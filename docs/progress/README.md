@@ -28,6 +28,7 @@
 | [0022](./0022-magnetometer-update.md) | 2026-04-20 | M1.11 Magnetometer update | `5c1231f` | 非线性 `h(x) = R(q)ᵀ·mag_ned + mag_bias`；3×24 的 H 矩阵，转置 Jacobian 通过 q 共轭识等式实现；有限差分 proptest 验证 H 到 1e-4。 |
 | [0023](./0023-barometer-update.md) | 2026-04-20 | M1.12 Barometer update | `ab3e2b3` | 1 维高度观测，标量 S / 标量 NIS / 纯数字求逆；Joseph form 退化到列操作；30 步 proptest 256 个随机高度目标收敛到 30cm 内。 |
 | [0024](./0024-end-to-end-simulation.md) | 2026-04-20 | M1.13 端到端多源融合 | `9574f99` | 2 秒 1 kHz 预测 + GPS 5Hz + Mag 25Hz + Baro 50Hz 并发；EKF 收敛位置 < 0.3m, 高度 < 0.2m。**EKF 数学栈的最终集成验证**。 |
+| [0025](./0025-nis-fdir-integration.md) | 2026-04-21 | M1.14 SensorRejectionCounter | `c362e59` | NIS 拒绝流 → HealthLevel；10 连拒→Degraded、50 连拒→Emergency；`observe` 单步单调性 Kani 证（多步 CBMC 卡 15min → 退到单步+归纳论证）。 |
 
 ## 写新文档时遵守的模板
 
