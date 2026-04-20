@@ -69,6 +69,24 @@ pub const QUATERNION_NORM_FLOOR: f32 = 1.0e-6;
 /// The property test `normalize_produces_unit_quaternion` proves this bound.
 pub const QUATERNION_NORM_TOLERANCE: f32 = 1.0e-6;
 
+/// Standard gravity used by the predict step (m/s²). NED convention:
+/// gravity vector is `(0, 0, +GRAVITY_M_S2)` — positive z points down.
+pub const GRAVITY_M_S2: f32 = 9.80665;
+
+/// Bias-free IMU measurement consumed by the predict step.
+///
+/// This struct is intentionally decoupled from `core_hal::ImuSample` so that
+/// `algo-ekf` stays independent of any HAL. The application layer bridges
+/// the two (dropping the timestamp, etc.).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ImuMeasurement {
+    /// Body-frame angular rate, rad/s.
+    pub gyro_rad_s: Vector3<f32>,
+    /// Body-frame specific force (accelerometer reading), m/s².
+    /// Includes gravity reaction: reads `-g` in body z when level & still.
+    pub accel_m_s2: Vector3<f32>,
+}
+
 /// Full state, accessed as a struct so consumers don't couple to raw indices.
 #[derive(Clone, Copy, Debug)]
 pub struct State {
@@ -155,6 +173,71 @@ impl State {
         v
     }
 
+    /// Advance the state by one IMU step of duration `dt_s`.
+    ///
+    /// This is the **predict** half of the EKF. Implementation follows the
+    /// standard strapdown-INS integration:
+    ///
+    /// 1. Correct the raw IMU reading for estimated biases.
+    /// 2. Integrate attitude: `q ← q ⊗ exp(½·ω·dt)` (exact quaternion
+    ///    exponential; small-angle fallback for numerical stability).
+    /// 3. Rotate the body-frame specific force into NED and add gravity:
+    ///    `a_ned = R(q) · f_body + (0, 0, +g)`.
+    /// 4. Euler-integrate velocity and position with a second-order
+    ///    position term: `p ← p + v·dt + ½·a·dt²`.
+    ///
+    /// Biases, earth magnetic field, and wind are left **unchanged** — they
+    /// evolve via process noise in the measurement-update step, not here.
+    ///
+    /// The output quaternion is normalized. If `dt_s` is non-finite or the
+    /// integrated quaternion degenerates to below [`QUATERNION_NORM_FLOOR`],
+    /// the returned state keeps the *previous* attitude rather than panic.
+    #[must_use]
+    pub fn predict(&self, imu: ImuMeasurement, dt_s: f32) -> State {
+        if !dt_s.is_finite() || dt_s < 0.0 {
+            // Clock skew or sensor outage: don't propagate, hold state.
+            return *self;
+        }
+
+        let omega = imu.gyro_rad_s - self.gyro_bias;
+        let specific_force = imu.accel_m_s2 - self.accel_bias;
+
+        // --- Attitude propagation ----------------------------------------
+        let delta_q = quaternion_exp(omega, dt_s);
+        let mut new_q = self.attitude * delta_q;
+        let q_norm_sq = new_q.w * new_q.w
+            + new_q.i * new_q.i
+            + new_q.j * new_q.j
+            + new_q.k * new_q.k;
+        if q_norm_sq.is_finite()
+            && q_norm_sq >= QUATERNION_NORM_FLOOR * QUATERNION_NORM_FLOOR
+        {
+            new_q /= libm::sqrtf(q_norm_sq);
+        } else {
+            // Degeneracy guard: fall back to previous attitude.
+            new_q = self.attitude;
+        }
+
+        // --- Translation propagation -------------------------------------
+        let rot = UnitQuaternion::new_unchecked(new_q);
+        let accel_ned = rot * specific_force + Vector3::new(0.0, 0.0, GRAVITY_M_S2);
+        let new_v = self.velocity_ned + accel_ned * dt_s;
+        let new_p = self.position_ned
+            + self.velocity_ned * dt_s
+            + accel_ned * (0.5 * dt_s * dt_s);
+
+        State {
+            attitude: new_q,
+            velocity_ned: new_v,
+            position_ned: new_p,
+            gyro_bias: self.gyro_bias,
+            accel_bias: self.accel_bias,
+            mag_ned: self.mag_ned,
+            mag_bias: self.mag_bias,
+            wind_ne: self.wind_ne,
+        }
+    }
+
     /// Reverse of [`Self::to_vector`].
     ///
     /// Copies fields 1-to-1; does **not** normalize the quaternion. Call
@@ -188,6 +271,27 @@ impl State {
                 .into_owned(),
         }
     }
+}
+
+/// Exact quaternion exponential for a body-frame angular rate `omega` applied
+/// over duration `dt_s`. Returns a **unit** rotation quaternion δq such that
+/// `q_new = q ⊗ δq` integrates attitude.
+///
+/// Uses the small-angle fallback when `‖ω·dt‖ < 1e-8` rad so the sin-over-θ
+/// division doesn't explode into NaN.
+#[must_use]
+pub fn quaternion_exp(omega: Vector3<f32>, dt_s: f32) -> Quaternion<f32> {
+    let half_vec = omega * (0.5 * dt_s);
+    let half_norm_sq = half_vec.dot(&half_vec);
+    if !half_norm_sq.is_finite() || half_norm_sq < 1.0e-16 {
+        // Small-angle: sin(θ/2) ≈ θ/2, cos(θ/2) ≈ 1.
+        return Quaternion::new(1.0, half_vec.x, half_vec.y, half_vec.z);
+    }
+    let half_norm = libm::sqrtf(half_norm_sq);
+    let sin_h = libm::sinf(half_norm);
+    let cos_h = libm::cosf(half_norm);
+    let scale = sin_h / half_norm;
+    Quaternion::new(cos_h, half_vec.x * scale, half_vec.y * scale, half_vec.z * scale)
 }
 
 #[cfg(test)]
@@ -329,6 +433,84 @@ mod tests {
             // Round-tripping the vector also gives the same vector.
             let v2 = s2.to_vector();
             prop_assert_eq!(v, v2);
+        }
+
+        /// Free fall: zero specific force + zero rate → velocity grows as g·dt
+        /// in the +z (down) direction, position as ½·g·dt².
+        #[test]
+        fn predict_free_fall_accumulates_gravity(dt_s in 1.0e-4f32..0.05) {
+            let state = State::default(); // identity attitude, zero v/p/biases
+            let imu = ImuMeasurement {
+                gyro_rad_s: Vector3::zeros(),
+                accel_m_s2: Vector3::zeros(), // free fall: no specific force
+            };
+            let next = state.predict(imu, dt_s);
+            let expected_v_z = GRAVITY_M_S2 * dt_s;
+            let expected_p_z = 0.5 * GRAVITY_M_S2 * dt_s * dt_s;
+            prop_assert!((next.velocity_ned.z - expected_v_z).abs() < 1.0e-5);
+            prop_assert!((next.velocity_ned.x).abs() < 1.0e-5);
+            prop_assert!((next.velocity_ned.y).abs() < 1.0e-5);
+            prop_assert!((next.position_ned.z - expected_p_z).abs() < 1.0e-6);
+        }
+
+        /// Level & stationary: specific force exactly cancels gravity →
+        /// velocity and position stay at zero.
+        #[test]
+        fn predict_level_stationary_holds_position(dt_s in 1.0e-4f32..0.05) {
+            let state = State::default();
+            let imu = ImuMeasurement {
+                gyro_rad_s: Vector3::zeros(),
+                // Level accelerometer reads -g on z body axis.
+                accel_m_s2: Vector3::new(0.0, 0.0, -GRAVITY_M_S2),
+            };
+            let next = state.predict(imu, dt_s);
+            prop_assert!(next.velocity_ned.norm() < 1.0e-4);
+            prop_assert!(next.position_ned.norm() < 1.0e-6);
+        }
+
+        /// Zero angular rate keeps the attitude quaternion (modulo normalization).
+        #[test]
+        fn predict_zero_rate_preserves_attitude(dt_s in 0.0f32..0.05) {
+            let mut state = State {
+                attitude: Quaternion::new(0.5, 0.5, 0.5, 0.5), // arbitrary unit q
+                ..State::default()
+            };
+            state.normalize_attitude();
+            let q_before = state.attitude;
+            let imu = ImuMeasurement::default();
+            let next = state.predict(imu, dt_s);
+            prop_assert!((next.attitude.w - q_before.w).abs() < 1.0e-5);
+            prop_assert!((next.attitude.i - q_before.i).abs() < 1.0e-5);
+            prop_assert!((next.attitude.j - q_before.j).abs() < 1.0e-5);
+            prop_assert!((next.attitude.k - q_before.k).abs() < 1.0e-5);
+        }
+
+        /// Predict step preserves the unit-norm invariant on the quaternion.
+        /// Gyro bounded to ±10 rad/s (realistic airframe).
+        #[test]
+        fn predict_preserves_quaternion_norm(
+            wx in -10.0f32..10.0,
+            wy in -10.0f32..10.0,
+            wz in -10.0f32..10.0,
+            dt_s in 1.0e-4f32..0.01,
+        ) {
+            let state = State::default();
+            let imu = ImuMeasurement {
+                gyro_rad_s: Vector3::new(wx, wy, wz),
+                accel_m_s2: Vector3::zeros(),
+            };
+            let next = state.predict(imu, dt_s);
+            prop_assert!((next.attitude.norm() - 1.0).abs() <= QUATERNION_NORM_TOLERANCE);
+        }
+
+        /// Negative or non-finite dt holds the state (safety path).
+        #[test]
+        fn predict_rejects_bad_dt(dt_s in -1.0f32..0.0) {
+            let state = State::default();
+            let imu = ImuMeasurement::default();
+            let next = state.predict(imu, dt_s);
+            prop_assert_eq!(next.velocity_ned, state.velocity_ned);
+            prop_assert_eq!(next.position_ned, state.position_ned);
         }
 
         /// Each struct field lands at its documented index in the vector.
