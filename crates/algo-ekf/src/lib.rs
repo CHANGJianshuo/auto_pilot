@@ -1369,6 +1369,75 @@ mod tests {
         assert!(chi < 0.01, "chi² = {chi} unexpectedly large");
     }
 
+    // ---- End-to-end flight simulation -----------------------------------
+
+    /// Simulate 2 seconds of "sitting on the bench": IMU reports gravity,
+    /// GPS reports (1, -2, -3) NED, magnetometer reports body-aligned earth
+    /// field, baro reports 3 m altitude. Verify EKF converges to each.
+    #[test]
+    fn end_to_end_stationary_multi_sensor_convergence() {
+        let mut state = State::default();
+        let mut p = initial_covariance();
+        let noise = ProcessNoise::default();
+        let dt = 0.001_f32; // 1 kHz predict
+        let imu = ImuMeasurement {
+            gyro_rad_s: Vector3::zeros(),
+            accel_m_s2: Vector3::new(0.0, 0.0, -GRAVITY_M_S2),
+        };
+        let gps_target = Vector3::new(1.0, -2.0, -3.0);
+        let gps = GpsMeasurement { position_ned: gps_target, sigma: Vector3::new(0.3, 0.3, 0.4) };
+        let mag = MagMeasurement {
+            body_field: state.mag_ned, // body == world at q = identity
+            sigma: Vector3::new(0.005, 0.005, 0.005),
+        };
+        let baro = BaroMeasurement { altitude_m: 3.0, sigma_m: 0.1 };
+
+        // 2 seconds of 1 kHz predict, with measurement updates at their own rates.
+        for i in 0..2000 {
+            let (s, c) = predict_step(&state, &p, imu, noise, dt);
+            state = s;
+            p = c;
+            // GPS @ 5 Hz: every 200 steps
+            if i % 200 == 0 {
+                let r = gps_update(&state, &p, &gps);
+                if r.applied {
+                    state = r.state;
+                    p = r.covariance;
+                }
+            }
+            // Mag @ 25 Hz: every 40 steps
+            if i % 40 == 0 {
+                let r = mag_update(&state, &p, &mag);
+                if r.applied {
+                    state = r.state;
+                    p = r.covariance;
+                }
+            }
+            // Baro @ 50 Hz: every 20 steps
+            if i % 20 == 0 {
+                let r = baro_update(&state, &p, &baro);
+                if r.applied {
+                    state = r.state;
+                    p = r.covariance;
+                }
+            }
+        }
+        // Position should converge to GPS.
+        let pos_err = (state.position_ned - gps_target).norm();
+        assert!(pos_err < 0.3, "position err = {pos_err} m");
+        // Altitude should match baro (overrides GPS z).
+        let altitude_err = (-state.position_ned.z - 3.0).abs();
+        assert!(altitude_err < 0.2, "altitude err = {altitude_err} m");
+        // Attitude should stay near identity.
+        let att_err = (state.attitude.norm() - 1.0).abs();
+        assert!(att_err < 1.0e-4, "‖q‖ − 1 = {att_err}");
+        // All P diagonals positive, all entries finite.
+        for i in 0..STATE_DIM {
+            let v = p.fixed_view::<1, 1>(i, i).to_scalar();
+            assert!(v > 0.0 && v.is_finite(), "P[{i},{i}] = {v}");
+        }
+    }
+
     // ---- Barometer update tests -----------------------------------------
 
     #[test]
