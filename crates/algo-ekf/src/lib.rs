@@ -14,10 +14,21 @@
 //! - Quaternion stays unit-normalized within 1e-6 after each predict/update.
 //! - No integer overflow, no panic paths.
 
-use nalgebra::{Quaternion, Vector2, Vector3};
+use nalgebra::{Quaternion, UnitQuaternion, Vector2, Vector3};
 
 /// Dimension of the EKF state vector.
 pub const STATE_DIM: usize = 24;
+
+/// Minimum quaternion norm accepted for normalization.
+///
+/// Near-zero quaternions have no unique direction; any prediction or update
+/// that drives ‖q‖ below this value is treated as a loss of attitude and
+/// the filter should reset.
+pub const QUATERNION_NORM_FLOOR: f32 = 1.0e-6;
+
+/// Relative tolerance we promise to hold `‖q‖ ≈ 1` to after normalization.
+/// The property test `normalize_produces_unit_quaternion` proves this bound.
+pub const QUATERNION_NORM_TOLERANCE: f32 = 1.0e-6;
 
 /// Full state, accessed as a struct so consumers don't couple to raw indices.
 #[derive(Clone, Copy, Debug)]
@@ -52,5 +63,88 @@ impl Default for State {
             mag_bias: Vector3::zeros(),
             wind_ne: Vector2::zeros(),
         }
+    }
+}
+
+impl State {
+    /// Normalize the stored attitude quaternion in place.
+    ///
+    /// Returns `None` when ‖q‖ < [`QUATERNION_NORM_FLOOR`], signalling that
+    /// attitude has been lost and the caller must reset the filter. Otherwise
+    /// returns the normalized quaternion as a `UnitQuaternion`.
+    ///
+    /// Postcondition (enforced by tests): the stored `attitude` satisfies
+    /// `|‖q‖ − 1| ≤ QUATERNION_NORM_TOLERANCE`.
+    pub fn normalize_attitude(&mut self) -> Option<UnitQuaternion<f32>> {
+        let norm = self.attitude.norm();
+        if norm < QUATERNION_NORM_FLOOR || !norm.is_finite() {
+            return None;
+        }
+        self.attitude /= norm;
+        Some(UnitQuaternion::new_unchecked(self.attitude))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_abs_diff_eq;
+    use proptest::prelude::*;
+
+    /// Generate finite f32 quaternion components in a range wide enough to
+    /// stress scaling, but not so wide that `norm()` overflows.
+    fn finite_component() -> impl Strategy<Value = f32> {
+        -1.0e6f32..1.0e6f32
+    }
+
+    fn any_quaternion() -> impl Strategy<Value = Quaternion<f32>> {
+        (
+            finite_component(),
+            finite_component(),
+            finite_component(),
+            finite_component(),
+        )
+            .prop_map(|(w, i, j, k)| Quaternion::new(w, i, j, k))
+    }
+
+    proptest! {
+        /// Core invariant: for any finite, non-degenerate input quaternion,
+        /// `State::normalize_attitude` yields ‖q‖ ≈ 1.
+        #[test]
+        fn normalize_produces_unit_quaternion(q in any_quaternion()) {
+            let mut state = State { attitude: q, ..State::default() };
+            let result = state.normalize_attitude();
+            let input_norm = q.norm();
+            if input_norm < QUATERNION_NORM_FLOOR || !input_norm.is_finite() {
+                prop_assert!(result.is_none(),
+                    "degenerate quaternion should return None, input norm {input_norm}");
+            } else {
+                prop_assert!(result.is_some());
+                let out_norm = state.attitude.norm();
+                prop_assert!((out_norm - 1.0).abs() <= QUATERNION_NORM_TOLERANCE,
+                    "normalized norm {out_norm} outside tolerance");
+            }
+        }
+    }
+
+    #[test]
+    fn default_state_has_unit_attitude() {
+        let s = State::default();
+        assert_abs_diff_eq!(s.attitude.norm(), 1.0, epsilon = QUATERNION_NORM_TOLERANCE);
+    }
+
+    #[test]
+    fn zero_quaternion_returns_none() {
+        let mut s = State { attitude: Quaternion::new(0.0, 0.0, 0.0, 0.0), ..State::default() };
+        assert!(s.normalize_attitude().is_none());
+    }
+
+    #[test]
+    fn nan_quaternion_returns_none() {
+        let mut s = State {
+            attitude: Quaternion::new(f32::NAN, 0.0, 0.0, 0.0),
+            ..State::default()
+        };
+        assert!(s.normalize_attitude().is_none());
     }
 }
