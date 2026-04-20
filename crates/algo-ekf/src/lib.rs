@@ -58,6 +58,78 @@ pub mod idx {
 /// Shorthand for a 24-D column vector over `f32`.
 pub type StateVector = SVector<f32, STATE_DIM>;
 
+/// Shorthand for the 24×24 EKF covariance matrix `P` over `f32`.
+pub type Covariance = nalgebra::SMatrix<f32, STATE_DIM, STATE_DIM>;
+
+/// Default initial 1-σ standard deviations per state group.
+///
+/// Units and rationale:
+/// * attitude quaternion — uncertainty on each component, ≈ small-angle
+///   misalignment of ~0.1 rad (~6°) before first alignment converges.
+/// * velocity_ned — no motion known yet, 1 m/s per axis is generous.
+/// * position_ned — origin-referenced, 10 m until GPS fix.
+/// * gyro_bias — rad/s, ICM-42688 datasheet zero-bias ≲ 0.01 rad/s.
+/// * accel_bias — m/s², datasheet ≲ 0.1 m/s².
+/// * mag_ned — gauss, Earth field varies geographically up to 0.05 g.
+/// * mag_bias — gauss, hard-iron correction ≲ 0.2 g until calibrated.
+/// * wind_ne — m/s, no wind knowledge, 2 m/s per axis.
+///
+/// Tuned during flight testing later; these are reasonable boot-time defaults.
+pub mod initial_sigma {
+    pub const ATTITUDE: f32 = 0.1;
+    pub const VELOCITY_NED: f32 = 1.0;
+    pub const POSITION_NED: f32 = 10.0;
+    pub const GYRO_BIAS: f32 = 0.01;
+    pub const ACCEL_BIAS: f32 = 0.1;
+    pub const MAG_NED: f32 = 0.05;
+    pub const MAG_BIAS: f32 = 0.2;
+    pub const WIND_NE: f32 = 2.0;
+}
+
+/// Build the initial covariance `P₀` as a diagonal matrix whose per-element
+/// entries come from [`initial_sigma`] (squared).
+///
+/// Diagonal means no a-priori cross-correlation between state components —
+/// the filter will build those as it consumes measurements.
+#[must_use]
+pub fn initial_covariance() -> Covariance {
+    let mut p = Covariance::zeros();
+    fill_block(&mut p, idx::Q_START, idx::Q_LEN, initial_sigma::ATTITUDE);
+    fill_block(&mut p, idx::V_NED_START, idx::V_NED_LEN, initial_sigma::VELOCITY_NED);
+    fill_block(&mut p, idx::P_NED_START, idx::P_NED_LEN, initial_sigma::POSITION_NED);
+    fill_block(&mut p, idx::GYRO_BIAS_START, idx::GYRO_BIAS_LEN, initial_sigma::GYRO_BIAS);
+    fill_block(&mut p, idx::ACCEL_BIAS_START, idx::ACCEL_BIAS_LEN, initial_sigma::ACCEL_BIAS);
+    fill_block(&mut p, idx::MAG_NED_START, idx::MAG_NED_LEN, initial_sigma::MAG_NED);
+    fill_block(&mut p, idx::MAG_BIAS_START, idx::MAG_BIAS_LEN, initial_sigma::MAG_BIAS);
+    fill_block(&mut p, idx::WIND_NE_START, idx::WIND_NE_LEN, initial_sigma::WIND_NE);
+    p
+}
+
+/// Place σ² on the diagonal of a `len`-long block starting at `start`.
+/// Only writes diagonal entries — upper/lower triangles stay zero.
+fn fill_block(p: &mut Covariance, start: usize, len: usize, sigma: f32) {
+    let sigma_sq = sigma * sigma;
+    for offset in 0..len {
+        let i = start + offset;
+        // fixed_view is the block API; writing one diagonal entry via
+        // a 1×1 view keeps us clear of `p[(i,i)]` indexing.
+        let mut cell = p.fixed_view_mut::<1, 1>(i, i);
+        cell.fill(sigma_sq);
+    }
+}
+
+/// Symmetrise the covariance matrix in place: `P ← (P + Pᵀ) / 2`.
+///
+/// Floating-point update loops (`P ← F·P·Fᵀ + Q`) drift away from perfect
+/// symmetry by ~1 ulp per element per step. Accumulated, this can make the
+/// matrix non-symmetric enough that a Cholesky solve or PSD check rejects
+/// it. This one-liner fixes it and should be called after every update.
+pub fn enforce_symmetry(p: &mut Covariance) {
+    let transposed = p.transpose();
+    *p += &transposed;
+    *p *= 0.5;
+}
+
 /// Minimum quaternion norm accepted for normalization.
 ///
 /// Near-zero quaternions have no unique direction; any prediction or update
@@ -402,6 +474,45 @@ mod tests {
     }
 
     #[test]
+    fn initial_covariance_is_diagonal() {
+        let p = initial_covariance();
+        for i in 0..STATE_DIM {
+            for j in 0..STATE_DIM {
+                let v = p.fixed_view::<1, 1>(i, j).to_scalar();
+                if i == j {
+                    assert!(v > 0.0, "diagonal entry ({i}, {i}) must be positive, got {v}");
+                } else {
+                    assert_eq!(v, 0.0, "off-diagonal ({i}, {j}) must be 0, got {v}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn initial_covariance_diagonal_uses_sigma_squared() {
+        let p = initial_covariance();
+        let attitude_var = p.fixed_view::<1, 1>(idx::Q_START, idx::Q_START).to_scalar();
+        assert!((attitude_var - initial_sigma::ATTITUDE.powi(2)).abs() < 1.0e-12);
+        let pos_var = p
+            .fixed_view::<1, 1>(idx::P_NED_START, idx::P_NED_START)
+            .to_scalar();
+        assert!((pos_var - initial_sigma::POSITION_NED.powi(2)).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn enforce_symmetry_is_idempotent() {
+        let mut p = Covariance::from_fn(|i, j| {
+            // Convert indices via f32 ctor — stays clear of `as` conversions.
+            f32::from(u16::try_from(i + j * 3).unwrap_or(0))
+        });
+        enforce_symmetry(&mut p);
+        let once = p;
+        enforce_symmetry(&mut p);
+        // Symmetrising again shouldn't change anything.
+        assert!((p - once).norm() < 1.0e-6);
+    }
+
+    #[test]
     fn idx_layout_totals_state_dim() {
         assert_eq!(idx::TOTAL, STATE_DIM);
         // Each range's end matches the next range's start — no gaps, no overlap.
@@ -511,6 +622,25 @@ mod tests {
             let next = state.predict(imu, dt_s);
             prop_assert_eq!(next.velocity_ned, state.velocity_ned);
             prop_assert_eq!(next.position_ned, state.position_ned);
+        }
+
+        /// `enforce_symmetry` produces a matrix equal to its transpose
+        /// (up to 1 ulp on f32), for arbitrary input matrices.
+        #[test]
+        fn enforce_symmetry_makes_matrix_symmetric(
+            seed in proptest::collection::vec(-10.0f32..10.0, STATE_DIM * STATE_DIM),
+        ) {
+            let mut p = Covariance::from_iterator(seed.iter().copied());
+            enforce_symmetry(&mut p);
+            // Check (i, j) == (j, i) for every pair.
+            for i in 0..STATE_DIM {
+                for j in (i + 1)..STATE_DIM {
+                    let a = p.fixed_view::<1, 1>(i, j).to_scalar();
+                    let b = p.fixed_view::<1, 1>(j, i).to_scalar();
+                    prop_assert!((a - b).abs() < 1.0e-6,
+                        "entries ({}, {}) and ({}, {}) not symmetric: {} vs {}", i, j, j, i, a, b);
+                }
+            }
         }
 
         /// Each struct field lands at its documented index in the vector.
