@@ -26,7 +26,7 @@
 //! * [`IndiController`] — pure compute, no state; takes **already-filtered**
 //!   `ω` and `ω̇` plus the vehicle's inertia `J` and gains, returns `Δτ`.
 
-use nalgebra::{Matrix3, Vector3};
+use nalgebra::{Matrix3, Quaternion, Vector3};
 
 /// Per-axis angular-rate setpoint from the attitude loop.
 #[derive(Clone, Copy, Debug, Default)]
@@ -78,6 +78,60 @@ pub fn compute_torque_increment(input: &IndiInput) -> TorqueIncrement {
     let delta_omega_dot = desired_omega_dot - input.omega_dot_filtered;
     TorqueIncrement {
         body_torque_nm: input.inertia * delta_omega_dot,
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Attitude loop
+// ----------------------------------------------------------------------------
+
+/// Per-axis attitude proportional gain. Typical values 5–15 rad/s per rad.
+pub type AttitudeGain = Vector3<f32>;
+
+/// Compute a body-frame rate command that drives `q_current` toward
+/// `q_desired`.
+///
+/// Uses the standard quaternion-error formulation:
+///
+/// ```text
+///   q_err = q_desired ⊗ q_current⁻¹
+///   choose the shortest rotation (q_err.w ≥ 0)
+///   ω_cmd = 2·k_att ⊙ q_err.vector_part
+/// ```
+///
+/// The `2·vector_part` approximation is exact in the small-angle limit
+/// and smoothly degrades for large errors.
+///
+/// Inputs must be unit quaternions. If the current attitude is degenerate
+/// (zero-norm), returns a zero rate command to avoid producing NaNs.
+#[must_use]
+pub fn attitude_to_rate(
+    q_current: Quaternion<f32>,
+    q_desired: Quaternion<f32>,
+    k_att: &AttitudeGain,
+) -> RateCommand {
+    let q_current_norm_sq =
+        q_current.w * q_current.w + q_current.i * q_current.i + q_current.j * q_current.j + q_current.k * q_current.k;
+    if !q_current_norm_sq.is_finite() || q_current_norm_sq < 1.0e-12 {
+        return RateCommand::default();
+    }
+    // Conjugate of a unit quaternion q = (w, x, y, z) is (w, -x, -y, -z).
+    let q_current_conj = Quaternion::new(
+        q_current.w,
+        -q_current.i,
+        -q_current.j,
+        -q_current.k,
+    );
+    let q_err = q_desired * q_current_conj;
+    // Shortest-rotation: flip so q_err.w ≥ 0.
+    let (ex, ey, ez) = if q_err.w >= 0.0 {
+        (q_err.i, q_err.j, q_err.k)
+    } else {
+        (-q_err.i, -q_err.j, -q_err.k)
+    };
+    let err_vec = Vector3::new(2.0 * ex, 2.0 * ey, 2.0 * ez);
+    RateCommand {
+        body_rate_rad_s: k_att.component_mul(&err_vec),
     }
 }
 
@@ -255,6 +309,74 @@ mod tests {
             let delta_alpha = desired_accel - Vector3::new(ax, ay, az);
             let expected = j * delta_alpha;
             prop_assert!((out.body_torque_nm - expected).norm() < 1.0e-4);
+        }
+    }
+
+    // ---- Attitude loop ---------------------------------------------------
+
+    fn default_att_gain() -> AttitudeGain {
+        Vector3::new(8.0, 8.0, 5.0)
+    }
+
+    #[test]
+    fn attitude_equal_yields_zero_rate() {
+        let q = Quaternion::new(1.0, 0.0, 0.0, 0.0);
+        let cmd = attitude_to_rate(q, q, &default_att_gain());
+        assert!(cmd.body_rate_rad_s.norm() < 1.0e-9);
+    }
+
+    #[test]
+    fn attitude_desired_yaws_right_produces_positive_yaw_rate() {
+        // q_desired = 20° about +z.
+        let theta = 20.0_f32.to_radians();
+        let qd = Quaternion::new((theta / 2.0).cos(), 0.0, 0.0, (theta / 2.0).sin());
+        let qc = Quaternion::new(1.0, 0.0, 0.0, 0.0);
+        let cmd = attitude_to_rate(qc, qd, &default_att_gain());
+        assert!(cmd.body_rate_rad_s.z > 0.0, "expected +yaw, got {}", cmd.body_rate_rad_s);
+        assert!(cmd.body_rate_rad_s.x.abs() < 1.0e-5);
+        assert!(cmd.body_rate_rad_s.y.abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn attitude_takes_shortest_rotation() {
+        // q_desired = 350° about z is the same attitude as -10° about z.
+        // A correct controller goes -10° (back), not +350° (forward).
+        let theta = 350.0_f32.to_radians();
+        let qd = Quaternion::new((theta / 2.0).cos(), 0.0, 0.0, (theta / 2.0).sin());
+        let qc = Quaternion::new(1.0, 0.0, 0.0, 0.0);
+        let cmd = attitude_to_rate(qc, qd, &default_att_gain());
+        // Expect *negative* yaw rate (shortest path = -10°).
+        assert!(cmd.body_rate_rad_s.z < 0.0, "expected -yaw, got {}", cmd.body_rate_rad_s);
+    }
+
+    #[test]
+    fn attitude_degenerate_quaternion_returns_zero() {
+        let qc = Quaternion::new(0.0, 0.0, 0.0, 0.0);
+        let qd = Quaternion::new(1.0, 0.0, 0.0, 0.0);
+        let cmd = attitude_to_rate(qc, qd, &default_att_gain());
+        assert_eq!(cmd.body_rate_rad_s, Vector3::zeros());
+    }
+
+    proptest! {
+        /// Small-angle: for unit q_current and a desired that differs by
+        /// a small body-frame rotation, the returned rate approximates
+        /// k_att ⊙ rotation_axis.
+        #[test]
+        fn attitude_small_angle_matches_axis_angle(
+            rx in -0.05f32..0.05,
+            ry in -0.05f32..0.05,
+            rz in -0.05f32..0.05,
+        ) {
+            let qc = Quaternion::new(1.0, 0.0, 0.0, 0.0);
+            // q_desired = exp(½·(rx, ry, rz))  —  small angle
+            let half_rot = Vector3::new(rx / 2.0, ry / 2.0, rz / 2.0);
+            let w = libm::sqrtf((1.0 - half_rot.norm_squared()).max(0.0));
+            let qd = Quaternion::new(w, half_rot.x, half_rot.y, half_rot.z);
+            let k = default_att_gain();
+            let cmd = attitude_to_rate(qc, qd, &k);
+            // Expected: ω ≈ k ⊙ (rx, ry, rz)
+            let expected = Vector3::new(k.x * rx, k.y * ry, k.z * rz);
+            prop_assert!((cmd.body_rate_rad_s - expected).norm() < 5.0e-3);
         }
     }
 
