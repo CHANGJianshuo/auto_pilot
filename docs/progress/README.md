@@ -30,6 +30,7 @@
 | [0024](./0024-end-to-end-simulation.md) | 2026-04-20 | M1.13 端到端多源融合 | `9574f99` | 2 秒 1 kHz 预测 + GPS 5Hz + Mag 25Hz + Baro 50Hz 并发；EKF 收敛位置 < 0.3m, 高度 < 0.2m。**EKF 数学栈的最终集成验证**。 |
 | [0025](./0025-nis-fdir-integration.md) | 2026-04-21 | M1.14 SensorRejectionCounter | `c362e59` | NIS 拒绝流 → HealthLevel；10 连拒→Degraded、50 连拒→Emergency；`observe` 单步单调性 Kani 证（多步 CBMC 卡 15min → 退到单步+归纳论证）。 |
 | [0026](./0026-indi-inner-loop.md) | 2026-04-21 | M2.0 INDI 内环 + LPF | `25a8e3f` | 生产级 INDI：`Δτ = J·(k·(ω_cmd − ω) − ω̇)`；LowPassFilterVec3 首阶 IIR；10 测试 含 2 proptest。**算法栈第二块（控制律）启动**。 |
+| [0027](./0027-control-allocation.md) | 2026-04-21 | M2.1a 控制分配 X-quad | `747b0a3` | 效率矩阵 `E = [−y, +x, k_yaw, 1]`；预计算 `E⁻¹`；`saturate` 夹取；256 样本 round-trip proptest。N=4 直接逆。 |
 
 ## 写新文档时遵守的模板
 
