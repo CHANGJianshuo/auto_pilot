@@ -215,6 +215,40 @@ pub fn identity_transition() -> Covariance {
     Covariance::identity()
 }
 
+/// Build the state-transition Jacobian `F = ∂f/∂x` with the **trivial**
+/// kinematic couplings filled in.
+///
+/// This is the M1.9b-0 intermediate: start from `I`, then set the only
+/// *purely linear* coupling — `∂p/∂v = I · dt` — so position tracks
+/// velocity correctly. The remaining attitude-coupled blocks
+/// (velocity ← attitude, velocity ← accel_bias, attitude ← gyro_bias)
+/// are left as identity until M1.9b-1 lands their closed-form Jacobians.
+///
+/// Algebra of the one non-identity block:
+///
+/// ```text
+///   p_new = p_old + v·dt + ½·a·dt²
+///   ⇒   ∂p_new/∂v = I · dt
+/// ```
+///
+/// Velocity's auto-coupling `∂v_new/∂v = I` is already provided by the
+/// identity start, so nothing else needs to be written here yet.
+#[must_use]
+pub fn kinematic_transition(dt_s: f32) -> Covariance {
+    let mut f = Covariance::identity();
+    if !dt_s.is_finite() || dt_s < 0.0 {
+        return f;
+    }
+    // ∂p/∂v = I · dt  — 3×3 block at rows [P_NED_START..), cols [V_NED_START..)
+    let mut dp_dv = f.fixed_view_mut::<{ idx::P_NED_LEN }, { idx::V_NED_LEN }>(
+        idx::P_NED_START,
+        idx::V_NED_START,
+    );
+    dp_dv.fill_with_identity();
+    dp_dv.scale_mut(dt_s);
+    f
+}
+
 /// Minimum quaternion norm accepted for normalization.
 ///
 /// Near-zero quaternions have no unique direction; any prediction or update
@@ -596,6 +630,75 @@ mod tests {
                 (pnext_diag - (p_diag + q_diag)).abs() < 1.0e-8,
                 "diag {i}: got {pnext_diag}, expected {}",
                 p_diag + q_diag
+            );
+        }
+    }
+
+    #[test]
+    fn kinematic_transition_is_identity_at_dt_zero() {
+        let f = kinematic_transition(0.0);
+        assert!((f - Covariance::identity()).norm() < 1.0e-9);
+    }
+
+    #[test]
+    fn kinematic_transition_rejects_bad_dt() {
+        let f = kinematic_transition(-1.0);
+        assert!((f - Covariance::identity()).norm() < 1.0e-9);
+    }
+
+    #[test]
+    fn kinematic_transition_sets_dp_dv_block_to_dt_identity() {
+        let dt = 0.01_f32;
+        let f = kinematic_transition(dt);
+        let block =
+            f.fixed_view::<{ idx::P_NED_LEN }, { idx::V_NED_LEN }>(idx::P_NED_START, idx::V_NED_START);
+        // ∂p/∂v = dt * I_3  (Nalgebra's identity matrices are square, so
+        // the 3x3 identity times dt is the expected block.)
+        for i in 0..idx::P_NED_LEN {
+            for j in 0..idx::V_NED_LEN {
+                let v = block.fixed_view::<1, 1>(i, j).to_scalar();
+                let expected = if i == j { dt } else { 0.0 };
+                assert!((v - expected).abs() < 1.0e-9, "({i},{j}): got {v} want {expected}");
+            }
+        }
+    }
+
+    proptest! {
+        /// End-to-end: feeding the kinematic F to predict_covariance produces
+        /// a symmetric P_new for any positive dt in the normal operating range.
+        #[test]
+        fn predict_covariance_with_kinematic_f_is_symmetric(dt_s in 1.0e-4f32..0.05) {
+            let p = initial_covariance();
+            let f = kinematic_transition(dt_s);
+            let q = build_process_noise(ProcessNoise::default(), dt_s);
+            let p_next = predict_covariance(&p, &f, &q);
+            for i in 0..STATE_DIM {
+                for j in (i + 1)..STATE_DIM {
+                    let a = p_next.fixed_view::<1, 1>(i, j).to_scalar();
+                    let b = p_next.fixed_view::<1, 1>(j, i).to_scalar();
+                    prop_assert!((a - b).abs() < 1.0e-6);
+                }
+            }
+        }
+
+        /// The kinematic F cross-couples position and velocity — after one
+        /// predict step with this F, the P block at (position, velocity)
+        /// must be non-zero whenever the velocity block started non-zero.
+        #[test]
+        fn kinematic_f_transfers_velocity_uncertainty_to_position(dt_s in 1.0e-3f32..0.05) {
+            let p = initial_covariance();
+            let f = kinematic_transition(dt_s);
+            let q = Covariance::zeros(); // isolate F's effect, no process noise
+            let p_next = predict_covariance(&p, &f, &q);
+            // (0th position row, 0th velocity col) should now be ≈ dt * σ_v²
+            let cross = p_next
+                .fixed_view::<1, 1>(idx::P_NED_START, idx::V_NED_START)
+                .to_scalar();
+            let v_var = initial_sigma::VELOCITY_NED.powi(2);
+            prop_assert!(cross > 0.0, "cross block should be positive, got {cross}");
+            prop_assert!(
+                (cross - dt_s * v_var).abs() < 1.0e-4,
+                "cross={cross} expected {}", dt_s * v_var
             );
         }
     }
