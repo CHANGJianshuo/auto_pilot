@@ -24,6 +24,7 @@
 | [0018](./0018-dp-dq-dp-dba.md) | 2026-04-20 | M1.9b-1d ∂p/∂q + ∂p/∂b_a | `704d544` | 位置的二次项 `½·R(q)·f·dt²` 对 q 和 b_a 的偏导；**F 矩阵所有非平凡块全部闭合**。EKF predict 半段数学收尾。 |
 | [0019](./0019-predict-step-end-to-end.md) | 2026-04-20 | M1.9c predict_step 端到端 | `4993ce4` | 单入口函数 `predict_step` + 1000 步悬停不变量 + 50 000 步随机序列 proptest。**EKF predict 半段完全收官**。 |
 | [0020](./0020-gps-innovation.md) | 2026-04-20 | M1.10a GPS innovation | `edcc0e8` | `GpsMeasurement`/`GpsInnovation` 类型 + NIS（χ² gating）+ block 抽取 S = P_pos + R（200× 快于实体化 H）。EKF **measurement** 半段开始。 |
+| [0021](./0021-gps-update-joseph.md) | 2026-04-20 | M1.10b GPS Kalman + Joseph | `ed3114f` | `gps_update()` 完整卡尔曼增益 + Joseph 协方差 + χ²=11.345 外值门；20 步 proptest 256 个随机目标全都在 0.5m 内收敛。 |
 
 ## 写新文档时遵守的模板
 
