@@ -653,6 +653,73 @@ pub fn build_transition_jacobian(
     f
 }
 
+// ============================================================================
+// Measurement update — GPS position
+// ============================================================================
+
+/// A 3-axis NED position observation from GPS / RTK.
+///
+/// `position_ned` is in the local NED frame relative to the EKF origin, in
+/// meters. `sigma` is the 1-σ uncertainty per axis (GPS receivers report
+/// HDOP / VDOP from which this can be derived).
+#[derive(Clone, Copy, Debug)]
+pub struct GpsMeasurement {
+    pub position_ned: Vector3<f32>,
+    pub sigma: Vector3<f32>,
+}
+
+/// 3-component innovation returned by an observation step.
+///
+/// `residual` is `y − h(x̂)` (measured − predicted). `innovation_covariance`
+/// is `S = H·P·Hᵀ + R`, useful for chi-square outlier tests before the
+/// Kalman-gain step is applied.
+#[derive(Clone, Copy, Debug)]
+pub struct GpsInnovation {
+    pub residual: Vector3<f32>,
+    pub innovation_covariance: Matrix3<f32>,
+}
+
+impl GpsInnovation {
+    /// Normalised chi-square gate (NIS): `residualᵀ · S⁻¹ · residual`.
+    /// Values far above 3-axis χ² 99% quantile (~11.34) suggest the
+    /// measurement is an outlier and should be rejected.
+    #[must_use]
+    pub fn normalized_squared(&self) -> f32 {
+        match self.innovation_covariance.try_inverse() {
+            Some(s_inv) => (self.residual.transpose() * s_inv * self.residual).to_scalar(),
+            None => f32::INFINITY,
+        }
+    }
+}
+
+/// Compute the GPS position innovation without yet applying a Kalman gain.
+///
+/// The measurement model is linear: `h(x) = position_ned`, so the
+/// observation matrix `H` has `I₃` at the position rows and zeros elsewhere.
+/// We don't materialise `H` explicitly — the structured block extraction is
+/// faster and clippy-safe.
+#[must_use]
+pub fn gps_innovation(
+    state: &State,
+    covariance: &Covariance,
+    measurement: &GpsMeasurement,
+) -> GpsInnovation {
+    let residual = measurement.position_ned - state.position_ned;
+    // S = P[P_NED, P_NED] + diag(σ²)
+    let p_block: Matrix3<f32> = covariance
+        .fixed_view::<{ idx::P_NED_LEN }, { idx::P_NED_LEN }>(idx::P_NED_START, idx::P_NED_START)
+        .into_owned();
+    let r = Matrix3::from_diagonal(&Vector3::new(
+        measurement.sigma.x * measurement.sigma.x,
+        measurement.sigma.y * measurement.sigma.y,
+        measurement.sigma.z * measurement.sigma.z,
+    ));
+    GpsInnovation {
+        residual,
+        innovation_covariance: p_block + r,
+    }
+}
+
 /// Exact quaternion exponential for a body-frame angular rate `omega` applied
 /// over duration `dt_s`. Returns a **unit** rotation quaternion δq such that
 /// `q_new = q ⊗ δq` integrates attitude.
@@ -920,6 +987,89 @@ mod tests {
                 let expected = if i == j { -dt / 2.0 } else { 0.0 };
                 assert!((v - expected).abs() < 1.0e-9);
             }
+        }
+    }
+
+    // ---- GPS measurement update tests -----------------------------------
+
+    #[test]
+    fn gps_innovation_zero_residual_when_state_matches() {
+        let state = State::default(); // position = 0
+        let p = initial_covariance();
+        let m = GpsMeasurement {
+            position_ned: Vector3::zeros(),
+            sigma: Vector3::new(1.0, 1.0, 1.5),
+        };
+        let innov = gps_innovation(&state, &p, &m);
+        assert!(innov.residual.norm() < 1.0e-9);
+    }
+
+    #[test]
+    fn gps_innovation_residual_tracks_difference() {
+        let state = State::default();
+        let p = initial_covariance();
+        let m = GpsMeasurement {
+            position_ned: Vector3::new(3.0, -2.0, 1.0),
+            sigma: Vector3::new(1.0, 1.0, 1.5),
+        };
+        let innov = gps_innovation(&state, &p, &m);
+        assert!((innov.residual - m.position_ned).norm() < 1.0e-9);
+    }
+
+    #[test]
+    fn gps_innovation_covariance_is_pblock_plus_r() {
+        let state = State::default();
+        let p = initial_covariance();
+        let sigma = Vector3::new(1.0, 1.5, 2.0);
+        let m = GpsMeasurement { position_ned: Vector3::zeros(), sigma };
+        let innov = gps_innovation(&state, &p, &m);
+        // P_NED_NED block of P is diag(σ_pos²).
+        let expected_p = initial_sigma::POSITION_NED.powi(2);
+        let expected = Matrix3::from_diagonal(&Vector3::new(
+            expected_p + sigma.x.powi(2),
+            expected_p + sigma.y.powi(2),
+            expected_p + sigma.z.powi(2),
+        ));
+        assert!((innov.innovation_covariance - expected).norm() < 1.0e-4);
+    }
+
+    #[test]
+    fn gps_innovation_normalized_squared_is_small_for_aligned_measurement() {
+        let state = State::default();
+        let p = initial_covariance();
+        let m = GpsMeasurement {
+            position_ned: Vector3::new(0.01, -0.02, 0.005), // ~cm residual
+            sigma: Vector3::new(1.0, 1.0, 1.5),
+        };
+        let innov = gps_innovation(&state, &p, &m);
+        let chi = innov.normalized_squared();
+        // With σ ≈ 10 m and residual ≈ 1 cm, χ² should be << 0.01.
+        assert!(chi < 0.01, "chi² = {chi} unexpectedly large");
+    }
+
+    proptest! {
+        /// Property: adding a meter offset between state and measurement
+        /// always increases the normalised chi-square.
+        #[test]
+        fn gps_innovation_nis_monotone_in_offset(
+            offset_m in 0.1f32..10.0,
+        ) {
+            let state = State::default();
+            let p = initial_covariance();
+            let sigma = Vector3::new(1.0, 1.0, 1.5);
+
+            let m_small = GpsMeasurement {
+                position_ned: Vector3::new(0.01, 0.0, 0.0),
+                sigma,
+            };
+            let m_large = GpsMeasurement {
+                position_ned: Vector3::new(offset_m, 0.0, 0.0),
+                sigma,
+            };
+            let nis_small = gps_innovation(&state, &p, &m_small).normalized_squared();
+            let nis_large = gps_innovation(&state, &p, &m_large).normalized_squared();
+            prop_assert!(nis_large > nis_small,
+                "NIS did not grow: small={nis_small}, large={nis_large}");
         }
     }
 
