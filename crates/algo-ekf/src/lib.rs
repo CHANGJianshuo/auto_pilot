@@ -692,6 +692,25 @@ impl GpsInnovation {
     }
 }
 
+/// χ² 99 % quantile for 3 degrees of freedom. GPS innovations whose NIS
+/// exceeds this value are rejected as outliers in [`gps_update`].
+///
+/// Field-tunable once real data is in hand — PX4's ekf2 defaults to the
+/// same number.
+pub const GPS_CHI2_GATE: f32 = 11.345;
+
+/// Result of one GPS measurement update.
+#[derive(Clone, Copy, Debug)]
+pub struct GpsUpdateResult {
+    pub state: State,
+    pub covariance: Covariance,
+    /// `true` if the measurement passed the χ² gate and was folded in;
+    /// `false` if it was rejected (state/covariance unchanged).
+    pub applied: bool,
+    /// Normalised innovation squared at the time of decision.
+    pub nis: f32,
+}
+
 /// Compute the GPS position innovation without yet applying a Kalman gain.
 ///
 /// The measurement model is linear: `h(x) = position_ned`, so the
@@ -717,6 +736,81 @@ pub fn gps_innovation(
     GpsInnovation {
         residual,
         innovation_covariance: p_block + r,
+    }
+}
+
+/// Fold a GPS measurement into the EKF with outlier gating.
+///
+/// Sequence:
+///
+/// 1. Compute `innovation` and its NIS (chi-square).
+/// 2. If NIS exceeds [`GPS_CHI2_GATE`] or is non-finite → reject
+///    (return unchanged state/covariance, `applied = false`).
+/// 3. Otherwise compute the Kalman gain `K = P·Hᵀ·S⁻¹`, apply the state
+///    correction `x ← x + K·residual`, and update the covariance via
+///    the **Joseph form** `P ← (I−K·H)·P·(I−K·H)ᵀ + K·R·Kᵀ`.
+/// 4. Re-normalise the attitude quaternion and enforce covariance symmetry.
+///
+/// The Joseph form is used (rather than `P ← (I−K·H)·P`) because it is
+/// symmetric by construction and robust to small numerical errors in K.
+#[must_use]
+pub fn gps_update(
+    state: &State,
+    covariance: &Covariance,
+    measurement: &GpsMeasurement,
+) -> GpsUpdateResult {
+    let innov = gps_innovation(state, covariance, measurement);
+    let nis = innov.normalized_squared();
+    if !nis.is_finite() || nis > GPS_CHI2_GATE {
+        return GpsUpdateResult {
+            state: *state,
+            covariance: *covariance,
+            applied: false,
+            nis,
+        };
+    }
+
+    let Some(s_inv) = innov.innovation_covariance.try_inverse() else {
+        return GpsUpdateResult {
+            state: *state,
+            covariance: *covariance,
+            applied: false,
+            nis: f32::INFINITY,
+        };
+    };
+
+    // P·Hᵀ is the (24×3) column block of P at [ :, P_NED_START..+3 ].
+    let p_ht: nalgebra::SMatrix<f32, STATE_DIM, 3> = covariance
+        .fixed_columns::<{ idx::P_NED_LEN }>(idx::P_NED_START)
+        .into_owned();
+    let k = p_ht * s_inv;
+
+    // State correction via 24-D vector round-trip, then re-normalise q.
+    let dx = k * innov.residual;
+    let mut new_state = State::from_vector(&(state.to_vector() + dx));
+    new_state.normalize_attitude();
+
+    // Joseph-form covariance update.
+    //   K·H has only columns P_NED_START..+3 non-zero (== columns of K).
+    let mut kh = Covariance::zeros();
+    kh.fixed_view_mut::<STATE_DIM, { idx::P_NED_LEN }>(0, idx::P_NED_START)
+        .copy_from(&k);
+    let i_minus_kh = Covariance::identity() - kh;
+
+    let r = Matrix3::from_diagonal(&Vector3::new(
+        measurement.sigma.x * measurement.sigma.x,
+        measurement.sigma.y * measurement.sigma.y,
+        measurement.sigma.z * measurement.sigma.z,
+    ));
+
+    let mut p_new = i_minus_kh * covariance * i_minus_kh.transpose() + k * r * k.transpose();
+    enforce_symmetry(&mut p_new);
+
+    GpsUpdateResult {
+        state: new_state,
+        covariance: p_new,
+        applied: true,
+        nis,
     }
 }
 
@@ -1045,6 +1139,109 @@ mod tests {
         let chi = innov.normalized_squared();
         // With σ ≈ 10 m and residual ≈ 1 cm, χ² should be << 0.01.
         assert!(chi < 0.01, "chi² = {chi} unexpectedly large");
+    }
+
+    #[test]
+    fn gps_update_rejects_massive_outlier() {
+        let state = State::default();
+        let p = initial_covariance();
+        let m = GpsMeasurement {
+            position_ned: Vector3::new(10_000.0, 0.0, 0.0), // absurdly far
+            sigma: Vector3::new(1.0, 1.0, 1.0),
+        };
+        let result = gps_update(&state, &p, &m);
+        assert!(!result.applied, "outlier should have been rejected");
+        // State and covariance unchanged.
+        assert_eq!(result.state.position_ned, state.position_ned);
+    }
+
+    #[test]
+    fn gps_update_pulls_state_toward_measurement() {
+        let state = State::default();
+        let p = initial_covariance();
+        let m = GpsMeasurement {
+            position_ned: Vector3::new(1.0, -0.5, 0.2),
+            sigma: Vector3::new(1.0, 1.0, 1.5),
+        };
+        let result = gps_update(&state, &p, &m);
+        assert!(result.applied, "NIS {} should pass gate", result.nis);
+        // Updated state is closer to measurement than original.
+        let before_err = (state.position_ned - m.position_ned).norm();
+        let after_err = (result.state.position_ned - m.position_ned).norm();
+        assert!(after_err < before_err, "before={before_err}, after={after_err}");
+    }
+
+    #[test]
+    fn gps_update_shrinks_position_variance() {
+        let state = State::default();
+        let p = initial_covariance();
+        let m = GpsMeasurement {
+            position_ned: Vector3::new(1.0, 0.0, 0.0),
+            sigma: Vector3::new(0.5, 0.5, 0.5), // tighter than prior
+        };
+        let result = gps_update(&state, &p, &m);
+        assert!(result.applied);
+        // Each position diagonal should shrink.
+        for i in 0..idx::P_NED_LEN {
+            let before = p.fixed_view::<1, 1>(idx::P_NED_START + i, idx::P_NED_START + i).to_scalar();
+            let after = result
+                .covariance
+                .fixed_view::<1, 1>(idx::P_NED_START + i, idx::P_NED_START + i)
+                .to_scalar();
+            assert!(after < before, "diag {i}: before={before} after={after}");
+        }
+    }
+
+    #[test]
+    fn gps_update_keeps_covariance_symmetric_and_positive() {
+        let state = State::default();
+        let p = initial_covariance();
+        let m = GpsMeasurement {
+            position_ned: Vector3::new(0.5, -0.5, 0.2),
+            sigma: Vector3::new(0.3, 0.3, 0.4),
+        };
+        let result = gps_update(&state, &p, &m);
+        for i in 0..STATE_DIM {
+            let v = result.covariance.fixed_view::<1, 1>(i, i).to_scalar();
+            assert!(v > 0.0, "diagonal {i} = {v}");
+            assert!(v.is_finite());
+        }
+        for i in 0..STATE_DIM {
+            for j in (i + 1)..STATE_DIM {
+                let a = result.covariance.fixed_view::<1, 1>(i, j).to_scalar();
+                let b = result.covariance.fixed_view::<1, 1>(j, i).to_scalar();
+                assert!((a - b).abs() < 1.0e-5, "asymmetric at ({i},{j})");
+            }
+        }
+    }
+
+    proptest! {
+        /// Iterative GPS updates converge: after many updates with small
+        /// noise, the estimated position comes within a fraction of σ.
+        #[test]
+        fn gps_update_converges_to_measured_position(
+            tx in -5.0f32..5.0,
+            ty in -5.0f32..5.0,
+            tz in -5.0f32..5.0,
+        ) {
+            let mut state = State::default();
+            let mut p = initial_covariance();
+            let target = Vector3::new(tx, ty, tz);
+            let m = GpsMeasurement {
+                position_ned: target,
+                sigma: Vector3::new(0.2, 0.2, 0.3),
+            };
+            for _ in 0..20 {
+                let r = gps_update(&state, &p, &m);
+                prop_assert!(r.applied || r.nis.is_finite());
+                if r.applied {
+                    state = r.state;
+                    p = r.covariance;
+                }
+            }
+            let residual = (state.position_ned - target).norm();
+            prop_assert!(residual < 0.5, "residual {residual}  target {target}  got {}", state.position_ned);
+        }
     }
 
     proptest! {
