@@ -607,6 +607,23 @@ pub fn build_transition_jacobian(
     );
     dv_dba_block.copy_from(&dv_dba);
 
+    // ∂p/∂q and ∂p/∂b_a blocks (M1.9b-1d). From the position integration
+    //   p_new = p + v·dt + ½·a_ned·dt²   with a_ned = R(q)·f_body + g
+    //   ⇒ ∂p_new/∂q   = ½·dt² · (∂R/∂q · f_body)          (3×4)
+    //   ⇒ ∂p_new/∂b_a = −½·R(q)·dt²                        (3×3)
+    let half_dt_sq = 0.5 * dt_s * dt_s;
+    let dp_dq = rot_jac * half_dt_sq;
+    let mut dp_dq_block =
+        f.fixed_view_mut::<{ idx::P_NED_LEN }, { idx::Q_LEN }>(idx::P_NED_START, idx::Q_START);
+    dp_dq_block.copy_from(&dp_dq);
+
+    let dp_dba = -r_q * half_dt_sq;
+    let mut dp_dba_block = f.fixed_view_mut::<{ idx::P_NED_LEN }, { idx::ACCEL_BIAS_LEN }>(
+        idx::P_NED_START,
+        idx::ACCEL_BIAS_START,
+    );
+    dp_dba_block.copy_from(&dp_dba);
+
     f
 }
 
@@ -974,6 +991,82 @@ mod tests {
                 (dv_measured - dv_predicted).norm() < 1.0e-4,
                 "measured: {}  predicted: {}  diff_norm: {}",
                 dv_measured, dv_predicted, (dv_measured - dv_predicted).norm()
+            );
+        }
+
+        /// Finite-difference: perturbing accel_bias should change position
+        /// by (∂p/∂b_a) · δb_a  =  -½·R(q)·dt² · δb_a  to first order.
+        #[test]
+        fn dp_dba_block_matches_finite_difference(
+            bx in -0.05f32..0.05,
+            by in -0.05f32..0.05,
+            bz in -0.05f32..0.05,
+            dt_s in 1.0e-3f32..0.02,
+        ) {
+            let state = State::default();
+            let imu = ImuMeasurement {
+                gyro_rad_s: Vector3::zeros(),
+                accel_m_s2: Vector3::new(0.4, -0.2, -9.78),
+            };
+            let delta_b = Vector3::new(bx, by, bz);
+            let state_plus = State { accel_bias: delta_b, ..state };
+            let p_nominal = state.predict(imu, dt_s).position_ned;
+            let p_perturbed = state_plus.predict(imu, dt_s).position_ned;
+            let dp_measured = p_perturbed - p_nominal;
+
+            let f = build_transition_jacobian(&state, &imu, dt_s);
+            let block = f.fixed_view::<{ idx::P_NED_LEN }, { idx::ACCEL_BIAS_LEN }>(
+                idx::P_NED_START, idx::ACCEL_BIAS_START
+            ).into_owned();
+            let dp_predicted = block * delta_b;
+
+            prop_assert!(
+                (dp_measured - dp_predicted).norm() < 1.0e-6,
+                "measured: {}  predicted: {}  diff_norm: {}",
+                dp_measured, dp_predicted, (dp_measured - dp_predicted).norm()
+            );
+        }
+
+        /// Finite-difference: perturbing q should change position to first
+        /// order by (∂p/∂q) · δq. Tolerance wider because q_new ≠ q + δq
+        /// once the normalisation and integration kick in.
+        #[test]
+        fn dp_dq_block_matches_finite_difference(
+            qw_pert in -0.01f32..0.01,
+            qx_pert in -0.01f32..0.01,
+            qy_pert in -0.01f32..0.01,
+            qz_pert in -0.01f32..0.01,
+            dt_s in 1.0e-3f32..0.02,
+        ) {
+            let state = State::default();
+            let imu = ImuMeasurement {
+                gyro_rad_s: Vector3::zeros(),
+                accel_m_s2: Vector3::new(0.3, -0.4, -9.80),
+            };
+            let delta_q = Vector4::new(qw_pert, qx_pert, qy_pert, qz_pert);
+            let state_plus = State {
+                attitude: Quaternion::new(
+                    state.attitude.w + qw_pert,
+                    state.attitude.i + qx_pert,
+                    state.attitude.j + qy_pert,
+                    state.attitude.k + qz_pert,
+                ),
+                ..state
+            };
+            let p_nominal = state.predict(imu, dt_s).position_ned;
+            let p_perturbed = state_plus.predict(imu, dt_s).position_ned;
+            let dp_measured = p_perturbed - p_nominal;
+
+            let f = build_transition_jacobian(&state, &imu, dt_s);
+            let block = f
+                .fixed_view::<{ idx::P_NED_LEN }, { idx::Q_LEN }>(idx::P_NED_START, idx::Q_START)
+                .into_owned();
+            let dp_predicted = block * delta_q;
+
+            prop_assert!(
+                (dp_measured - dp_predicted).norm() < 1.0e-5,
+                "measured: {}  predicted: {}  diff_norm: {}",
+                dp_measured, dp_predicted, (dp_measured - dp_predicted).norm()
             );
         }
 
