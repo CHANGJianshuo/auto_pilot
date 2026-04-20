@@ -479,6 +479,21 @@ pub fn right_multiplication_matrix(q: Quaternion<f32>) -> Matrix4<f32> {
     )
 }
 
+/// Left-multiplication matrix `L(q)` such that `q ⊗ p = L(q) · p_vec`,
+/// where quaternions are laid out as `(w, x, y, z)`.
+///
+/// Useful when you need `∂(q ⊗ p)/∂p = L(q)`.
+#[must_use]
+pub fn left_multiplication_matrix(q: Quaternion<f32>) -> Matrix4<f32> {
+    let (w, x, y, z) = (q.w, q.i, q.j, q.k);
+    Matrix4::new(
+        w, -x, -y, -z,
+        x,  w, -z,  y,
+        y,  z,  w, -x,
+        z, -y,  x,  w,
+    )
+}
+
 /// Build the full 24×24 state-transition Jacobian `F = ∂f/∂x` for the
 /// current predict step.
 ///
@@ -514,6 +529,18 @@ pub fn build_transition_jacobian(
     let r_dq = right_multiplication_matrix(delta_q);
     let mut block = f.fixed_view_mut::<{ idx::Q_LEN }, { idx::Q_LEN }>(idx::Q_START, idx::Q_START);
     block.copy_from(&r_dq);
+
+    // ∂q/∂b_g block. Derivation (small-angle first-order, evaluated at the
+    // current q):
+    //   q_new = q ⊗ δq ;      δq = exp(½·(ω − b_g)·dt) ≈ (1, ½·(ω − b_g)·dt)
+    //   ⇒ ∂δq/∂b_g = -(dt/2) · [top row zero, I₃ below]  (a 4×3 matrix)
+    //   ⇒ ∂q_new/∂b_g = L(q) · ∂δq/∂b_g  =  -(dt/2) · L(q)[:, 1:4]
+    let lq = left_multiplication_matrix(state.attitude);
+    let dq_dbg = -(dt_s / 2.0) * lq.fixed_columns::<{ idx::GYRO_BIAS_LEN }>(1).into_owned();
+    let mut dq_dbg_block =
+        f.fixed_view_mut::<{ idx::Q_LEN }, { idx::GYRO_BIAS_LEN }>(idx::Q_START, idx::GYRO_BIAS_START);
+    dq_dbg_block.copy_from(&dq_dbg);
+
     f
 }
 
@@ -732,6 +759,101 @@ mod tests {
         let expected = Vector4::new(hamilton.w, hamilton.i, hamilton.j, hamilton.k);
         let got = r * p_vec;
         assert!((got - expected).norm() < 1.0e-6);
+    }
+
+    #[test]
+    fn left_mult_matrix_on_identity_quaternion_is_identity() {
+        let l = left_multiplication_matrix(Quaternion::new(1.0, 0.0, 0.0, 0.0));
+        assert!((l - Matrix4::identity()).norm() < 1.0e-9);
+    }
+
+    #[test]
+    fn left_mult_matrix_matches_hamilton_product() {
+        let p = Quaternion::new(0.6, -0.2, 0.4, 0.2);
+        let q = Quaternion::new(0.5, 0.5, 0.5, 0.5);
+        let hamilton = p * q;
+        let l = left_multiplication_matrix(p);
+        let q_vec = Vector4::new(q.w, q.i, q.j, q.k);
+        let expected = Vector4::new(hamilton.w, hamilton.i, hamilton.j, hamilton.k);
+        let got = l * q_vec;
+        assert!((got - expected).norm() < 1.0e-6);
+    }
+
+    #[test]
+    fn dq_dbg_block_is_zero_at_dt_zero() {
+        let state = State::default();
+        let imu = ImuMeasurement::default();
+        let f = build_transition_jacobian(&state, &imu, 0.0);
+        let block =
+            f.fixed_view::<{ idx::Q_LEN }, { idx::GYRO_BIAS_LEN }>(idx::Q_START, idx::GYRO_BIAS_START);
+        assert!(block.norm() < 1.0e-9);
+    }
+
+    #[test]
+    fn dq_dbg_block_with_identity_q_matches_expected_form() {
+        // At q = identity, L(q) = I_4, so the 4×3 block should be:
+        //    -(dt/2) · L(q)[:, 1:4]  =  -(dt/2) · [0; I_3]
+        let state = State::default();
+        let imu = ImuMeasurement::default();
+        let dt = 0.01_f32;
+        let f = build_transition_jacobian(&state, &imu, dt);
+        let block =
+            f.fixed_view::<{ idx::Q_LEN }, { idx::GYRO_BIAS_LEN }>(idx::Q_START, idx::GYRO_BIAS_START);
+        // Row 0 (scalar part) should be all zero.
+        for j in 0..idx::GYRO_BIAS_LEN {
+            let v = block.fixed_view::<1, 1>(0, j).to_scalar();
+            assert!(v.abs() < 1.0e-9, "scalar row (0, {j}) = {v}");
+        }
+        // Rows 1..4 should be -(dt/2) · I_3.
+        for i in 0..idx::GYRO_BIAS_LEN {
+            for j in 0..idx::GYRO_BIAS_LEN {
+                let v = block.fixed_view::<1, 1>(i + 1, j).to_scalar();
+                let expected = if i == j { -dt / 2.0 } else { 0.0 };
+                assert!((v - expected).abs() < 1.0e-9);
+            }
+        }
+    }
+
+    proptest! {
+        /// Consistency check: a positive gyro bias error δb_g causes the
+        /// predicted quaternion to move opposite to a positive δω would
+        /// (because ω_effective = ω - b_g). Concretely, if we perturb
+        /// gyro_bias and re-run the predict, the resulting quaternion
+        /// difference should equal ∂q/∂b_g · δb_g to first order.
+        #[test]
+        fn dq_dbg_block_matches_finite_difference(
+            bx in -0.01f32..0.01,
+            by in -0.01f32..0.01,
+            bz in -0.01f32..0.01,
+            dt_s in 1.0e-3f32..0.02,
+        ) {
+            let state = State::default();
+            let imu = ImuMeasurement {
+                gyro_rad_s: Vector3::new(0.1, -0.2, 0.15), // nominal rate
+                accel_m_s2: Vector3::zeros(),
+            };
+            let delta_b = Vector3::new(bx, by, bz);
+
+            let state_plus = State { gyro_bias: delta_b, ..state };
+
+            let q_nominal = state.predict(imu, dt_s).attitude;
+            let q_perturbed = state_plus.predict(imu, dt_s).attitude;
+            let dq_measured =
+                Vector4::new(q_perturbed.w, q_perturbed.i, q_perturbed.j, q_perturbed.k)
+                    - Vector4::new(q_nominal.w, q_nominal.i, q_nominal.j, q_nominal.k);
+
+            let f = build_transition_jacobian(&state, &imu, dt_s);
+            let block =
+                f.fixed_view::<{ idx::Q_LEN }, { idx::GYRO_BIAS_LEN }>(idx::Q_START, idx::GYRO_BIAS_START)
+                    .into_owned();
+            let dq_predicted = block * delta_b;
+
+            prop_assert!(
+                (dq_measured - dq_predicted).norm() < 1.0e-4,
+                "measured: {}  predicted: {}  diff_norm: {}",
+                dq_measured, dq_predicted, (dq_measured - dq_predicted).norm()
+            );
+        }
     }
 
     #[test]
