@@ -28,19 +28,23 @@ unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 
+# Lint policy:
+#   * Safety-critical rules are `deny` (panic / unwrap / indexing / ...) —
+#     these enforce the `no-panic-in-firmware` rule from CLAUDE.md.
+#   * Stylistic rules (`pedantic`, `cargo`) are NOT enabled at the workspace
+#     level. Each crate can opt in if it wants stricter style locally.
+#     The `cargo` group is aimed at published crates and fires on things
+#     like missing `keywords`/`categories` which don't apply to an internal
+#     monorepo.
 [workspace.lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-cargo = { level = "warn", priority = -1 }
+# Project-defined safety invariants:
 panic = "deny"
 unwrap_used = "deny"
 expect_used = "deny"
 indexing_slicing = "deny"
+# Numeric hygiene — warn but don't break builds.
 integer_division = "warn"
-float_arithmetic = "allow"
 as_conversions = "warn"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-module_name_repetitions = "allow"
 
 [workspace.dependencies]
 # Math / linear algebra (no_std with libm)

@@ -6,6 +6,15 @@
 
 set -eo pipefail   # NOTE: NOT -u — ROS setup.bash references unbound vars.
 
+# --- Cargo volume ownership ----------------------------------------------
+# Named volumes mount as root-owned the first time. Take ownership so the
+# dev user can write into the registry / git caches.
+for d in /opt/rust/cargo/registry /opt/rust/cargo/git; do
+    if [[ -d "$d" && ! -w "$d" ]]; then
+        sudo chown -R "$(id -u):$(id -g)" "$d" 2>/dev/null || true
+    fi
+done
+
 # --- ROS 2 ----------------------------------------------------------------
 if [[ -n "${ROS_DISTRO:-}" && -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]]; then
     # ROS scripts assume these exist; keep them empty so `-u` callers downstream
