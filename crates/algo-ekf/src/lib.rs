@@ -14,7 +14,7 @@
 //! - Quaternion stays unit-normalized within 1e-6 after each predict/update.
 //! - No integer overflow, no panic paths.
 
-use nalgebra::{Quaternion, SVector, UnitQuaternion, Vector2, Vector3, Vector4};
+use nalgebra::{Matrix4, Quaternion, SVector, UnitQuaternion, Vector2, Vector3, Vector4};
 
 /// Dimension of the EKF state vector.
 pub const STATE_DIM: usize = 24;
@@ -464,6 +464,59 @@ impl State {
     }
 }
 
+/// Right-multiplication matrix `R(q)` such that `p ⊗ q = R(q) · p_vec`,
+/// where quaternions are laid out as `(w, x, y, z)`.
+///
+/// Useful when you need `∂(p ⊗ q)/∂p = R(q)`.
+#[must_use]
+pub fn right_multiplication_matrix(q: Quaternion<f32>) -> Matrix4<f32> {
+    let (w, x, y, z) = (q.w, q.i, q.j, q.k);
+    Matrix4::new(
+        w, -x, -y, -z,
+        x,  w,  z, -y,
+        y, -z,  w,  x,
+        z,  y, -x,  w,
+    )
+}
+
+/// Build the full 24×24 state-transition Jacobian `F = ∂f/∂x` for the
+/// current predict step.
+///
+/// Layout so far (filled incrementally across M1.9b subtasks):
+///
+/// ```text
+///   ┌──────────────┬──────────┬──────────┬───────────┐
+///   │ ∂q/∂q = R(δq)│  (I)     │  (I)     │   ...     │
+///   │ ∂v/∂q = (I)  │ ∂v/∂v=I  │          │           │
+///   │ ∂p/∂q = (I)  │ ∂p/∂v=Idt│ ∂p/∂p=I  │           │
+///   │  ...         │          │          │  I        │
+///   └──────────────┴──────────┴──────────┴───────────┘
+/// ```
+///
+/// Filled so far:
+/// * `∂q/∂q` — closed-form via right-multiplication by δq = exp(½·ω·dt)
+/// * `∂p/∂v` — `I · dt` (linear)
+///
+/// Still identity (M1.9b-1b/c/d):
+/// * `∂q/∂b_g`, `∂v/∂q`, `∂v/∂b_a`, `∂p/∂q`
+#[must_use]
+pub fn build_transition_jacobian(
+    state: &State,
+    imu: &ImuMeasurement,
+    dt_s: f32,
+) -> Covariance {
+    let mut f = kinematic_transition(dt_s);
+    if !dt_s.is_finite() || dt_s < 0.0 {
+        return f;
+    }
+    let omega = imu.gyro_rad_s - state.gyro_bias;
+    let delta_q = quaternion_exp(omega, dt_s);
+    let r_dq = right_multiplication_matrix(delta_q);
+    let mut block = f.fixed_view_mut::<{ idx::Q_LEN }, { idx::Q_LEN }>(idx::Q_START, idx::Q_START);
+    block.copy_from(&r_dq);
+    f
+}
+
 /// Exact quaternion exponential for a body-frame angular rate `omega` applied
 /// over duration `dt_s`. Returns a **unit** rotation quaternion δq such that
 /// `q_new = q ⊗ δq` integrates attitude.
@@ -663,7 +716,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn right_mult_matrix_on_identity_quaternion_is_identity() {
+        let r = right_multiplication_matrix(Quaternion::new(1.0, 0.0, 0.0, 0.0));
+        assert!((r - Matrix4::identity()).norm() < 1.0e-9);
+    }
+
+    #[test]
+    fn right_mult_matrix_matches_hamilton_product() {
+        let p = Quaternion::new(0.5, 0.5, 0.5, 0.5); // unit quaternion
+        let q = Quaternion::new(0.6, -0.2, 0.4, 0.2);
+        let hamilton = p * q;
+        let r = right_multiplication_matrix(q);
+        let p_vec = Vector4::new(p.w, p.i, p.j, p.k);
+        let expected = Vector4::new(hamilton.w, hamilton.i, hamilton.j, hamilton.k);
+        let got = r * p_vec;
+        assert!((got - expected).norm() < 1.0e-6);
+    }
+
+    #[test]
+    fn build_transition_jacobian_is_identity_at_zero_rate_and_dt() {
+        let state = State::default();
+        let imu = ImuMeasurement::default();
+        let f = build_transition_jacobian(&state, &imu, 0.0);
+        assert!((f - Covariance::identity()).norm() < 1.0e-9);
+    }
+
+    #[test]
+    fn build_transition_jacobian_zero_rate_keeps_attitude_block_identity() {
+        let state = State::default();
+        let imu = ImuMeasurement::default(); // zero gyro
+        let dt = 0.005;
+        let f = build_transition_jacobian(&state, &imu, dt);
+        let block = f.fixed_view::<{ idx::Q_LEN }, { idx::Q_LEN }>(idx::Q_START, idx::Q_START);
+        assert!((block - Matrix4::identity()).norm() < 1.0e-6);
+    }
+
     proptest! {
+        /// The quaternion self-Jacobian `∂q/∂q = R(δq)` has determinant
+        /// exactly 1 when δq is a unit quaternion (rotation preserves volume).
+        #[test]
+        fn dq_dq_block_has_unit_determinant(
+            wx in -5.0f32..5.0,
+            wy in -5.0f32..5.0,
+            wz in -5.0f32..5.0,
+            dt_s in 1.0e-4f32..0.02,
+        ) {
+            let state = State::default();
+            let imu = ImuMeasurement {
+                gyro_rad_s: Vector3::new(wx, wy, wz),
+                accel_m_s2: Vector3::zeros(),
+            };
+            let f = build_transition_jacobian(&state, &imu, dt_s);
+            let block: Matrix4<f32> =
+                f.fixed_view::<{ idx::Q_LEN }, { idx::Q_LEN }>(idx::Q_START, idx::Q_START).into_owned();
+            // Determinant of a right-multiplication matrix of a unit quaternion = 1.
+            prop_assert!((block.determinant() - 1.0).abs() < 1.0e-4,
+                "det(block) = {}", block.determinant());
+        }
+
         /// End-to-end: feeding the kinematic F to predict_covariance produces
         /// a symmetric P_new for any positive dt in the normal operating range.
         #[test]
