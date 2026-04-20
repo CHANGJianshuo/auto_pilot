@@ -130,6 +130,91 @@ pub fn enforce_symmetry(p: &mut Covariance) {
     *p *= 0.5;
 }
 
+/// Per-second process-noise intensities (1-σ). Multiplied by `dt` in
+/// [`build_process_noise`] to yield the one-step `Q` matrix.
+///
+/// Units match each state group's natural rate:
+/// * `gyro_bias_per_s` — rad/s per √s (random walk of the gyro zero-bias)
+/// * `accel_bias_per_s` — m/s² per √s
+/// * `attitude_per_s` — rad per √s (angular process noise beyond gyro noise)
+/// * `velocity_per_s` — m/s per √s (unmodeled acceleration)
+/// * `position_per_s` — m per √s (numerical guard against zero variance;
+///   real position drift comes from velocity integration)
+/// * `mag_ned_per_s` / `mag_bias_per_s` — gauss per √s
+/// * `wind_per_s` — m/s per √s (weather-driven wind drift)
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessNoise {
+    pub attitude_per_s: f32,
+    pub velocity_per_s: f32,
+    pub position_per_s: f32,
+    pub gyro_bias_per_s: f32,
+    pub accel_bias_per_s: f32,
+    pub mag_ned_per_s: f32,
+    pub mag_bias_per_s: f32,
+    pub wind_per_s: f32,
+}
+
+impl Default for ProcessNoise {
+    fn default() -> Self {
+        Self {
+            attitude_per_s: 1.0e-4,
+            velocity_per_s: 1.0e-2,
+            position_per_s: 1.0e-6,
+            gyro_bias_per_s: 1.0e-5,
+            accel_bias_per_s: 1.0e-4,
+            mag_ned_per_s: 1.0e-6,
+            mag_bias_per_s: 1.0e-5,
+            wind_per_s: 1.0e-2,
+        }
+    }
+}
+
+/// Build the one-step process-noise covariance `Q = diag(σ²·dt)` from
+/// per-second intensities. Non-finite or negative `dt` yields the zero
+/// matrix (the caller's predict skips in that case anyway).
+#[must_use]
+pub fn build_process_noise(noise: ProcessNoise, dt_s: f32) -> Covariance {
+    if !dt_s.is_finite() || dt_s <= 0.0 {
+        return Covariance::zeros();
+    }
+    let mut q = Covariance::zeros();
+    fill_block(&mut q, idx::Q_START, idx::Q_LEN, noise.attitude_per_s * libm::sqrtf(dt_s));
+    fill_block(&mut q, idx::V_NED_START, idx::V_NED_LEN, noise.velocity_per_s * libm::sqrtf(dt_s));
+    fill_block(&mut q, idx::P_NED_START, idx::P_NED_LEN, noise.position_per_s * libm::sqrtf(dt_s));
+    fill_block(&mut q, idx::GYRO_BIAS_START, idx::GYRO_BIAS_LEN, noise.gyro_bias_per_s * libm::sqrtf(dt_s));
+    fill_block(&mut q, idx::ACCEL_BIAS_START, idx::ACCEL_BIAS_LEN, noise.accel_bias_per_s * libm::sqrtf(dt_s));
+    fill_block(&mut q, idx::MAG_NED_START, idx::MAG_NED_LEN, noise.mag_ned_per_s * libm::sqrtf(dt_s));
+    fill_block(&mut q, idx::MAG_BIAS_START, idx::MAG_BIAS_LEN, noise.mag_bias_per_s * libm::sqrtf(dt_s));
+    fill_block(&mut q, idx::WIND_NE_START, idx::WIND_NE_LEN, noise.wind_per_s * libm::sqrtf(dt_s));
+    q
+}
+
+/// Propagate the covariance forward by one step using `P ← F·P·Fᵀ + Q`,
+/// then symmetrise.
+///
+/// **M1.9a placeholder**: the state-transition Jacobian `F` is taken as the
+/// identity so the data pipeline is end-to-end testable before the full
+/// quaternion-aware Jacobian lands in M1.9b. The `enforce_symmetry` call
+/// at the end is the production-shape guard; swapping in the real `F`
+/// later keeps the call-site unchanged.
+#[must_use]
+pub fn predict_covariance(
+    p_prev: &Covariance,
+    f_transition: &Covariance,
+    q: &Covariance,
+) -> Covariance {
+    let mut p_next = f_transition * p_prev * f_transition.transpose() + q;
+    enforce_symmetry(&mut p_next);
+    p_next
+}
+
+/// Identity transition matrix — the M1.9a placeholder for `F`. Replace
+/// with the quaternion-aware Jacobian in M1.9b.
+#[must_use]
+pub fn identity_transition() -> Covariance {
+    Covariance::identity()
+}
+
 /// Minimum quaternion norm accepted for normalization.
 ///
 /// Near-zero quaternions have no unique direction; any prediction or update
@@ -484,6 +569,48 @@ mod tests {
                 } else {
                     assert_eq!(v, 0.0, "off-diagonal ({i}, {j}) must be 0, got {v}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn build_process_noise_rejects_bad_dt() {
+        let n = ProcessNoise::default();
+        assert_eq!(build_process_noise(n, -1.0).norm(), 0.0);
+        assert_eq!(build_process_noise(n, 0.0).norm(), 0.0);
+        assert_eq!(build_process_noise(n, f32::NAN).norm(), 0.0);
+    }
+
+    #[test]
+    fn predict_covariance_with_identity_f_adds_q() {
+        let p = initial_covariance();
+        let f = identity_transition();
+        let q = build_process_noise(ProcessNoise::default(), 0.01);
+        let p_next = predict_covariance(&p, &f, &q);
+        // With F=I: p_next = p + q, so each diagonal increases by q's diagonal.
+        for i in 0..STATE_DIM {
+            let p_diag = p.fixed_view::<1, 1>(i, i).to_scalar();
+            let q_diag = q.fixed_view::<1, 1>(i, i).to_scalar();
+            let pnext_diag = p_next.fixed_view::<1, 1>(i, i).to_scalar();
+            assert!(
+                (pnext_diag - (p_diag + q_diag)).abs() < 1.0e-8,
+                "diag {i}: got {pnext_diag}, expected {}",
+                p_diag + q_diag
+            );
+        }
+    }
+
+    #[test]
+    fn predict_covariance_keeps_symmetric_input_symmetric() {
+        let p = initial_covariance(); // already symmetric (diagonal)
+        let f = identity_transition();
+        let q = build_process_noise(ProcessNoise::default(), 0.005);
+        let p_next = predict_covariance(&p, &f, &q);
+        for i in 0..STATE_DIM {
+            for j in (i + 1)..STATE_DIM {
+                let a = p_next.fixed_view::<1, 1>(i, j).to_scalar();
+                let b = p_next.fixed_view::<1, 1>(j, i).to_scalar();
+                assert!((a - b).abs() < 1.0e-6);
             }
         }
     }
