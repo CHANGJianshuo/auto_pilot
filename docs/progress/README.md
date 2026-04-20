@@ -27,6 +27,7 @@
 | [0021](./0021-gps-update-joseph.md) | 2026-04-20 | M1.10b GPS Kalman + Joseph | `ed3114f` | `gps_update()` 完整卡尔曼增益 + Joseph 协方差 + χ²=11.345 外值门；20 步 proptest 256 个随机目标全都在 0.5m 内收敛。 |
 | [0022](./0022-magnetometer-update.md) | 2026-04-20 | M1.11 Magnetometer update | `5c1231f` | 非线性 `h(x) = R(q)ᵀ·mag_ned + mag_bias`；3×24 的 H 矩阵，转置 Jacobian 通过 q 共轭识等式实现；有限差分 proptest 验证 H 到 1e-4。 |
 | [0023](./0023-barometer-update.md) | 2026-04-20 | M1.12 Barometer update | `ab3e2b3` | 1 维高度观测，标量 S / 标量 NIS / 纯数字求逆；Joseph form 退化到列操作；30 步 proptest 256 个随机高度目标收敛到 30cm 内。 |
+| [0024](./0024-end-to-end-simulation.md) | 2026-04-20 | M1.13 端到端多源融合 | `9574f99` | 2 秒 1 kHz 预测 + GPS 5Hz + Mag 25Hz + Baro 50Hz 并发；EKF 收敛位置 < 0.3m, 高度 < 0.2m。**EKF 数学栈的最终集成验证**。 |
 
 ## 写新文档时遵守的模板
 
