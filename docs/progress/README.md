@@ -12,6 +12,7 @@
 | [0006](./0006-priority-proofs.md) | 2026-04-20 | M1.2 Priority 排序证明 | `01c8c26` | `Priority::{rank, from_rank, ALL}` + 5 个 Kani 证明（全序/传递/反对称/round-trip/越界无 panic）。49 ms 证完。 |
 | [0007](./0007-kani-in-image.md) | 2026-04-20 | M1.3 Kani 装进 Dockerfile | `f371d3c` | 镜像自带 kani-verifier + CBMC + nightly toolchain；`docker run --rm` 即可跑所有证明。 |
 | [0008](./0008-healthlevel-proofs.md) | 2026-04-20 | M1.4 HealthLevel 状态机 | `94f1c24` | 单向 FDIR 不变量（monotone transition + ground-only reset）+ 5 个 Kani 证明 21 ms 通过。 |
+| [0009](./0009-state-24d-vector.md) | 2026-04-20 | M1.5 State ↔ 24-D 向量 | `33fdc0d` | 24 维序列化 + `idx` 模块、2 个 256-sample proptest round-trip、EKF 协方差矩阵的数据基础。 |
 
 ## 写新文档时遵守的模板
 
