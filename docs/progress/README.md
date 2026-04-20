@@ -10,6 +10,8 @@
 | [0004](./0004-quaternion-invariant.md) | 2026-04-20 | M1.0 四元数归一化不变量 | `2a74d09` | `algo-ekf::State::normalize_attitude` + proptest（256 样本） + 3 个边界用例。**项目第一个真正的测试**。 |
 | [0005](./0005-kani-harness.md) | 2026-04-20 | M1.1 Kani 形式化证明 | `e421dc2` | 重构 normalize_attitude 让退化检查先于 sqrt；Kani 0.67.0 装好，证明零四元数 100% 被拒绝，1.8 s 通过。**项目第一个形式化证明**。 |
 | [0006](./0006-priority-proofs.md) | 2026-04-20 | M1.2 Priority 排序证明 | `01c8c26` | `Priority::{rank, from_rank, ALL}` + 5 个 Kani 证明（全序/传递/反对称/round-trip/越界无 panic）。49 ms 证完。 |
+| [0007](./0007-kani-in-image.md) | 2026-04-20 | M1.3 Kani 装进 Dockerfile | `f371d3c` | 镜像自带 kani-verifier + CBMC + nightly toolchain；`docker run --rm` 即可跑所有证明。 |
+| [0008](./0008-healthlevel-proofs.md) | 2026-04-20 | M1.4 HealthLevel 状态机 | `94f1c24` | 单向 FDIR 不变量（monotone transition + ground-only reset）+ 5 个 Kani 证明 21 ms 通过。 |
 
 ## 写新文档时遵守的模板
 
