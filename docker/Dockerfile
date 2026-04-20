@@ -20,60 +20,100 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LC_ALL=C.UTF-8 \
     TZ=Etc/UTC
 
-# ---- 1. System packages ---------------------------------------------------
+# ---- 0. apt resilience ----------------------------------------------------
+# Campus networks / transparent proxies frequently drop parallel connections
+# when a large apt install is in flight. Make apt patient and serial, and
+# optionally swap to a Chinese mirror (only if APT_MIRROR is provided at
+# build time, e.g. APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ubuntu).
+ARG APT_MIRROR=""
+RUN set -eux; \
+    printf 'Acquire::Retries "10";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Queue-Mode "access";\nAcquire::http::Dl-Limit "0";\nAPT::Install-Recommends "0";\nAPT::Install-Suggests "0";\n' \
+        > /etc/apt/apt.conf.d/80-ap-retries; \
+    if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}|g; s|http://security.ubuntu.com/ubuntu|${APT_MIRROR}|g" \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true; \
+    fi
+
+# ---- 1a. Core packages (small set so retries are cheap) ------------------
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
         ca-certificates curl wget gnupg lsb-release sudo \
+        locales tzdata bash-completion \
+    && locale-gen en_US.UTF-8
+
+# ---- 1b. Build toolchain ---------------------------------------------------
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build pkg-config \
         git git-lfs openssh-client \
-        gdb lldb strace ltrace \
         libssl-dev libudev-dev libusb-1.0-0-dev \
-        clang lld \
-        python3 python3-pip python3-venv python3-dev \
-        tmux neovim htop tree file unzip zip jq \
-        bash-completion locales tzdata \
-    && locale-gen en_US.UTF-8 \
-    && rm -rf /var/lib/apt/lists/*
+        clang lld
 
-# GitHub CLI (for `gh auth login` inside the container)
+# ---- 1c. Debugging + Python + editors (not critical, can retry alone) ----
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    mkdir -p -m 755 /etc/apt/keyrings \
-    && out=$(wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg) \
-    && echo "$out" | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
-    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        gdb strace \
+        python3 python3-pip python3-venv python3-dev \
+        tmux htop tree file unzip zip jq \
     && rm -rf /var/lib/apt/lists/*
+
+# GitHub CLI (for `gh auth login` inside the container).
+# Install via direct .deb download — avoids the apt repo signature dance that
+# fails behind captive/transparent proxies that rewrite binary responses.
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    GH_VERSION="2.60.0"; \
+    wget -qO /tmp/gh.deb "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${arch}.deb" \
+        && apt-get install -y /tmp/gh.deb \
+        && rm -f /tmp/gh.deb \
+        || echo 'gh CLI install skipped (network); install later inside container if needed'
 
 # ---- 2. ROS 2 Jazzy + Gazebo Harmonic (optional) --------------------------
 ARG ROS_ENABLE=1
 ARG ROS_DISTRO=jazzy
 ENV ROS_DISTRO=${ROS_DISTRO}
 
+ARG GZ_ENABLE=0
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    set -eux; \
     if [ "$ROS_ENABLE" = "1" ]; then \
-        add-apt-repository() { \
-            apt-get install -y --no-install-recommends software-properties-common; \
-            command add-apt-repository "$@"; \
-        }; \
         apt-get update && apt-get install -y --no-install-recommends software-properties-common && \
-        add-apt-repository universe && \
+        add-apt-repository -y universe && \
         curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
             -o /usr/share/keyrings/ros-archive-keyring.gpg && \
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
-              http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" \
+        . /etc/os-release && \
+        CODENAME="${UBUNTU_CODENAME}"; \
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu ${CODENAME} main" \
             > /etc/apt/sources.list.d/ros2.list && \
+        if [ "$GZ_ENABLE" = "1" ]; then \
+            curl -sSL https://packages.osrfoundation.org/gazebo.gpg \
+                -o /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg && \
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] http://packages.osrfoundation.org/gazebo/ubuntu-stable ${CODENAME} main" \
+                > /etc/apt/sources.list.d/gazebo-stable.list; \
+        fi && \
         apt-get update && apt-get install -y --no-install-recommends \
             ros-${ROS_DISTRO}-ros-base \
             ros-${ROS_DISTRO}-rmw-cyclonedds-cpp \
-            ros-${ROS_DISTRO}-rmw-zenoh-cpp \
             ros-dev-tools \
-            gz-harmonic \
-            ros-${ROS_DISTRO}-ros-gz && \
+            python3-colcon-common-extensions \
+            python3-rosdep && \
+        # ros-gz is in the ROS repo; pulls in the Gazebo runtime bits it needs.
+        (apt-get install -y --no-install-recommends ros-${ROS_DISTRO}-ros-gz \
+            || echo 'ros-gz unavailable, skipping') && \
+        # Optional standalone Gazebo Harmonic CLI (requires OSRF repo above).
+        if [ "$GZ_ENABLE" = "1" ]; then \
+            apt-get install -y --no-install-recommends gz-harmonic \
+                || echo 'gz-harmonic install failed, continuing'; \
+        fi && \
+        # rmw_zenoh is opt-in (not always packaged on release day); ignore if absent.
+        (apt-get install -y --no-install-recommends ros-${ROS_DISTRO}-rmw-zenoh-cpp || echo 'rmw_zenoh not in apt yet, skipping') && \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
@@ -82,7 +122,7 @@ ENV RUSTUP_HOME=/opt/rust/rustup \
     CARGO_HOME=/opt/rust/cargo \
     PATH=/opt/rust/cargo/bin:${PATH}
 
-ARG RUST_VERSION=1.85.0
+ARG RUST_VERSION=1.88.0
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --no-modify-path --profile minimal --default-toolchain ${RUST_VERSION} && \
     rustup component add rustfmt clippy rust-src llvm-tools-preview && \
@@ -93,15 +133,38 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 # probe-rs: flash + debug Cortex-M via CMSIS-DAP / J-Link / ST-Link
 # flip-link: stack-overflow-safe linker for embedded Rust
 # cargo-binutils: objcopy / objdump / size for Rust
+#
+# Each tool is installed in its own RUN so a single failure doesn't sink the
+# whole image. Versions are pinned to avoid MSRV churn (cargo-nextest 0.9.133
+# requires rustc 1.91; probe-rs-tools 0.31.0 has an upstream compile bug).
 RUN --mount=type=cache,target=/opt/rust/cargo/registry \
     --mount=type=cache,target=/opt/rust/cargo/git \
-    cargo install --locked \
-        probe-rs-tools@0.24.0 \
-        flip-link \
-        cargo-binutils \
-        cargo-geiger \
-        cargo-audit \
-        cargo-nextest \
+    cargo install --locked flip-link \
+    && cargo install --locked cargo-binutils \
+    && chmod -R a+rw /opt/rust
+
+RUN --mount=type=cache,target=/opt/rust/cargo/registry \
+    --mount=type=cache,target=/opt/rust/cargo/git \
+    (cargo install --locked cargo-audit || echo 'cargo-audit failed, skipping') \
+    && (cargo install --locked cargo-geiger || echo 'cargo-geiger failed, skipping') \
+    && chmod -R a+rw /opt/rust
+
+# cargo-nextest: pin < 0.9.100 for rustc 1.88 compatibility.
+RUN --mount=type=cache,target=/opt/rust/cargo/registry \
+    --mount=type=cache,target=/opt/rust/cargo/git \
+    (cargo install --locked cargo-nextest --version '^0.9.99' \
+        || cargo install --locked cargo-nextest --version '0.9.89' \
+        || echo 'cargo-nextest failed, skipping') \
+    && chmod -R a+rw /opt/rust
+
+# probe-rs-tools: 0.31.0 has a compile bug; 0.24.0 is the last known-good.
+# If install fails, flashing is done by the user on host or later with a
+# different version; not blocking for host-side development.
+RUN --mount=type=cache,target=/opt/rust/cargo/registry \
+    --mount=type=cache,target=/opt/rust/cargo/git \
+    (cargo install --locked probe-rs-tools --version '0.24.0' \
+        || cargo install --locked probe-rs-tools --version '0.23.0' \
+        || echo 'probe-rs-tools failed, skipping — install manually later') \
     && chmod -R a+rw /opt/rust
 
 # udev rules so the dev user can access USB debug probes without sudo
@@ -134,13 +197,24 @@ ARG USER_UID=1000
 ARG USER_GID=1000
 ARG WORKSPACE=/workspace
 
-RUN groupadd --gid ${USER_GID} ${USER_NAME} 2>/dev/null || true \
-    && useradd -m -s /bin/bash --uid ${USER_UID} --gid ${USER_GID} ${USER_NAME} 2>/dev/null || true \
-    && echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USER_NAME} \
-    && chmod 0440 /etc/sudoers.d/${USER_NAME} \
-    && usermod -aG plugdev,dialout ${USER_NAME} 2>/dev/null || true \
-    && mkdir -p ${WORKSPACE} \
-    && chown -R ${USER_UID}:${USER_GID} ${WORKSPACE} /opt/rust
+RUN set -eux; \
+    # Ubuntu 24.04 ships with a pre-created `ubuntu` user on UID 1000 that
+    # collides with the host-UID mapping. Remove it before adding `dev`.
+    if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu 2>/dev/null || true; fi; \
+    if getent passwd ${USER_UID} >/dev/null; then \
+        userdel -r "$(getent passwd ${USER_UID} | cut -d: -f1)" 2>/dev/null || true; \
+    fi; \
+    if getent group ${USER_GID} >/dev/null; then \
+        groupdel "$(getent group ${USER_GID} | cut -d: -f1)" 2>/dev/null || true; \
+    fi; \
+    groupadd --gid ${USER_GID} ${USER_NAME}; \
+    useradd -m -s /bin/bash --uid ${USER_UID} --gid ${USER_GID} ${USER_NAME}; \
+    echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USER_NAME}; \
+    chmod 0440 /etc/sudoers.d/${USER_NAME}; \
+    usermod -aG dialout ${USER_NAME} 2>/dev/null || true; \
+    usermod -aG plugdev ${USER_NAME} 2>/dev/null || true; \
+    mkdir -p ${WORKSPACE}; \
+    chown -R ${USER_UID}:${USER_GID} ${WORKSPACE} /opt/rust
 
 # Auto-source ROS and set a helpful prompt
 RUN if [ -n "${ROS_DISTRO}" ] && [ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]; then \

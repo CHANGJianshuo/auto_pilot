@@ -4,10 +4,15 @@
 # Sources ROS (if present), configures git safe.directory for the bind-mounted
 # workspace, and hands off to the requested command.
 
-set -euo pipefail
+set -eo pipefail   # NOTE: NOT -u — ROS setup.bash references unbound vars.
 
 # --- ROS 2 ----------------------------------------------------------------
 if [[ -n "${ROS_DISTRO:-}" && -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]]; then
+    # ROS scripts assume these exist; keep them empty so `-u` callers downstream
+    # don't trip either.
+    export AMENT_TRACE_SETUP_FILES="${AMENT_TRACE_SETUP_FILES:-}"
+    export AMENT_PYTHON_EXECUTABLE="${AMENT_PYTHON_EXECUTABLE:-}"
+    export COLCON_TRACE="${COLCON_TRACE:-}"
     # shellcheck disable=SC1090
     source "/opt/ros/${ROS_DISTRO}/setup.bash"
 fi
