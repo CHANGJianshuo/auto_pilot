@@ -10,6 +10,9 @@ description = "Multirotor application binary: composes HAL, RTOS, bus, estimator
 [lints]
 workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "app-copter"
 path = "src/main.rs"
@@ -25,3 +28,7 @@ algo-alloc  = { path = "../algo-alloc" }
 algo-fdir   = { path = "../algo-fdir" }
 nn-runtime  = { path = "../nn-runtime" }
 comms-mavlink = { path = "../comms-mavlink" }
+nalgebra = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
