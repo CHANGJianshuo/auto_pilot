@@ -217,6 +217,32 @@ pub fn identity_transition() -> Covariance {
     Covariance::identity()
 }
 
+/// Run one full EKF predict cycle: advance state and covariance one step.
+///
+/// This is the recommended entry point for the rate-loop task — it bundles
+/// state propagation, Jacobian construction, process-noise build, and
+/// covariance update into a single call so that callers can't forget one
+/// of the four pieces.
+///
+/// After every call the caller should check [`State::attitude`] remains
+/// within [`QUATERNION_NORM_TOLERANCE`] of unit norm (the `predict` step
+/// normalizes it, but if the normalization bailed because of a degenerate
+/// input, the attitude carries the previous step's value).
+#[must_use]
+pub fn predict_step(
+    state: &State,
+    covariance: &Covariance,
+    imu: ImuMeasurement,
+    noise: ProcessNoise,
+    dt_s: f32,
+) -> (State, Covariance) {
+    let f = build_transition_jacobian(state, &imu, dt_s);
+    let q = build_process_noise(noise, dt_s);
+    let next_state = state.predict(imu, dt_s);
+    let next_covariance = predict_covariance(covariance, &f, &q);
+    (next_state, next_covariance)
+}
+
 /// Build the state-transition Jacobian `F = ∂f/∂x` with the **trivial**
 /// kinematic couplings filled in.
 ///
@@ -898,6 +924,43 @@ mod tests {
     }
 
     #[test]
+    fn predict_step_hovers_stable_state_is_stable_covariance() {
+        // Level + stationary + zero rate: state stays put, covariance grows
+        // only by the (tiny) process-noise diagonal.
+        let mut state = State::default();
+        let mut p = initial_covariance();
+        let imu = ImuMeasurement {
+            gyro_rad_s: Vector3::zeros(),
+            accel_m_s2: Vector3::new(0.0, 0.0, -GRAVITY_M_S2),
+        };
+        let noise = ProcessNoise::default();
+        let dt = 0.001_f32;
+        for _ in 0..1000 {
+            let (s, c) = predict_step(&state, &p, imu, noise, dt);
+            state = s;
+            p = c;
+        }
+        // ‖q‖ still unit.
+        assert!((state.attitude.norm() - 1.0).abs() < QUATERNION_NORM_TOLERANCE * 10.0);
+        // Velocity / position still bounded (numerical drift only).
+        assert!(state.velocity_ned.norm() < 0.01);
+        assert!(state.position_ned.norm() < 0.01);
+        // Covariance diagonal all positive.
+        for i in 0..STATE_DIM {
+            let v = p.fixed_view::<1, 1>(i, i).to_scalar();
+            assert!(v > 0.0, "P_{i}{i} went non-positive: {v}");
+        }
+        // Covariance stays symmetric.
+        for i in 0..STATE_DIM {
+            for j in (i + 1)..STATE_DIM {
+                let a = p.fixed_view::<1, 1>(i, j).to_scalar();
+                let b = p.fixed_view::<1, 1>(j, i).to_scalar();
+                assert!((a - b).abs() < 1.0e-4, "P asymmetric at ({i},{j}): {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
     fn rotation_matrix_identity_quaternion() {
         let r = rotation_matrix(Quaternion::new(1.0, 0.0, 0.0, 0.0));
         assert!((r - Matrix3::identity()).norm() < 1.0e-9);
@@ -992,6 +1055,42 @@ mod tests {
                 "measured: {}  predicted: {}  diff_norm: {}",
                 dv_measured, dv_predicted, (dv_measured - dv_predicted).norm()
             );
+        }
+
+        /// Invariant: over any random short IMU trajectory, predict_step
+        /// keeps ‖q‖ within tolerance and P's diagonal positive.
+        #[test]
+        fn predict_step_preserves_invariants(
+            steps in 10usize..200,
+            wx in -3.0f32..3.0,
+            wy in -3.0f32..3.0,
+            wz in -3.0f32..3.0,
+            ax in -5.0f32..5.0,
+            ay in -5.0f32..5.0,
+            az in (-GRAVITY_M_S2 - 2.0)..(-GRAVITY_M_S2 + 2.0),
+            dt_s in 1.0e-4f32..0.01,
+        ) {
+            let mut state = State::default();
+            let mut p = initial_covariance();
+            let imu = ImuMeasurement {
+                gyro_rad_s: Vector3::new(wx, wy, wz),
+                accel_m_s2: Vector3::new(ax, ay, az),
+            };
+            let noise = ProcessNoise::default();
+            for _ in 0..steps {
+                let (s, c) = predict_step(&state, &p, imu, noise, dt_s);
+                state = s;
+                p = c;
+            }
+            prop_assert!(
+                (state.attitude.norm() - 1.0).abs() < 1.0e-4,
+                "‖q‖ = {} drifted", state.attitude.norm()
+            );
+            for i in 0..STATE_DIM {
+                let v = p.fixed_view::<1, 1>(i, i).to_scalar();
+                prop_assert!(v > 0.0, "P_{i}{i} = {v} went non-positive");
+                prop_assert!(v.is_finite(), "P_{i}{i} = {v} went non-finite");
+            }
         }
 
         /// Finite-difference: perturbing accel_bias should change position
