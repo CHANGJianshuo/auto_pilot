@@ -25,6 +25,7 @@
 | [0019](./0019-predict-step-end-to-end.md) | 2026-04-20 | M1.9c predict_step 端到端 | `4993ce4` | 单入口函数 `predict_step` + 1000 步悬停不变量 + 50 000 步随机序列 proptest。**EKF predict 半段完全收官**。 |
 | [0020](./0020-gps-innovation.md) | 2026-04-20 | M1.10a GPS innovation | `edcc0e8` | `GpsMeasurement`/`GpsInnovation` 类型 + NIS（χ² gating）+ block 抽取 S = P_pos + R（200× 快于实体化 H）。EKF **measurement** 半段开始。 |
 | [0021](./0021-gps-update-joseph.md) | 2026-04-20 | M1.10b GPS Kalman + Joseph | `ed3114f` | `gps_update()` 完整卡尔曼增益 + Joseph 协方差 + χ²=11.345 外值门；20 步 proptest 256 个随机目标全都在 0.5m 内收敛。 |
+| [0022](./0022-magnetometer-update.md) | 2026-04-20 | M1.11 Magnetometer update | `5c1231f` | 非线性 `h(x) = R(q)ᵀ·mag_ned + mag_bias`；3×24 的 H 矩阵，转置 Jacobian 通过 q 共轭识等式实现；有限差分 proptest 验证 H 到 1e-4。 |
 
 ## 写新文档时遵守的模板
 
