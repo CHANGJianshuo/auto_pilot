@@ -29,6 +29,7 @@ algo-fdir   = { path = "../algo-fdir" }
 nn-runtime  = { path = "../nn-runtime" }
 comms-mavlink = { path = "../comms-mavlink" }
 nalgebra = { workspace = true }
+libm = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

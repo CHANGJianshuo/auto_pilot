@@ -21,8 +21,10 @@
 
 use algo_ekf::{predict_step, Covariance, ImuMeasurement, ProcessNoise, State};
 use algo_indi::{
-    compute_torque_increment, IndiInput, Inertia, LowPassFilterVec3, RateCommand, RateGain,
+    attitude_to_rate, compute_torque_increment, AttitudeGain, IndiInput, Inertia,
+    LowPassFilterVec3, RateCommand, RateGain,
 };
+use algo_nmpc::{position_to_attitude_thrust, PositionGains, Setpoint};
 use core_hal::traits::ImuSample;
 use nalgebra::{Matrix4, SVector, Vector3};
 
@@ -35,7 +37,9 @@ pub use algo_alloc::{
 #[derive(Clone, Debug)]
 pub struct RateLoopConfig {
     pub k_rate: RateGain,
+    pub k_attitude: AttitudeGain,
     pub inertia: Inertia,
+    pub mass_kg: f32,
     pub process_noise: ProcessNoise,
     pub gyro_lpf: LowPassFilterVec3,
     pub alpha_lpf: LowPassFilterVec3,
@@ -46,6 +50,8 @@ pub struct RateLoopConfig {
     pub motor_max_n: f32,
     /// Nominal hover thrust (N) — used when no thrust command is given.
     pub hover_thrust_n: f32,
+    /// Outer-loop gains (position / velocity).
+    pub position_gains: PositionGains,
 }
 
 /// Dynamic flight state held across iterations.
@@ -147,7 +153,9 @@ pub fn default_config_250g() -> RateLoopConfig {
     let e_inv = invert_quad_effectiveness(&e_mat).unwrap_or(Matrix4::identity());
     RateLoopConfig {
         k_rate: Vector3::new(25.0, 25.0, 15.0),
+        k_attitude: Vector3::new(8.0, 8.0, 5.0),
         inertia: nalgebra::Matrix3::from_diagonal(&Vector3::new(0.015, 0.015, 0.025)),
+        mass_kg: 0.25,
         process_noise: ProcessNoise::default(),
         gyro_lpf: LowPassFilterVec3::new(80.0, 1000.0),
         alpha_lpf: LowPassFilterVec3::new(30.0, 1000.0),
@@ -155,7 +163,44 @@ pub fn default_config_250g() -> RateLoopConfig {
         motor_min_n: 0.0,
         motor_max_n: 6.0,
         hover_thrust_n: 2.45, // m=0.25 kg × g=9.8 m/s²
+        position_gains: PositionGains::default(),
     }
+}
+
+/// Outer-to-inner single-step control.
+///
+/// Runs `position_to_attitude_thrust` → `attitude_to_rate` →
+/// `rate_loop_step` in sequence. The caller passes a position setpoint;
+/// this function handles everything down to motor thrusts.
+///
+/// The commanded thrust from the outer loop overrides the
+/// `hover_thrust_n` fallback — `rate_loop_step` sees the outer loop's
+/// actual thrust demand so climbing / descending works.
+pub fn outer_step(
+    cfg: &mut RateLoopConfig,
+    flight: &mut FlightState,
+    imu: ImuSample,
+    dt_s: f32,
+    setpoint: &Setpoint,
+) -> RateLoopOutput {
+    // Outer loop: position → (q_desired, thrust).
+    let att = position_to_attitude_thrust(
+        setpoint,
+        flight.state.position_ned,
+        flight.state.velocity_ned,
+        cfg.mass_kg,
+        &cfg.position_gains,
+    );
+
+    // Inner (middle): q_desired → rate command.
+    let rate_cmd = attitude_to_rate(flight.state.attitude, att.q_desired, &cfg.k_attitude);
+
+    // Swap the hover fallback for the live thrust demand for this tick.
+    let saved_hover = cfg.hover_thrust_n;
+    cfg.hover_thrust_n = att.thrust_n;
+    let out = rate_loop_step(cfg, flight, imu, dt_s, rate_cmd);
+    cfg.hover_thrust_n = saved_hover;
+    out
 }
 
 #[cfg(test)]
@@ -210,6 +255,40 @@ mod tests {
             let v = flight.covariance.fixed_view::<1, 1>(i, i).to_scalar();
             assert!(v > 0.0 && v.is_finite(), "P[{i},{i}]={v}");
         }
+    }
+
+    #[test]
+    fn outer_step_hover_at_origin_stays_stable() {
+        let mut cfg = default_config_250g();
+        let mut flight = FlightState::default();
+        let setpoint = Setpoint::default();
+        for i in 0..1000u64 {
+            let imu = stationary_imu(i);
+            let _ = outer_step(&mut cfg, &mut flight, imu, 0.001, &setpoint);
+        }
+        // ‖q‖ unit, position / velocity bounded (synthetic IMU keeps vehicle
+        // stationary; controller only has to *not destabilise* it).
+        assert!((flight.state.attitude.norm() - 1.0).abs() < 1.0e-4);
+        assert!(flight.state.position_ned.norm() < 0.05);
+        assert!(flight.state.velocity_ned.norm() < 0.1);
+    }
+
+    #[test]
+    fn outer_step_altitude_setpoint_raises_thrust() {
+        let mut cfg = default_config_250g();
+        let mut flight = FlightState::default();
+        // Climb to 1 m altitude (z = -1 in NED).
+        let setpoint = Setpoint {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..Setpoint::default()
+        };
+        let imu = stationary_imu(0);
+        let out = outer_step(&mut cfg, &mut flight, imu, 0.001, &setpoint);
+        // Total commanded thrust > hover baseline (2.45 N).
+        let total: f32 = (0..4)
+            .map(|i| out.motor_thrusts_n.fixed_view::<1, 1>(i, 0).to_scalar())
+            .sum();
+        assert!(total > 2.45, "total thrust {total} should exceed hover");
     }
 
     #[test]
