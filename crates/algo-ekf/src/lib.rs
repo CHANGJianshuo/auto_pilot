@@ -761,6 +761,97 @@ pub fn gps_innovation(
 }
 
 // ============================================================================
+// Measurement update — Barometer (1-D altitude)
+// ============================================================================
+
+/// χ² 99 % quantile for 1 degree of freedom.
+pub const BARO_CHI2_GATE: f32 = 6.635;
+
+/// Barometer altitude observation.
+///
+/// `altitude_m` is geometric altitude above the EKF origin (positive up).
+/// NED convention has `+z` pointing down, so `h(x) = -position_ned.z`.
+#[derive(Clone, Copy, Debug)]
+pub struct BaroMeasurement {
+    pub altitude_m: f32,
+    pub sigma_m: f32,
+}
+
+/// Result of one barometer update.
+#[derive(Clone, Copy, Debug)]
+pub struct BaroUpdateResult {
+    pub state: State,
+    pub covariance: Covariance,
+    pub applied: bool,
+    pub nis: f32,
+}
+
+/// Fold a barometric altitude measurement.
+///
+/// `h(x) = −position_ned.z`, so `H` is a 1×24 row vector with `-1` at
+/// column `P_NED_START + 2`. Innovation and S are scalars, so the Kalman
+/// gain reduces to `K = P[:, P_z] · (-1) / s_scalar` — no matrix inverse.
+#[must_use]
+pub fn baro_update(
+    state: &State,
+    covariance: &Covariance,
+    measurement: &BaroMeasurement,
+) -> BaroUpdateResult {
+    let down_idx = idx::P_NED_START + 2;
+    let predicted = -state.position_ned.z;
+    let residual = measurement.altitude_m - predicted;
+
+    // H = [0..., -1 at column down_idx, ...0], so:
+    //   H·P·Hᵀ = P[down_idx, down_idx]
+    //   S      = P[down_idx, down_idx] + σ²
+    //   P·Hᵀ   = -P[:, down_idx]
+    let p_down_z: f32 = covariance.fixed_view::<1, 1>(down_idx, down_idx).to_scalar();
+    let r = measurement.sigma_m * measurement.sigma_m;
+    let s_scalar = p_down_z + r;
+
+    let nis = if s_scalar > 0.0 { residual * residual / s_scalar } else { f32::INFINITY };
+    if !nis.is_finite() || nis > BARO_CHI2_GATE {
+        return BaroUpdateResult {
+            state: *state,
+            covariance: *covariance,
+            applied: false,
+            nis,
+        };
+    }
+
+    // K = P·Hᵀ / S  (24-vector)
+    let p_col: StateVector =
+        -covariance.fixed_columns::<1>(down_idx).into_owned() / s_scalar;
+    let k = p_col;
+
+    // State correction.
+    let dx = k * residual;
+    let mut new_state = State::from_vector(&(state.to_vector() + dx));
+    new_state.normalize_attitude();
+
+    // Joseph form: (I − K·H) with H having -1 at column down_idx means
+    //   (I − K·H)[:, down_idx] = I[:, down_idx] − K · (-1) = I[:, down_idx] + K
+    //   other columns unchanged.
+    let mut i_minus_kh = Covariance::identity();
+    {
+        let mut col = i_minus_kh.fixed_columns_mut::<1>(down_idx);
+        col += k;
+    }
+
+    // K·R·Kᵀ reduces to (K·r)·Kᵀ because R is scalar.
+    let kr_kt = k * r * k.transpose();
+    let mut p_new = i_minus_kh * covariance * i_minus_kh.transpose() + kr_kt;
+    enforce_symmetry(&mut p_new);
+
+    BaroUpdateResult {
+        state: new_state,
+        covariance: p_new,
+        applied: true,
+        nis,
+    }
+}
+
+// ============================================================================
 // Measurement update — Magnetometer
 // ============================================================================
 
@@ -1276,6 +1367,76 @@ mod tests {
         let chi = innov.normalized_squared();
         // With σ ≈ 10 m and residual ≈ 1 cm, χ² should be << 0.01.
         assert!(chi < 0.01, "chi² = {chi} unexpectedly large");
+    }
+
+    // ---- Barometer update tests -----------------------------------------
+
+    #[test]
+    fn baro_update_zero_altitude_no_change() {
+        let state = State::default(); // position_ned = 0 → altitude 0
+        let p = initial_covariance();
+        let m = BaroMeasurement { altitude_m: 0.0, sigma_m: 0.5 };
+        let r = baro_update(&state, &p, &m);
+        assert!(r.applied);
+        assert!(r.state.position_ned.norm() < 1.0e-6);
+    }
+
+    #[test]
+    fn baro_update_pulls_altitude_toward_measurement() {
+        let state = State::default();
+        let p = initial_covariance();
+        let m = BaroMeasurement { altitude_m: 5.0, sigma_m: 0.3 };
+        let r = baro_update(&state, &p, &m);
+        assert!(r.applied);
+        // After update the state's altitude (-position_ned.z) is closer to 5.
+        let altitude = -r.state.position_ned.z;
+        assert!(altitude > 0.1, "altitude didn't rise: {altitude}");
+    }
+
+    #[test]
+    fn baro_update_rejects_massive_outlier() {
+        let state = State::default();
+        let p = initial_covariance();
+        let m = BaroMeasurement { altitude_m: 10_000.0, sigma_m: 0.1 };
+        let r = baro_update(&state, &p, &m);
+        assert!(!r.applied);
+    }
+
+    #[test]
+    fn baro_update_shrinks_altitude_variance() {
+        let state = State::default();
+        let p = initial_covariance();
+        let m = BaroMeasurement { altitude_m: 1.0, sigma_m: 0.1 };
+        let r = baro_update(&state, &p, &m);
+        assert!(r.applied);
+        let down_idx = idx::P_NED_START + 2;
+        let before = p.fixed_view::<1, 1>(down_idx, down_idx).to_scalar();
+        let after = r.covariance.fixed_view::<1, 1>(down_idx, down_idx).to_scalar();
+        assert!(after < before, "down variance didn't shrink: {before} → {after}");
+    }
+
+    proptest! {
+        /// Repeated baro updates converge altitude to the measured value.
+        #[test]
+        fn baro_update_converges(
+            target_altitude in -20.0f32..20.0,
+        ) {
+            let mut state = State::default();
+            let mut p = initial_covariance();
+            let m = BaroMeasurement { altitude_m: target_altitude, sigma_m: 0.1 };
+            for _ in 0..30 {
+                let r = baro_update(&state, &p, &m);
+                if r.applied {
+                    state = r.state;
+                    p = r.covariance;
+                }
+            }
+            let altitude = -state.position_ned.z;
+            prop_assert!(
+                (altitude - target_altitude).abs() < 0.3,
+                "target={target_altitude} got={altitude}"
+            );
+        }
     }
 
     // ---- Magnetometer update tests --------------------------------------
