@@ -13,6 +13,7 @@
 | [0007](./0007-kani-in-image.md) | 2026-04-20 | M1.3 Kani 装进 Dockerfile | `f371d3c` | 镜像自带 kani-verifier + CBMC + nightly toolchain；`docker run --rm` 即可跑所有证明。 |
 | [0008](./0008-healthlevel-proofs.md) | 2026-04-20 | M1.4 HealthLevel 状态机 | `94f1c24` | 单向 FDIR 不变量（monotone transition + ground-only reset）+ 5 个 Kani 证明 21 ms 通过。 |
 | [0009](./0009-state-24d-vector.md) | 2026-04-20 | M1.5 State ↔ 24-D 向量 | `33fdc0d` | 24 维序列化 + `idx` 模块、2 个 256-sample proptest round-trip、EKF 协方差矩阵的数据基础。 |
+| [0010](./0010-imu-buffer.md) | 2026-04-20 | M1.6 IMU 环形缓冲 + mock | `68fa83d` | `heapless::spsc` SPSC ImuSource + MockImuSource 重放、FIFO proptest。生产/SITL 同一套 trait。 |
 
 ## 写新文档时遵守的模板
 
