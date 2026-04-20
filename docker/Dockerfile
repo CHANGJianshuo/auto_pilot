@@ -167,6 +167,22 @@ RUN --mount=type=cache,target=/opt/rust/cargo/registry \
         || echo 'probe-rs-tools failed, skipping — install manually later') \
     && chmod -R a+rw /opt/rust
 
+# Kani formal verifier — adds `cargo kani` for symbolic-execution proofs.
+# Split into two concerns:
+#   (a) `kani-verifier` is a small CLI that we install system-wide into
+#       /opt/rust/cargo/bin. Binary cache is fine here.
+#   (b) `cargo kani setup` downloads CBMC + the pinned nightly toolchain
+#       (~2 GB) into $HOME/.kani. We run this step AS the dev user later
+#       (see section 6b below) because Kani stores per-user state.
+ARG KANI_ENABLE=1
+RUN --mount=type=cache,target=/opt/rust/cargo/registry \
+    --mount=type=cache,target=/opt/rust/cargo/git \
+    if [ "$KANI_ENABLE" = "1" ]; then \
+        (cargo install --locked kani-verifier \
+            || echo 'kani-verifier failed, skipping'); \
+    fi \
+    && chmod -R a+rw /opt/rust
+
 # udev rules so the dev user can access USB debug probes without sudo
 RUN mkdir -p /etc/udev/rules.d \
     && probe-rs complete --shell bash > /etc/bash_completion.d/probe-rs 2>/dev/null || true \
@@ -230,6 +246,15 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 USER ${USER_NAME}
 WORKDIR ${WORKSPACE}
+
+# ---- 6b. Per-user tool state (runs AS dev) -------------------------------
+# Kani's setup wants to write to $HOME/.kani, so it has to run after the
+# USER switch. Downloads CBMC + pinned nightly toolchain (~2 GB). Fatal
+# failure is tolerated so the image still ships if the setup flakes —
+# `cargo kani setup` can be re-run interactively inside the container.
+RUN if command -v cargo-kani >/dev/null 2>&1; then \
+        cargo kani setup || echo 'cargo kani setup failed, run manually inside container'; \
+    fi
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["bash"]

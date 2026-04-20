@@ -12,6 +12,7 @@ same toolchain.
 | OS | Ubuntu 24.04 |
 | Rust | 1.85 (pinned by `rust-toolchain.toml`) + `thumbv7em-none-eabihf` target, `clippy`, `rustfmt`, `rust-src`, `llvm-tools` |
 | Embedded | `probe-rs`, `flip-link`, `cargo-binutils`, `cargo-geiger`, `cargo-audit`, `cargo-nextest` |
+| Verification | `kani-verifier` (symbolic execution + CBMC backend, pinned via `KANI_ENABLE=1`) |
 | Middleware | ROS 2 Jazzy (LTS) + `rmw_cyclonedds`, `rmw_zenoh` |
 | Simulation | Gazebo Harmonic (`gz-harmonic`), `ros-gz` bridge |
 | Python | `uv` fast installer; optional ML stack (`torch`, `onnx`, `pymavlink`) |
