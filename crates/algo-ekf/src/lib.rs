@@ -14,7 +14,9 @@
 //! - Quaternion stays unit-normalized within 1e-6 after each predict/update.
 //! - No integer overflow, no panic paths.
 
-use nalgebra::{Matrix4, Quaternion, SVector, UnitQuaternion, Vector2, Vector3, Vector4};
+use nalgebra::{
+    Matrix3, Matrix3x4, Matrix4, Quaternion, SVector, UnitQuaternion, Vector2, Vector3, Vector4,
+};
 
 /// Dimension of the EKF state vector.
 pub const STATE_DIM: usize = 24;
@@ -479,6 +481,50 @@ pub fn right_multiplication_matrix(q: Quaternion<f32>) -> Matrix4<f32> {
     )
 }
 
+/// Rotation matrix `R(q)` from body frame to world (NED) frame for a unit
+/// quaternion `q = (w, x, y, z)`.
+#[must_use]
+pub fn rotation_matrix(q: Quaternion<f32>) -> Matrix3<f32> {
+    let (w, x, y, z) = (q.w, q.i, q.j, q.k);
+    Matrix3::new(
+        1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z),       2.0 * (x * z + w * y),
+        2.0 * (x * y + w * z),       1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x),
+        2.0 * (x * z - w * y),       2.0 * (y * z + w * x),       1.0 - 2.0 * (x * x + y * y),
+    )
+}
+
+/// Jacobian of `R(q) · v` w.r.t. `q`, returned as a 3×4 matrix.
+///
+/// Closed form: column `j` is `(∂R/∂q_j) · v`, evaluated element-by-element.
+/// Used to build the `∂v/∂q` block of the state-transition Jacobian.
+#[must_use]
+pub fn rotation_jacobian_wrt_q(q: Quaternion<f32>, v: Vector3<f32>) -> Matrix3x4<f32> {
+    let (w, x, y, z) = (q.w, q.i, q.j, q.k);
+    let (vx, vy, vz) = (v.x, v.y, v.z);
+    let two = 2.0_f32;
+    // ∂R/∂w · v
+    let col_w = two * Vector3::new(-z * vy + y * vz, z * vx - x * vz, -y * vx + x * vy);
+    // ∂R/∂x · v
+    let col_x = two * Vector3::new(
+        y * vy + z * vz,
+        y * vx - 2.0 * x * vy - w * vz,
+        z * vx + w * vy - 2.0 * x * vz,
+    );
+    // ∂R/∂y · v
+    let col_y = two * Vector3::new(
+        -2.0 * y * vx + x * vy + w * vz,
+        x * vx + z * vz,
+        -w * vx + z * vy - 2.0 * y * vz,
+    );
+    // ∂R/∂z · v
+    let col_z = two * Vector3::new(
+        -2.0 * z * vx - w * vy + x * vz,
+        w * vx - 2.0 * z * vy + y * vz,
+        x * vx + y * vy,
+    );
+    Matrix3x4::from_columns(&[col_w, col_x, col_y, col_z])
+}
+
 /// Left-multiplication matrix `L(q)` such that `q ⊗ p = L(q) · p_vec`,
 /// where quaternions are laid out as `(w, x, y, z)`.
 ///
@@ -540,6 +586,26 @@ pub fn build_transition_jacobian(
     let mut dq_dbg_block =
         f.fixed_view_mut::<{ idx::Q_LEN }, { idx::GYRO_BIAS_LEN }>(idx::Q_START, idx::GYRO_BIAS_START);
     dq_dbg_block.copy_from(&dq_dbg);
+
+    // ∂v/∂q and ∂v/∂b_a blocks (M1.9b-1c). Evaluated at current q:
+    //   a_ned = R(q) · (accel - b_a) + g
+    //   v_new = v + a_ned · dt
+    //   ⇒ ∂v_new/∂q   =  (∂R/∂q · f_body) · dt         (3×4)
+    //   ⇒ ∂v_new/∂b_a = -R(q) · dt                      (3×3)
+    let f_body = imu.accel_m_s2 - state.accel_bias;
+    let rot_jac = rotation_jacobian_wrt_q(state.attitude, f_body);
+    let dv_dq = rot_jac * dt_s;
+    let mut dv_dq_block =
+        f.fixed_view_mut::<{ idx::V_NED_LEN }, { idx::Q_LEN }>(idx::V_NED_START, idx::Q_START);
+    dv_dq_block.copy_from(&dv_dq);
+
+    let r_q = rotation_matrix(state.attitude);
+    let dv_dba = -r_q * dt_s;
+    let mut dv_dba_block = f.fixed_view_mut::<{ idx::V_NED_LEN }, { idx::ACCEL_BIAS_LEN }>(
+        idx::V_NED_START,
+        idx::ACCEL_BIAS_START,
+    );
+    dv_dba_block.copy_from(&dv_dba);
 
     f
 }
@@ -811,6 +877,147 @@ mod tests {
                 let expected = if i == j { -dt / 2.0 } else { 0.0 };
                 assert!((v - expected).abs() < 1.0e-9);
             }
+        }
+    }
+
+    #[test]
+    fn rotation_matrix_identity_quaternion() {
+        let r = rotation_matrix(Quaternion::new(1.0, 0.0, 0.0, 0.0));
+        assert!((r - Matrix3::identity()).norm() < 1.0e-9);
+    }
+
+    #[test]
+    fn rotation_matrix_unit_quaternion_is_orthogonal() {
+        // Arbitrary unit quaternion: 90° rotation about z.
+        let half = core::f32::consts::FRAC_1_SQRT_2;
+        let q = Quaternion::new(half, 0.0, 0.0, half);
+        let r = rotation_matrix(q);
+        // R · R^T should be the identity.
+        let prod = r * r.transpose();
+        assert!((prod - Matrix3::identity()).norm() < 1.0e-6);
+    }
+
+    #[test]
+    fn rotation_jacobian_at_identity_matches_skew() {
+        // At q = identity, ∂(R·v)/∂q maps infinitesimal rotation into a
+        // velocity change — the x/y/z columns should equal 2·skew_cols(v).
+        let v = Vector3::new(1.0, 2.0, -0.5);
+        let j = rotation_jacobian_wrt_q(Quaternion::new(1.0, 0.0, 0.0, 0.0), v);
+        // Column 0 (∂/∂w): with q=identity → 2·(0 × v) = 0
+        for i in 0..3 {
+            let v_ij = j.fixed_view::<1, 1>(i, 0).to_scalar();
+            assert!(v_ij.abs() < 1.0e-9, "∂w col row {i} = {v_ij}, expected 0");
+        }
+        // Columns 1..4 are 2·∂(R·v)/∂x|y|z at q=identity. The well-known
+        // closed form is 2·[v × e_x, v × e_y, v × e_z] which expands to the
+        // skew-symmetric entries listed below.
+        // Column 1 (∂/∂x at q=identity):
+        //   row 0:  2·(y·v_y + z·v_z) = 0 at q=I                 → 0
+        //   row 1:  2·(y·v_x - 2x·v_y - w·v_z) = -2·v_z          → -2·v_z
+        //   row 2:  2·(z·v_x + w·v_y - 2x·v_z) = 2·v_y           → 2·v_y
+        let col1_r1 = j.fixed_view::<1, 1>(1, 1).to_scalar();
+        let col1_r2 = j.fixed_view::<1, 1>(2, 1).to_scalar();
+        assert!((col1_r1 - (-2.0 * v.z)).abs() < 1.0e-6);
+        assert!((col1_r2 - (2.0 * v.y)).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn dv_dba_block_at_identity_is_negative_dt() {
+        let state = State::default();
+        let imu = ImuMeasurement::default();
+        let dt = 0.01_f32;
+        let f = build_transition_jacobian(&state, &imu, dt);
+        let block = f.fixed_view::<{ idx::V_NED_LEN }, { idx::ACCEL_BIAS_LEN }>(
+            idx::V_NED_START,
+            idx::ACCEL_BIAS_START,
+        );
+        // At q=identity, R(q) = I, so dv/db_a = -I · dt.
+        for i in 0..idx::V_NED_LEN {
+            for j_c in 0..idx::ACCEL_BIAS_LEN {
+                let v = block.fixed_view::<1, 1>(i, j_c).to_scalar();
+                let expected = if i == j_c { -dt } else { 0.0 };
+                assert!((v - expected).abs() < 1.0e-9);
+            }
+        }
+    }
+
+    proptest! {
+        /// Finite-difference sanity: perturbing accel_bias by δb_a and re-
+        /// running predict should yield a velocity change of (∂v/∂b_a)·δb_a
+        /// to first order.
+        #[test]
+        fn dv_dba_block_matches_finite_difference(
+            bx in -0.05f32..0.05,
+            by in -0.05f32..0.05,
+            bz in -0.05f32..0.05,
+            dt_s in 1.0e-3f32..0.02,
+        ) {
+            let state = State::default(); // q = identity
+            let imu = ImuMeasurement {
+                gyro_rad_s: Vector3::zeros(), // avoid R(q_new)≠R(q) drift
+                accel_m_s2: Vector3::new(0.3, -0.4, -9.8),
+            };
+            let delta_b = Vector3::new(bx, by, bz);
+            let state_plus = State { accel_bias: delta_b, ..state };
+            let v_nominal = state.predict(imu, dt_s).velocity_ned;
+            let v_perturbed = state_plus.predict(imu, dt_s).velocity_ned;
+            let dv_measured = v_perturbed - v_nominal;
+
+            let f = build_transition_jacobian(&state, &imu, dt_s);
+            let block = f.fixed_view::<{ idx::V_NED_LEN }, { idx::ACCEL_BIAS_LEN }>(
+                idx::V_NED_START,
+                idx::ACCEL_BIAS_START,
+            ).into_owned();
+            let dv_predicted = block * delta_b;
+
+            prop_assert!(
+                (dv_measured - dv_predicted).norm() < 1.0e-4,
+                "measured: {}  predicted: {}  diff_norm: {}",
+                dv_measured, dv_predicted, (dv_measured - dv_predicted).norm()
+            );
+        }
+
+        /// Finite-difference: perturbing attitude and running predict should
+        /// change velocity by ∂v/∂q · δq to first order. Bounded δq so the
+        /// small-q-drift approximation stays < 0.01 rad overall.
+        #[test]
+        fn dv_dq_block_matches_finite_difference(
+            qw_pert in -0.01f32..0.01,
+            qx_pert in -0.01f32..0.01,
+            qy_pert in -0.01f32..0.01,
+            qz_pert in -0.01f32..0.01,
+            dt_s in 1.0e-3f32..0.02,
+        ) {
+            let state = State::default();
+            let imu = ImuMeasurement {
+                gyro_rad_s: Vector3::zeros(),
+                accel_m_s2: Vector3::new(0.2, -0.3, -9.81),
+            };
+            let delta_q = Vector4::new(qw_pert, qx_pert, qy_pert, qz_pert);
+            let state_plus = State {
+                attitude: Quaternion::new(
+                    state.attitude.w + qw_pert,
+                    state.attitude.i + qx_pert,
+                    state.attitude.j + qy_pert,
+                    state.attitude.k + qz_pert,
+                ),
+                ..state
+            };
+            let v_nominal = state.predict(imu, dt_s).velocity_ned;
+            let v_perturbed = state_plus.predict(imu, dt_s).velocity_ned;
+            let dv_measured = v_perturbed - v_nominal;
+
+            let f = build_transition_jacobian(&state, &imu, dt_s);
+            let block = f
+                .fixed_view::<{ idx::V_NED_LEN }, { idx::Q_LEN }>(idx::V_NED_START, idx::Q_START)
+                .into_owned();
+            let dv_predicted = block * delta_q;
+
+            prop_assert!(
+                (dv_measured - dv_predicted).norm() < 5.0e-4,
+                "measured: {}  predicted: {}  diff_norm: {}",
+                dv_measured, dv_predicted, (dv_measured - dv_predicted).norm()
+            );
         }
     }
 
