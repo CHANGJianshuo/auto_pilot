@@ -519,6 +519,27 @@ pub fn rotation_matrix(q: Quaternion<f32>) -> Matrix3<f32> {
     )
 }
 
+/// Jacobian of `R(q)ᵀ · v` w.r.t. `q`, returned as a 3×4 matrix.
+///
+/// Uses `R(q)ᵀ = R(q*)` where `q* = (w, -x, -y, -z)` is the conjugate:
+///
+/// ```text
+///   ∂(R(q)ᵀ · v) / ∂q  =  ∂(R(q*) · v) / ∂q*  ·  ∂q*/∂q
+///                       =  J_R(q*, v) · diag(1, -1, -1, -1)
+/// ```
+#[must_use]
+pub fn rotation_transpose_jacobian_wrt_q(q: Quaternion<f32>, v: Vector3<f32>) -> Matrix3x4<f32> {
+    let q_conj = Quaternion::new(q.w, -q.i, -q.j, -q.k);
+    let mut j = rotation_jacobian_wrt_q(q_conj, v);
+    let mut c1 = j.fixed_columns_mut::<1>(1);
+    c1.scale_mut(-1.0);
+    let mut c2 = j.fixed_columns_mut::<1>(2);
+    c2.scale_mut(-1.0);
+    let mut c3 = j.fixed_columns_mut::<1>(3);
+    c3.scale_mut(-1.0);
+    j
+}
+
 /// Jacobian of `R(q) · v` w.r.t. `q`, returned as a 3×4 matrix.
 ///
 /// Closed form: column `j` is `(∂R/∂q_j) · v`, evaluated element-by-element.
@@ -736,6 +757,122 @@ pub fn gps_innovation(
     GpsInnovation {
         residual,
         innovation_covariance: p_block + r,
+    }
+}
+
+// ============================================================================
+// Measurement update — Magnetometer
+// ============================================================================
+
+/// χ² 99 % quantile for 3 degrees of freedom, shared with GPS.
+pub const MAG_CHI2_GATE: f32 = GPS_CHI2_GATE;
+
+/// Body-frame magnetic-field observation.
+///
+/// `body_field` is what the magnetometer reads (after the calibration
+/// applied by the driver) in gauss. `sigma` is the 1-σ per-axis noise.
+#[derive(Clone, Copy, Debug)]
+pub struct MagMeasurement {
+    pub body_field: Vector3<f32>,
+    pub sigma: Vector3<f32>,
+}
+
+/// Result of one magnetometer update.
+#[derive(Clone, Copy, Debug)]
+pub struct MagUpdateResult {
+    pub state: State,
+    pub covariance: Covariance,
+    pub applied: bool,
+    pub nis: f32,
+}
+
+/// Build the 3×24 observation Jacobian `H` for the magnetometer.
+///
+/// Model: `h(x) = R(q)ᵀ · mag_ned + mag_bias`.
+/// Non-zero columns:
+///   * `q` (4 cols): `∂(R(q)ᵀ · mag_ned)/∂q`
+///   * `mag_ned` (3 cols): `R(q)ᵀ`
+///   * `mag_bias` (3 cols): `I₃`
+#[must_use]
+fn build_mag_observation_matrix(state: &State) -> nalgebra::SMatrix<f32, 3, STATE_DIM> {
+    let mut h: nalgebra::SMatrix<f32, 3, STATE_DIM> = nalgebra::SMatrix::zeros();
+
+    let j_q = rotation_transpose_jacobian_wrt_q(state.attitude, state.mag_ned);
+    h.fixed_view_mut::<3, { idx::Q_LEN }>(0, idx::Q_START)
+        .copy_from(&j_q);
+
+    let r_transpose = rotation_matrix(state.attitude).transpose();
+    h.fixed_view_mut::<3, { idx::MAG_NED_LEN }>(0, idx::MAG_NED_START)
+        .copy_from(&r_transpose);
+
+    let mut bias_block =
+        h.fixed_view_mut::<3, { idx::MAG_BIAS_LEN }>(0, idx::MAG_BIAS_START);
+    bias_block.fill_with_identity();
+
+    h
+}
+
+/// Predicted magnetometer reading given the current EKF state.
+#[must_use]
+pub fn predict_magnetometer(state: &State) -> Vector3<f32> {
+    rotation_matrix(state.attitude).transpose() * state.mag_ned + state.mag_bias
+}
+
+/// Fold a magnetometer observation into the EKF with χ² outlier gating
+/// and Joseph-form covariance update.
+#[must_use]
+pub fn mag_update(
+    state: &State,
+    covariance: &Covariance,
+    measurement: &MagMeasurement,
+) -> MagUpdateResult {
+    let predicted = predict_magnetometer(state);
+    let residual = measurement.body_field - predicted;
+
+    let h = build_mag_observation_matrix(state);
+    let r = Matrix3::from_diagonal(&Vector3::new(
+        measurement.sigma.x * measurement.sigma.x,
+        measurement.sigma.y * measurement.sigma.y,
+        measurement.sigma.z * measurement.sigma.z,
+    ));
+    let s = h * covariance * h.transpose() + r;
+
+    let nis = match s.try_inverse() {
+        Some(s_inv) => (residual.transpose() * s_inv * residual).to_scalar(),
+        None => f32::INFINITY,
+    };
+    if !nis.is_finite() || nis > MAG_CHI2_GATE {
+        return MagUpdateResult {
+            state: *state,
+            covariance: *covariance,
+            applied: false,
+            nis,
+        };
+    }
+    let Some(s_inv) = s.try_inverse() else {
+        return MagUpdateResult {
+            state: *state,
+            covariance: *covariance,
+            applied: false,
+            nis: f32::INFINITY,
+        };
+    };
+
+    let k = covariance * h.transpose() * s_inv;
+    let dx = k * residual;
+    let mut new_state = State::from_vector(&(state.to_vector() + dx));
+    new_state.normalize_attitude();
+
+    let kh = k * h;
+    let i_minus_kh = Covariance::identity() - kh;
+    let mut p_new = i_minus_kh * covariance * i_minus_kh.transpose() + k * r * k.transpose();
+    enforce_symmetry(&mut p_new);
+
+    MagUpdateResult {
+        state: new_state,
+        covariance: p_new,
+        applied: true,
+        nis,
     }
 }
 
@@ -1139,6 +1276,105 @@ mod tests {
         let chi = innov.normalized_squared();
         // With σ ≈ 10 m and residual ≈ 1 cm, χ² should be << 0.01.
         assert!(chi < 0.01, "chi² = {chi} unexpectedly large");
+    }
+
+    // ---- Magnetometer update tests --------------------------------------
+
+    #[test]
+    fn predict_magnetometer_matches_expected_at_identity() {
+        let state = State::default(); // q = identity, mag_bias = 0
+        let predicted = predict_magnetometer(&state);
+        // R(q)^T = I, so predicted = mag_ned + 0 = default mag_ned.
+        assert!((predicted - state.mag_ned).norm() < 1.0e-6);
+    }
+
+    #[test]
+    fn mag_update_zero_residual_leaves_state_nearly_unchanged() {
+        let state = State::default();
+        let p = initial_covariance();
+        let m = MagMeasurement {
+            body_field: predict_magnetometer(&state),
+            sigma: Vector3::new(0.01, 0.01, 0.01),
+        };
+        let r = mag_update(&state, &p, &m);
+        assert!(r.applied);
+        assert!((r.state.attitude.norm() - 1.0).abs() < QUATERNION_NORM_TOLERANCE * 10.0);
+        assert!(r.state.velocity_ned.norm() < 1.0e-3);
+    }
+
+    #[test]
+    fn mag_update_rejects_huge_outlier() {
+        let state = State::default();
+        let p = initial_covariance();
+        let m = MagMeasurement {
+            body_field: Vector3::new(50.0, -50.0, 50.0), // far from reasonable
+            sigma: Vector3::new(0.01, 0.01, 0.01),
+        };
+        let r = mag_update(&state, &p, &m);
+        assert!(!r.applied);
+    }
+
+    #[test]
+    fn mag_update_keeps_covariance_symmetric() {
+        let state = State::default();
+        let p = initial_covariance();
+        let predicted = predict_magnetometer(&state);
+        let m = MagMeasurement {
+            body_field: predicted + Vector3::new(0.001, -0.002, 0.001),
+            sigma: Vector3::new(0.01, 0.01, 0.01),
+        };
+        let r = mag_update(&state, &p, &m);
+        assert!(r.applied);
+        for i in 0..STATE_DIM {
+            for j in (i + 1)..STATE_DIM {
+                let a = r.covariance.fixed_view::<1, 1>(i, j).to_scalar();
+                let b = r.covariance.fixed_view::<1, 1>(j, i).to_scalar();
+                assert!((a - b).abs() < 1.0e-5, "asymmetric at ({i},{j})");
+            }
+        }
+    }
+
+    proptest! {
+        /// Jacobian sanity: perturbing q and re-running the predicted
+        /// measurement should match the closed-form Jacobian to first order.
+        #[test]
+        fn mag_h_jacobian_matches_finite_difference(
+            qx in -0.005f32..0.005,
+            qy in -0.005f32..0.005,
+            qz in -0.005f32..0.005,
+        ) {
+            // Put state somewhere non-trivial so R(q) isn't identity.
+            let mut state = State {
+                attitude: Quaternion::new(0.9, 0.3, 0.2, 0.1),
+                ..State::default()
+            };
+            state.normalize_attitude();
+
+            let h = build_mag_observation_matrix(&state);
+            let h_q = h.fixed_view::<3, { idx::Q_LEN }>(0, idx::Q_START).into_owned();
+
+            // Build δq = (0, δx, δy, δz). Test only the 3 vector components
+            // for simplicity.
+            let delta_q = Vector4::new(0.0, qx, qy, qz);
+
+            let state_plus = State {
+                attitude: Quaternion::new(
+                    state.attitude.w,
+                    state.attitude.i + qx,
+                    state.attitude.j + qy,
+                    state.attitude.k + qz,
+                ),
+                ..state
+            };
+            let pred_nominal = predict_magnetometer(&state);
+            let pred_plus = predict_magnetometer(&state_plus);
+            let dh_measured = pred_plus - pred_nominal;
+            let dh_predicted = h_q * delta_q;
+            prop_assert!(
+                (dh_measured - dh_predicted).norm() < 1.0e-4,
+                "dh_measured: {}  dh_predicted: {}", dh_measured, dh_predicted
+            );
+        }
     }
 
     #[test]
