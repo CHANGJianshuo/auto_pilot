@@ -18,6 +18,7 @@
 | [0012](./0012-covariance-scaffold.md) | 2026-04-20 | M1.8 协方差矩阵骨架 | `cf8196a` | `Covariance = SMatrix<24,24>`、`initial_sigma` 常量、`initial_covariance()` 对角 P₀、`enforce_symmetry()` + proptest。为 M1.9 的 F·P·Fᵀ+Q 铺路。 |
 | [0013](./0013-process-noise-placeholder-f.md) | 2026-04-20 | M1.9a 过程噪声 Q + F=I 占位 | `81f1a25` | `ProcessNoise` 每秒强度 + `build_process_noise(dt)` + `predict_covariance(P,F,Q)` 完整数据流。F=I 先占位，M1.9b 替换真实 Jacobian。 |
 | [0014](./0014-kinematic-f.md) | 2026-04-20 | M1.9b-0 动学 F（dp/dv = I·dt） | `f9c204c` | F 矩阵填入唯一纯线性子块；2 个 proptest 验证 cross-block 正确生成（P[p, v] ≈ dt·σ_v²）。 |
+| [0015](./0015-dq-dq-jacobian.md) | 2026-04-20 | M1.9b-1a ∂q/∂q Jacobian | `c228afc` | 四元数自耦合 = 右乘矩阵 R(δq)；Hamilton 积数值验证 + determinant=1 proptest。F 的最重要一块。 |
 
 ## 写新文档时遵守的模板
 
