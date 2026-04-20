@@ -1,0 +1,15 @@
+/target
+/**/target
+Cargo.lock.*
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+*.log
+/sim/build/
+/sim/logs/
+perf.data*
+flamegraph.svg

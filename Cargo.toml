@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core-hal",
+    "crates/core-rtos",
+    "crates/core-bus",
+    "crates/algo-ekf",
+    "crates/algo-nmpc",
+    "crates/algo-indi",
+    "crates/algo-alloc",
+    "crates/algo-fdir",
+    "crates/nn-runtime",
+    "crates/comms-mavlink",
+    "crates/sim-hil",
+    "crates/app-copter",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/chang/auto_pilot"
+authors = ["auto_pilot contributors"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+integer_division = "warn"
+float_arithmetic = "allow"
+as_conversions = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+
+[workspace.dependencies]
+# Math / linear algebra (no_std with libm)
+nalgebra = { version = "0.33", default-features = false, features = ["libm"] }
+libm = "0.2"
+
+# Embedded primitives
+heapless = "0.8"
+embedded-hal = "1.0"
+embedded-hal-async = "1.0"
+defmt = "0.3"
+defmt-rtt = "0.4"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
+
+# Embassy async runtime
+embassy-executor = { version = "0.6", features = ["arch-cortex-m", "executor-thread", "integrated-timers"] }
+embassy-time = "0.3"
+embassy-sync = "0.6"
+embassy-stm32 = { version = "0.1", features = ["stm32h753ii", "time-driver-tim2", "defmt", "unstable-pac", "exti"] }
+
+# Serialization
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+postcard = { version = "1.0", default-features = false }
+
+# Host-side deps
+tokio = { version = "1.40", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Testing
+proptest = "1.5"
+approx = "0.5"

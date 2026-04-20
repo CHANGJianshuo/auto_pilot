@@ -1,0 +1,15 @@
+[package]
+name = "algo-nmpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Nonlinear Model Predictive Control outer loop. QP-based, embedded-friendly."
+
+[lints]
+workspace = true
+
+[dependencies]
+nalgebra = { workspace = true }
+libm = { workspace = true }

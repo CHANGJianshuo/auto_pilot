@@ -1,0 +1,15 @@
+[package]
+name = "nn-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Onboard NN / RL policy inference with a safety-envelope guard."
+
+[lints]
+workspace = true
+
+[dependencies]
+heapless = { workspace = true }
+nalgebra = { workspace = true }

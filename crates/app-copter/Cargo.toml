@@ -1,0 +1,27 @@
+[package]
+name = "app-copter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Multirotor application binary: composes HAL, RTOS, bus, estimator, and controllers."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "app-copter"
+path = "src/main.rs"
+
+[dependencies]
+core-hal    = { path = "../core-hal" }
+core-rtos   = { path = "../core-rtos" }
+core-bus    = { path = "../core-bus" }
+algo-ekf    = { path = "../algo-ekf" }
+algo-nmpc   = { path = "../algo-nmpc" }
+algo-indi   = { path = "../algo-indi" }
+algo-alloc  = { path = "../algo-alloc" }
+algo-fdir   = { path = "../algo-fdir" }
+nn-runtime  = { path = "../nn-runtime" }
+comms-mavlink = { path = "../comms-mavlink" }

@@ -1,0 +1,14 @@
+[package]
+name = "core-rtos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Task scheduling, priority assignment, WCET instrumentation."
+
+[lints]
+workspace = true
+
+[dependencies]
+heapless = { workspace = true }

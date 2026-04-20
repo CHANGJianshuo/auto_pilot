@@ -1,0 +1,18 @@
+# Default build target for the workspace is the host. Firmware builds must
+# pass an explicit `--target thumbv7em-none-eabihf`.
+
+[build]
+# Leave default (host) — the firmware bin opts in explicitly.
+
+[target.thumbv7em-none-eabihf]
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+    "-C", "target-cpu=cortex-m7",
+    "-C", "target-feature=+fp-armv8d16sp",
+]
+
+[alias]
+ci-check = "check --workspace --all-targets"
+ci-clippy = "clippy --workspace --all-targets -- -D warnings"
+ci-test = "test --workspace"
+fw-build = "build -p app-copter --target thumbv7em-none-eabihf --release"

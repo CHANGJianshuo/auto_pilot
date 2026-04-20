@@ -1,0 +1,19 @@
+[package]
+name = "algo-ekf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "24-state Extended Kalman Filter for IMU/GPS/Mag fusion. no_std, Kani-verifiable."
+
+[lints]
+workspace = true
+
+[dependencies]
+nalgebra = { workspace = true }
+libm = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+approx = { workspace = true }

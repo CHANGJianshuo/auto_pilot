@@ -1,0 +1,23 @@
+[package]
+name = "core-hal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hardware abstraction layer: peripheral ownership, IMU/GPS/ESC traits, embassy-stm32 backend."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# STM32H753 (Pixhawk 6X) backend. Gated because it drags in embassy-stm32 crates.
+stm32h753 = []
+
+[dependencies]
+embedded-hal = { workspace = true }
+embedded-hal-async = { workspace = true }
+heapless = { workspace = true }
+nalgebra = { workspace = true }
+defmt = { workspace = true, optional = true }
