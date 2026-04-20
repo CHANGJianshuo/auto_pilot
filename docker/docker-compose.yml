@@ -1,0 +1,113 @@
+# auto_pilot dev stack.
+#
+# Profiles:
+#   default        CPU-only dev shell. Good for everyday firmware work.
+#   gpu            Adds NVIDIA runtime for PyTorch / Isaac Gym training.
+#   sim            Spawns a Gazebo Harmonic + QGroundControl-friendly
+#                  network, exposes MAVLink UDP ports.
+#
+# Usage (from repo root):
+#   docker compose -f docker/docker-compose.yml build dev
+#   docker compose -f docker/docker-compose.yml run --rm dev
+#   docker compose -f docker/docker-compose.yml --profile gpu run --rm dev
+#   docker compose -f docker/docker-compose.yml --profile sim up
+#
+# WSL2 notes:
+#   X11/GUI works via WSLg out of the box. $DISPLAY is injected from host.
+#   USB passthrough to probe-rs needs `usbipd` on the Windows side; see
+#   docker/README.md.
+
+x-dev-base: &dev_base
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+    args:
+      USER_UID: "${UID:-1000}"
+      USER_GID: "${GID:-1000}"
+      ROS_ENABLE: "1"
+      ML_ENABLE: "0"
+  image: auto_pilot-dev:latest
+  hostname: ap-dev
+  working_dir: /workspace
+  volumes:
+    # Source tree (bind — edits on host persist).
+    - ..:/workspace:cached
+    # Persist cargo caches across runs.
+    - cargo-registry:/opt/rust/cargo/registry
+    - cargo-git:/opt/rust/cargo/git
+    # Host git / gh / ssh config so the container shares identity.
+    - ${HOME}/.gitconfig:/home/dev/.gitconfig:ro
+    - ${HOME}/.ssh:/home/dev/.ssh:ro
+    - ${HOME}/.config/gh:/home/dev/.config/gh
+    # X11 (Linux / WSLg).
+    - /tmp/.X11-unix:/tmp/.X11-unix
+    - ${XAUTHORITY:-/dev/null}:/home/dev/.Xauthority:ro
+    # WSLg specifics (no-op on pure Linux).
+    - /mnt/wslg:/mnt/wslg:ro
+  environment:
+    - DISPLAY=${DISPLAY:-:0}
+    - WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}
+    - PULSE_SERVER=${PULSE_SERVER:-}
+    - XDG_RUNTIME_DIR=/tmp/runtime-dev
+    - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-42}
+    - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+  cap_add:
+    - SYS_PTRACE            # gdb / lldb
+  security_opt:
+    - seccomp:unconfined    # debugger friendliness
+  # USB passthrough for probe-rs / flashing. Devices resolve lazily, so
+  # missing ones are ignored (useful on macOS / WSL without usbipd set up).
+  devices: []
+  stdin_open: true
+  tty: true
+  networks:
+    - ap-net
+
+services:
+  # -------------------- default profile ----------------------------------
+  dev:
+    <<: *dev_base
+    profiles: ["", "default"]
+    command: ["bash"]
+
+  # -------------------- GPU profile --------------------------------------
+  dev-gpu:
+    <<: *dev_base
+    profiles: ["gpu"]
+    runtime: nvidia
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-42}
+    # NVIDIA Container Toolkit must be installed on the host:
+    #   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # -------------------- Simulation profile -------------------------------
+  sim:
+    <<: *dev_base
+    profiles: ["sim"]
+    command: >
+      bash -c "echo 'sim profile: Gazebo Harmonic is available as `gz sim`.
+      Launch from another shell with:  gz sim -v 4 <world.sdf>' && bash"
+    ports:
+      # MAVLink UDP (QGroundControl / MissionPlanner)
+      - "14550:14550/udp"
+      - "14556:14556/udp"
+      # Foxglove / rosbridge (optional)
+      - "8765:8765"
+
+volumes:
+  cargo-registry:
+  cargo-git:
+
+networks:
+  ap-net:
+    driver: bridge

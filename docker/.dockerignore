@@ -1,0 +1,10 @@
+target/
+**/target/
+.git/
+.github/
+sim/build/
+sim/logs/
+*.swp
+.DS_Store
+.idea/
+.vscode/
