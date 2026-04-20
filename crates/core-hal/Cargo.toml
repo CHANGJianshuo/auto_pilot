@@ -21,3 +21,6 @@ embedded-hal-async = { workspace = true }
 heapless = { workspace = true }
 nalgebra = { workspace = true }
 defmt = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
