@@ -14,6 +14,7 @@
 | [0008](./0008-healthlevel-proofs.md) | 2026-04-20 | M1.4 HealthLevel 状态机 | `94f1c24` | 单向 FDIR 不变量（monotone transition + ground-only reset）+ 5 个 Kani 证明 21 ms 通过。 |
 | [0009](./0009-state-24d-vector.md) | 2026-04-20 | M1.5 State ↔ 24-D 向量 | `33fdc0d` | 24 维序列化 + `idx` 模块、2 个 256-sample proptest round-trip、EKF 协方差矩阵的数据基础。 |
 | [0010](./0010-imu-buffer.md) | 2026-04-20 | M1.6 IMU 环形缓冲 + mock | `68fa83d` | `heapless::spsc` SPSC ImuSource + MockImuSource 重放、FIFO proptest。生产/SITL 同一套 trait。 |
+| [0011](./0011-ekf-predict.md) | 2026-04-20 | M1.7 EKF predict 步 | `d5ca634` | Strapdown IMU 积分（四元数指数 + NED 重力 + 速度/位置） + 5 个 proptest（自由落体、水平静止、零角速度、四元数归一化、bad-dt）。 |
 
 ## 写新文档时遵守的模板
 
