@@ -31,6 +31,7 @@
 | [0025](./0025-nis-fdir-integration.md) | 2026-04-21 | M1.14 SensorRejectionCounter | `c362e59` | NIS 拒绝流 → HealthLevel；10 连拒→Degraded、50 连拒→Emergency；`observe` 单步单调性 Kani 证（多步 CBMC 卡 15min → 退到单步+归纳论证）。 |
 | [0026](./0026-indi-inner-loop.md) | 2026-04-21 | M2.0 INDI 内环 + LPF | `25a8e3f` | 生产级 INDI：`Δτ = J·(k·(ω_cmd − ω) − ω̇)`；LowPassFilterVec3 首阶 IIR；10 测试 含 2 proptest。**算法栈第二块（控制律）启动**。 |
 | [0027](./0027-control-allocation.md) | 2026-04-21 | M2.1a 控制分配 X-quad | `747b0a3` | 效率矩阵 `E = [−y, +x, k_yaw, 1]`；预计算 `E⁻¹`；`saturate` 夹取；256 样本 round-trip proptest。N=4 直接逆。 |
+| [0028](./0028-rate-loop-assembly.md) | 2026-04-21 | M2.3 rate loop 组装 | `5f4e812` | **第一次端到端组合**：IMU → EKF → LPF → INDI → 分配 → 电机。`app-copter` dual-target lib+bin，3 集成测试，demo 跑 100 ms 悬停稳定。 |
 
 ## 写新文档时遵守的模板
 
