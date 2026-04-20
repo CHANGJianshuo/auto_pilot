@@ -16,6 +16,7 @@
 | [0010](./0010-imu-buffer.md) | 2026-04-20 | M1.6 IMU 环形缓冲 + mock | `68fa83d` | `heapless::spsc` SPSC ImuSource + MockImuSource 重放、FIFO proptest。生产/SITL 同一套 trait。 |
 | [0011](./0011-ekf-predict.md) | 2026-04-20 | M1.7 EKF predict 步 | `d5ca634` | Strapdown IMU 积分（四元数指数 + NED 重力 + 速度/位置） + 5 个 proptest（自由落体、水平静止、零角速度、四元数归一化、bad-dt）。 |
 | [0012](./0012-covariance-scaffold.md) | 2026-04-20 | M1.8 协方差矩阵骨架 | `cf8196a` | `Covariance = SMatrix<24,24>`、`initial_sigma` 常量、`initial_covariance()` 对角 P₀、`enforce_symmetry()` + proptest。为 M1.9 的 F·P·Fᵀ+Q 铺路。 |
+| [0013](./0013-process-noise-placeholder-f.md) | 2026-04-20 | M1.9a 过程噪声 Q + F=I 占位 | `81f1a25` | `ProcessNoise` 每秒强度 + `build_process_noise(dt)` + `predict_covariance(P,F,Q)` 完整数据流。F=I 先占位，M1.9b 替换真实 Jacobian。 |
 
 ## 写新文档时遵守的模板
 
