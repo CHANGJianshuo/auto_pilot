@@ -32,6 +32,7 @@
 | [0026](./0026-indi-inner-loop.md) | 2026-04-21 | M2.0 INDI 内环 + LPF | `25a8e3f` | 生产级 INDI：`Δτ = J·(k·(ω_cmd − ω) − ω̇)`；LowPassFilterVec3 首阶 IIR；10 测试 含 2 proptest。**算法栈第二块（控制律）启动**。 |
 | [0027](./0027-control-allocation.md) | 2026-04-21 | M2.1a 控制分配 X-quad | `747b0a3` | 效率矩阵 `E = [−y, +x, k_yaw, 1]`；预计算 `E⁻¹`；`saturate` 夹取；256 样本 round-trip proptest。N=4 直接逆。 |
 | [0028](./0028-rate-loop-assembly.md) | 2026-04-21 | M2.3 rate loop 组装 | `5f4e812` | **第一次端到端组合**：IMU → EKF → LPF → INDI → 分配 → 电机。`app-copter` dual-target lib+bin，3 集成测试，demo 跑 100 ms 悬停稳定。 |
+| [0029](./0029-attitude-loop.md) | 2026-04-21 | M2.4 姿态环（四元数误差）| `7e4ddec` | `attitude_to_rate(q_current, q_desired, k_att)`；最短旋转判定；退化 q 返回 0；small-angle proptest 256 样本验证 ω ≈ k⊙r。 |
 
 ## 写新文档时遵守的模板
 
