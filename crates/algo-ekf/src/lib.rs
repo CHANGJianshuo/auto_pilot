@@ -14,10 +14,49 @@
 //! - Quaternion stays unit-normalized within 1e-6 after each predict/update.
 //! - No integer overflow, no panic paths.
 
-use nalgebra::{Quaternion, UnitQuaternion, Vector2, Vector3};
+use nalgebra::{Quaternion, SVector, UnitQuaternion, Vector2, Vector3, Vector4};
 
 /// Dimension of the EKF state vector.
 pub const STATE_DIM: usize = 24;
+
+/// Canonical index layout of the 24-D state vector.
+///
+/// ```text
+///   [0..4)   attitude quaternion (w, i, j, k)
+///   [4..7)   velocity_ned (n, e, d)
+///   [7..10)  position_ned (n, e, d)
+///   [10..13) gyro_bias    (x, y, z)
+///   [13..16) accel_bias   (x, y, z)
+///   [16..19) mag_ned      (n, e, d)
+///   [19..22) mag_bias     (x, y, z)
+///   [22..24) wind_ne      (n, e)
+/// ```
+///
+/// All downstream consumers (EKF covariance matrix, Jacobians, logging)
+/// must use these constants — never hard-coded integers.
+pub mod idx {
+    pub const Q_START: usize = 0;
+    pub const Q_LEN: usize = 4;
+    pub const V_NED_START: usize = 4;
+    pub const V_NED_LEN: usize = 3;
+    pub const P_NED_START: usize = 7;
+    pub const P_NED_LEN: usize = 3;
+    pub const GYRO_BIAS_START: usize = 10;
+    pub const GYRO_BIAS_LEN: usize = 3;
+    pub const ACCEL_BIAS_START: usize = 13;
+    pub const ACCEL_BIAS_LEN: usize = 3;
+    pub const MAG_NED_START: usize = 16;
+    pub const MAG_NED_LEN: usize = 3;
+    pub const MAG_BIAS_START: usize = 19;
+    pub const MAG_BIAS_LEN: usize = 3;
+    pub const WIND_NE_START: usize = 22;
+    pub const WIND_NE_LEN: usize = 2;
+    /// Total — must equal `super::STATE_DIM`.
+    pub const TOTAL: usize = 24;
+}
+
+/// Shorthand for a 24-D column vector over `f32`.
+pub type StateVector = SVector<f32, STATE_DIM>;
 
 /// Minimum quaternion norm accepted for normalization.
 ///
@@ -89,9 +128,65 @@ impl State {
         {
             return None;
         }
-        let norm = norm_sq.sqrt();
+        let norm = libm::sqrtf(norm_sq);
         self.attitude /= norm;
         Some(UnitQuaternion::new_unchecked(self.attitude))
+    }
+
+    /// Pack the struct into a 24-D column vector following [`idx`].
+    ///
+    /// The returned vector is stack-allocated (nalgebra's `SVector`), so this
+    /// is `no_std`-friendly and allocation-free. Uses nalgebra's block copy
+    /// operations so no raw integer indexing is needed — this keeps the
+    /// `indexing_slicing = deny` lint satisfied.
+    #[must_use]
+    pub fn to_vector(&self) -> StateVector {
+        let mut v = StateVector::zeros();
+        // Quaternion stored as [w, i, j, k] to match EKF convention.
+        let q_block = Vector4::new(self.attitude.w, self.attitude.i, self.attitude.j, self.attitude.k);
+        v.fixed_rows_mut::<{ idx::Q_LEN }>(idx::Q_START).copy_from(&q_block);
+        v.fixed_rows_mut::<{ idx::V_NED_LEN }>(idx::V_NED_START).copy_from(&self.velocity_ned);
+        v.fixed_rows_mut::<{ idx::P_NED_LEN }>(idx::P_NED_START).copy_from(&self.position_ned);
+        v.fixed_rows_mut::<{ idx::GYRO_BIAS_LEN }>(idx::GYRO_BIAS_START).copy_from(&self.gyro_bias);
+        v.fixed_rows_mut::<{ idx::ACCEL_BIAS_LEN }>(idx::ACCEL_BIAS_START).copy_from(&self.accel_bias);
+        v.fixed_rows_mut::<{ idx::MAG_NED_LEN }>(idx::MAG_NED_START).copy_from(&self.mag_ned);
+        v.fixed_rows_mut::<{ idx::MAG_BIAS_LEN }>(idx::MAG_BIAS_START).copy_from(&self.mag_bias);
+        v.fixed_rows_mut::<{ idx::WIND_NE_LEN }>(idx::WIND_NE_START).copy_from(&self.wind_ne);
+        v
+    }
+
+    /// Reverse of [`Self::to_vector`].
+    ///
+    /// Copies fields 1-to-1; does **not** normalize the quaternion. Call
+    /// [`Self::normalize_attitude`] afterwards if the caller can't guarantee
+    /// the input came from a prior `to_vector` of a normalized state.
+    #[must_use]
+    pub fn from_vector(v: &StateVector) -> Self {
+        let q_block: Vector4<f32> = v.fixed_rows::<{ idx::Q_LEN }>(idx::Q_START).into_owned();
+        Self {
+            attitude: Quaternion::new(q_block.x, q_block.y, q_block.z, q_block.w),
+            velocity_ned: v
+                .fixed_rows::<{ idx::V_NED_LEN }>(idx::V_NED_START)
+                .into_owned(),
+            position_ned: v
+                .fixed_rows::<{ idx::P_NED_LEN }>(idx::P_NED_START)
+                .into_owned(),
+            gyro_bias: v
+                .fixed_rows::<{ idx::GYRO_BIAS_LEN }>(idx::GYRO_BIAS_START)
+                .into_owned(),
+            accel_bias: v
+                .fixed_rows::<{ idx::ACCEL_BIAS_LEN }>(idx::ACCEL_BIAS_START)
+                .into_owned(),
+            mag_ned: v
+                .fixed_rows::<{ idx::MAG_NED_LEN }>(idx::MAG_NED_START)
+                .into_owned(),
+            mag_bias: v
+                .fixed_rows::<{ idx::MAG_BIAS_LEN }>(idx::MAG_BIAS_START)
+                .into_owned(),
+            wind_ne: v
+                .fixed_rows::<{ idx::WIND_NE_LEN }>(idx::WIND_NE_START)
+                .into_owned(),
+        }
     }
 }
 
@@ -156,6 +251,109 @@ mod tests {
             ..State::default()
         };
         assert!(s.normalize_attitude().is_none());
+    }
+
+    // ---- 24-D serialization tests ----------------------------------------
+
+    fn finite_coord() -> impl Strategy<Value = f32> {
+        -1.0e3f32..1.0e3f32
+    }
+
+    /// Strategy that produces an arbitrary, finite (non-NaN, non-Inf) State.
+    fn any_state() -> impl Strategy<Value = State> {
+        (
+            any_quaternion(),
+            (finite_coord(), finite_coord(), finite_coord()),
+            (finite_coord(), finite_coord(), finite_coord()),
+            (finite_coord(), finite_coord(), finite_coord()),
+            (finite_coord(), finite_coord(), finite_coord()),
+            (finite_coord(), finite_coord(), finite_coord()),
+            (finite_coord(), finite_coord(), finite_coord()),
+            (finite_coord(), finite_coord()),
+        )
+            .prop_map(|(q, v, p, g, a, m, mb, w)| State {
+                attitude: q,
+                velocity_ned: Vector3::new(v.0, v.1, v.2),
+                position_ned: Vector3::new(p.0, p.1, p.2),
+                gyro_bias: Vector3::new(g.0, g.1, g.2),
+                accel_bias: Vector3::new(a.0, a.1, a.2),
+                mag_ned: Vector3::new(m.0, m.1, m.2),
+                mag_bias: Vector3::new(mb.0, mb.1, mb.2),
+                wind_ne: Vector2::new(w.0, w.1),
+            })
+    }
+
+    fn states_equal(a: &State, b: &State) -> bool {
+        a.attitude.w == b.attitude.w
+            && a.attitude.i == b.attitude.i
+            && a.attitude.j == b.attitude.j
+            && a.attitude.k == b.attitude.k
+            && a.velocity_ned == b.velocity_ned
+            && a.position_ned == b.position_ned
+            && a.gyro_bias == b.gyro_bias
+            && a.accel_bias == b.accel_bias
+            && a.mag_ned == b.mag_ned
+            && a.mag_bias == b.mag_bias
+            && a.wind_ne == b.wind_ne
+    }
+
+    #[test]
+    fn idx_layout_totals_state_dim() {
+        assert_eq!(idx::TOTAL, STATE_DIM);
+        // Each range's end matches the next range's start — no gaps, no overlap.
+        assert_eq!(idx::Q_START + idx::Q_LEN, idx::V_NED_START);
+        assert_eq!(idx::V_NED_START + idx::V_NED_LEN, idx::P_NED_START);
+        assert_eq!(idx::P_NED_START + idx::P_NED_LEN, idx::GYRO_BIAS_START);
+        assert_eq!(idx::GYRO_BIAS_START + idx::GYRO_BIAS_LEN, idx::ACCEL_BIAS_START);
+        assert_eq!(idx::ACCEL_BIAS_START + idx::ACCEL_BIAS_LEN, idx::MAG_NED_START);
+        assert_eq!(idx::MAG_NED_START + idx::MAG_NED_LEN, idx::MAG_BIAS_START);
+        assert_eq!(idx::MAG_BIAS_START + idx::MAG_BIAS_LEN, idx::WIND_NE_START);
+        assert_eq!(idx::WIND_NE_START + idx::WIND_NE_LEN, idx::TOTAL);
+    }
+
+    #[test]
+    fn default_state_round_trips() {
+        let s = State::default();
+        let v = s.to_vector();
+        let s2 = State::from_vector(&v);
+        assert!(states_equal(&s, &s2));
+    }
+
+    proptest! {
+        /// Round-trip property: every random State survives to_vector → from_vector.
+        #[test]
+        fn state_vector_round_trip(s in any_state()) {
+            let v = s.to_vector();
+            let s2 = State::from_vector(&v);
+            prop_assert!(states_equal(&s, &s2));
+            // Round-tripping the vector also gives the same vector.
+            let v2 = s2.to_vector();
+            prop_assert_eq!(v, v2);
+        }
+
+        /// Each struct field lands at its documented index in the vector.
+        #[test]
+        fn to_vector_respects_layout(s in any_state()) {
+            let v = s.to_vector();
+            let q: Vector4<f32> =
+                v.fixed_rows::<{ idx::Q_LEN }>(idx::Q_START).into_owned();
+            prop_assert_eq!(q.x, s.attitude.w);
+            prop_assert_eq!(q.y, s.attitude.i);
+            prop_assert_eq!(q.z, s.attitude.j);
+            prop_assert_eq!(q.w, s.attitude.k);
+            prop_assert_eq!(
+                v.fixed_rows::<{ idx::V_NED_LEN }>(idx::V_NED_START).into_owned(),
+                s.velocity_ned
+            );
+            prop_assert_eq!(
+                v.fixed_rows::<{ idx::P_NED_LEN }>(idx::P_NED_START).into_owned(),
+                s.position_ned
+            );
+            prop_assert_eq!(
+                v.fixed_rows::<{ idx::WIND_NE_LEN }>(idx::WIND_NE_START).into_owned(),
+                s.wind_ne
+            );
+        }
     }
 }
 
