@@ -27,6 +27,8 @@ authors = ["auto_pilot contributors"]
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
+# `kani` is injected by cargo-kani; rustc doesn't know about it by default.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 # Lint policy:
 #   * Safety-critical rules are `deny` (panic / unwrap / indexing / ...) —
