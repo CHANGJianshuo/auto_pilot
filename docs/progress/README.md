@@ -20,6 +20,7 @@
 | [0014](./0014-kinematic-f.md) | 2026-04-20 | M1.9b-0 动学 F（dp/dv = I·dt） | `f9c204c` | F 矩阵填入唯一纯线性子块；2 个 proptest 验证 cross-block 正确生成（P[p, v] ≈ dt·σ_v²）。 |
 | [0015](./0015-dq-dq-jacobian.md) | 2026-04-20 | M1.9b-1a ∂q/∂q Jacobian | `c228afc` | 四元数自耦合 = 右乘矩阵 R(δq)；Hamilton 积数值验证 + determinant=1 proptest。F 的最重要一块。 |
 | [0016](./0016-dq-dbg-jacobian.md) | 2026-04-20 | M1.9b-1b ∂q/∂b_g Jacobian | `10d6d41` | 陀螺偏差对姿态的 4×3 块 `-(dt/2)·L(q)[:, 1:4]`；有限差分 proptest 256 样本匹配闭式公式到 1e-4。 |
+| [0017](./0017-dv-dq-dv-dba.md) | 2026-04-20 | M1.9b-1c ∂v/∂q + ∂v/∂b_a | `06c32b7` | 旋转矩阵对 q 的偏导 3×4、加速度偏差的 `−R(q)·dt` 3×3；两个有限差分 proptest 同时通过。 |
 
 ## 写新文档时遵守的模板
 
