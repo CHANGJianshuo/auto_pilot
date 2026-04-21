@@ -40,6 +40,7 @@
 | [0034](./0034-realistic-sitl.md) | 2026-04-21 | M3.1b 真实 SITL（噪声+滞后+阻力+风）| `ac59ea2` | Xorshift + Box-Muller SimRng；`NoiseConfig::realistic()`；电机 τ=20 ms 滞后；线性+二次阻力；恒风扰；3 闭环场景（ideal/realistic/wind）全通过。 |
 | [0035](./0035-pi-cascade.md) | 2026-04-21 | M3.2 PI cascade（积分项）| `0004831` | velocity-loop 加 I + conditional anti-windup + integrator clamp；realistic SITL 稳态误差 **2m → 0.6m**；向后兼容旧函数。 |
 | [0036](./0036-wind-feedforward.md) | 2026-04-21 | M3.3 风扰前馈 | `9eeaaa9` | `outer_step` 用 EKF.wind_ne 做 accel FF；`wind_ff_gain = k_drag/mass`；I 项处理慢变，FF 处理已知风；未来加 EKF 风观测时零改动。 |
+| [0037](./0037-drag-aware-predict.md) | 2026-04-21 | M3.4 drag-aware predict | `a39e2ad` | `State::predict_with_drag` + `predict_step_with_drag`；outer loop 的 wind FF (M3.3) 现在有了估计器配对 —— predict 出的速度会反映风拖动。Jacobian 更新（wind observability）queue 到 M4。 |
 
 ## 写新文档时遵守的模板
 
