@@ -36,6 +36,7 @@
 | [0030](./0030-position-loop-baseline.md) | 2026-04-21 | M2.5 位置环基线 | `851a79c` | P-P 级联：`p_sp → v → a → (q_desired, thrust)`；推力向量法避开姿态奇异；256 proptest 所有输入下 q 单位、thrust 有限非负。M4 NMPC 将透明替换。 |
 | [0031](./0031-outer-step-stitching.md) | 2026-04-21 | M2.6 outer_step 缝合 | `43f3226` | `app-copter::outer_step(setpoint) → motor_thrusts`：position → attitude → rate → allocation 全栈调用。悬停 1000 ticks + 高度目标 thrust 增长测试。**控制栈整链首次可驱动**。 |
 | [0032](./0032-measurement-hooks-fdir.md) | 2026-04-21 | M3.0 GPS/mag/baro + FDIR | `870f146` | `FlightState` 三传感器 `SensorRejectionCounter` + `apply_*_measurement` + `overall_health`；15 连拒 GPS → Degraded；EKF predict+update 闭环 + FDIR 在 app 层打通。 |
+| [0033](./0033-sitl-first-hover.md) | 2026-04-21 | 🚁 M3.1a SITL 首次闭环悬停 | `6cb7c96` | 6-DoF 欧拉 rigid-body 仿真器（Newton-Euler 含 `ω×Jω` 项）+ 无噪声传感器；3 秒 1 kHz 闭环悬停测试通过，altitude/水平误差 < 0.5 m。**控制栈首次系统级验证**。 |
 
 ## 写新文档时遵守的模板
 
