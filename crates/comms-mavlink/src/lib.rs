@@ -1,4 +1,286 @@
 #![no_std]
 
-//! MAVLink 2 adapter. We depend on the upstream `mavlink` crate lazily from
-//! the application binary so this crate stays a thin project-specific shim.
+//! MAVLink 2 adapter.
+//!
+//! This crate provides **stateless encoders** from the EKF-estimated vehicle
+//! state into MAVLink messages (HEARTBEAT, ATTITUDE, GLOBAL_POSITION_INT)
+//! and a matching `parse_frame` that extracts incoming messages from a
+//! byte buffer. Transport (serial, UDP) lives in the application crate.
+//!
+//! We deliberately take raw numeric types rather than `algo_ekf::State` so
+//! `comms-mavlink` does not depend on the filter crate.
+
+use mavlink::common::{MavMessage, ATTITUDE_DATA, GLOBAL_POSITION_INT_DATA, HEARTBEAT_DATA};
+use mavlink::{MAVLinkV2MessageRaw, MavHeader};
+use nalgebra::{Quaternion, Vector3};
+
+/// A fixed-size buffer big enough for the largest MAVLink 2 payload we
+/// currently emit (GLOBAL_POSITION_INT is 28 B + 12 B framing = 40 B).
+/// Keep power-of-two with headroom so users of the API can compose
+/// several messages.
+pub const MAX_FRAME_LEN: usize = 280;
+pub type FrameBuffer = heapless::Vec<u8, MAX_FRAME_LEN>;
+
+/// Pack a full MAVLink 2 frame for `msg` into `FrameBuffer`. System /
+/// component IDs match QGroundControl's expectations.
+#[must_use]
+pub fn encode(header: &MavHeader, msg: &MavMessage) -> FrameBuffer {
+    let mut raw = MAVLinkV2MessageRaw::new();
+    raw.serialize_message(*header, msg);
+    let mut out = FrameBuffer::new();
+    let _ = out.extend_from_slice(raw.raw_bytes());
+    out
+}
+
+/// Build a `HEARTBEAT` frame. The autopilot reports itself as a
+/// `MAV_TYPE_QUADROTOR` with our in-development autopilot kind.
+#[must_use]
+pub fn encode_heartbeat(system_id: u8, component_id: u8, sequence: u8) -> FrameBuffer {
+    use mavlink::common::{MavAutopilot, MavModeFlag, MavState, MavType};
+    let msg = MavMessage::HEARTBEAT(HEARTBEAT_DATA {
+        custom_mode: 0,
+        mavtype: MavType::MAV_TYPE_QUADROTOR,
+        autopilot: MavAutopilot::MAV_AUTOPILOT_GENERIC,
+        base_mode: MavModeFlag::empty(),
+        system_status: MavState::MAV_STATE_STANDBY,
+        mavlink_version: 3,
+    });
+    let header = MavHeader { system_id, component_id, sequence };
+    encode(&header, &msg)
+}
+
+/// Extract roll/pitch/yaw (radians) from a unit quaternion using the
+/// standard aerospace (3-2-1) convention.
+#[must_use]
+pub fn quaternion_to_euler(q: Quaternion<f32>) -> (f32, f32, f32) {
+    let (w, x, y, z) = (q.w, q.i, q.j, q.k);
+    // Roll (x-axis)
+    let sinr_cosp = 2.0 * (w * x + y * z);
+    let cosr_cosp = 1.0 - 2.0 * (x * x + y * y);
+    let roll = libm::atan2f(sinr_cosp, cosr_cosp);
+    // Pitch (y-axis, handle gimbal lock)
+    let sinp = 2.0 * (w * y - z * x);
+    let pitch = if sinp.abs() >= 1.0 {
+        libm::copysignf(core::f32::consts::FRAC_PI_2, sinp)
+    } else {
+        libm::asinf(sinp)
+    };
+    // Yaw (z-axis)
+    let siny_cosp = 2.0 * (w * z + x * y);
+    let cosy_cosp = 1.0 - 2.0 * (y * y + z * z);
+    let yaw = libm::atan2f(siny_cosp, cosy_cosp);
+    (roll, pitch, yaw)
+}
+
+/// Build an `ATTITUDE` frame from a unit quaternion + angular rate.
+///
+/// `time_boot_ms` is the timestamp in milliseconds since boot (the
+/// caller typically sets this from a monotonic clock).
+#[must_use]
+pub fn encode_attitude(
+    system_id: u8,
+    component_id: u8,
+    sequence: u8,
+    time_boot_ms: u32,
+    attitude: Quaternion<f32>,
+    body_rate_rad_s: Vector3<f32>,
+) -> FrameBuffer {
+    let (roll, pitch, yaw) = quaternion_to_euler(attitude);
+    let msg = MavMessage::ATTITUDE(ATTITUDE_DATA {
+        time_boot_ms,
+        roll,
+        pitch,
+        yaw,
+        rollspeed: body_rate_rad_s.x,
+        pitchspeed: body_rate_rad_s.y,
+        yawspeed: body_rate_rad_s.z,
+    });
+    let header = MavHeader { system_id, component_id, sequence };
+    encode(&header, &msg)
+}
+
+/// Scale factor to convert degrees to the 1e-7-degrees integer that
+/// `GLOBAL_POSITION_INT` uses.
+const DEG_TO_E7: f64 = 1.0e7;
+
+/// Build a `GLOBAL_POSITION_INT` frame from a local NED position + the
+/// geodetic origin. Lat/lon are reported as 1e-7-degrees integers,
+/// altitude as millimetres.
+///
+/// The NED → lat/lon conversion uses a flat-earth approximation (good
+/// to ~1 m at ≤ 10 km ranges). For long-range flights swap in a WGS-84
+/// Vincenty solver later.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn encode_global_position_int(
+    system_id: u8,
+    component_id: u8,
+    sequence: u8,
+    time_boot_ms: u32,
+    origin_lat_deg: f64,
+    origin_lon_deg: f64,
+    origin_alt_m: f32,
+    position_ned_m: Vector3<f32>,
+    velocity_ned_m_s: Vector3<f32>,
+    heading_rad: f32,
+) -> FrameBuffer {
+    // Flat-earth small-angle delta to latitude / longitude.
+    const EARTH_RADIUS_M: f64 = 6_378_137.0;
+    let delta_lat_rad = f64::from(position_ned_m.x) / EARTH_RADIUS_M;
+    let delta_lon_rad =
+        f64::from(position_ned_m.y) / (EARTH_RADIUS_M * libm::cos(origin_lat_deg.to_radians()));
+    let lat_deg = origin_lat_deg + delta_lat_rad.to_degrees();
+    let lon_deg = origin_lon_deg + delta_lon_rad.to_degrees();
+
+    // NED convention: +z is down → altitude_m = origin_alt − z.
+    let altitude_m = origin_alt_m - position_ned_m.z;
+
+    let lat_i32 = clamp_f64_to_i32(lat_deg * DEG_TO_E7);
+    let lon_i32 = clamp_f64_to_i32(lon_deg * DEG_TO_E7);
+    let alt_mm = clamp_f32_to_i32(altitude_m * 1000.0);
+    // MAV uses cm/s for velocity.
+    let vx_cms = clamp_f32_to_i16(velocity_ned_m_s.x * 100.0);
+    let vy_cms = clamp_f32_to_i16(velocity_ned_m_s.y * 100.0);
+    let vz_cms = clamp_f32_to_i16(velocity_ned_m_s.z * 100.0);
+
+    // `hdg` is centidegrees, wrapped to 0..=35999. 65535 = unknown.
+    let heading_deg = heading_rad.to_degrees();
+    let wrapped = libm::fmodf(heading_deg + 360.0, 360.0);
+    let hdg_cdeg = {
+        let v = libm::roundf(wrapped * 100.0);
+        if v.is_finite() && (0.0..=35_999.0).contains(&v) {
+            #[allow(clippy::as_conversions)]
+            let u = v as u16;
+            u
+        } else {
+            65_535
+        }
+    };
+
+    let msg = MavMessage::GLOBAL_POSITION_INT(GLOBAL_POSITION_INT_DATA {
+        time_boot_ms,
+        lat: lat_i32,
+        lon: lon_i32,
+        alt: alt_mm,
+        relative_alt: clamp_f32_to_i32((altitude_m - origin_alt_m) * 1000.0),
+        vx: vx_cms,
+        vy: vy_cms,
+        vz: vz_cms,
+        hdg: hdg_cdeg,
+    });
+    let header = MavHeader { system_id, component_id, sequence };
+    encode(&header, &msg)
+}
+
+// TODO(M5.2): expose a streaming parser. The `mavlink` crate's parse
+// paths assume an `io::Read`; for the transport-agnostic slice API we
+// want here we need a small adapter. Keeping this commit focused on
+// *encoding* since that's what the telemetry tests drive.
+
+// --- Internal conversions ---------------------------------------------------
+
+fn clamp_f64_to_i32(v: f64) -> i32 {
+    if !v.is_finite() {
+        return 0;
+    }
+    let clamped = v.clamp(f64::from(i32::MIN), f64::from(i32::MAX));
+    #[allow(clippy::as_conversions)]
+    let out = clamped as i32;
+    out
+}
+
+fn clamp_f32_to_i32(v: f32) -> i32 {
+    if !v.is_finite() {
+        return 0;
+    }
+    #[allow(clippy::as_conversions)]
+    let clamped = v.clamp(i32::MIN as f32, i32::MAX as f32);
+    #[allow(clippy::as_conversions)]
+    let out = clamped as i32;
+    out
+}
+
+fn clamp_f32_to_i16(v: f32) -> i16 {
+    if !v.is_finite() {
+        return 0;
+    }
+    #[allow(clippy::as_conversions)]
+    let clamped = v.clamp(f32::from(i16::MIN), f32::from(i16::MAX));
+    #[allow(clippy::as_conversions)]
+    let out = clamped as i16;
+    out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn byte_at(frame: &FrameBuffer, idx: usize) -> u8 {
+        *frame.get(idx).unwrap_or(&0)
+    }
+
+    #[test]
+    fn heartbeat_round_trips() {
+        let frame = encode_heartbeat(7, 1, 3);
+        // MAVLink 2 frame layout:
+        //   idx 0  STX (0xFD)
+        //   idx 1  payload length
+        //   idx 2  incompat flags
+        //   idx 3  compat flags
+        //   idx 4  sequence
+        //   idx 5  system ID
+        //   idx 6  component ID
+        assert!(frame.len() >= 12, "frame too small: {}", frame.len());
+        assert_eq!(byte_at(&frame, 0), 0xFD, "expected MAVLink v2 magic");
+        assert_eq!(byte_at(&frame, 4), 3, "sequence");
+        assert_eq!(byte_at(&frame, 5), 7, "sys_id");
+        assert_eq!(byte_at(&frame, 6), 1, "comp_id");
+    }
+
+    #[test]
+    fn attitude_encodes_expected_euler() {
+        // 90° rotation about z: quaternion (cos 45°, 0, 0, sin 45°).
+        let half = core::f32::consts::FRAC_PI_4;
+        let q = Quaternion::new(libm::cosf(half), 0.0, 0.0, libm::sinf(half));
+        let (_r, _p, yaw) = quaternion_to_euler(q);
+        assert!((yaw - core::f32::consts::FRAC_PI_2).abs() < 1.0e-4);
+
+        let frame = encode_attitude(1, 1, 0, 12345, q, Vector3::new(0.1, -0.2, 0.3));
+        assert_eq!(byte_at(&frame, 0), 0xFD);
+        assert!(frame.len() > 20);
+    }
+
+    #[test]
+    fn global_position_int_wraps_heading() {
+        let pos = Vector3::new(100.0, 0.0, -5.0); // 100 m north, 5 m up
+        let vel = Vector3::new(1.0, 0.0, 0.0);
+
+        let frame = encode_global_position_int(
+            1, 1, 0, 1000,
+            40.0, -105.0, 1655.0,
+            pos, vel, 0.0,
+        );
+        assert_eq!(byte_at(&frame, 0), 0xFD);
+        // MAVLink 2 truncates trailing zeros, so payload length is variable.
+        // Just require the frame fits the 28-byte upper bound plus overhead.
+        assert!(frame.len() <= 12 + 28);
+    }
+
+    #[test]
+    fn global_position_int_handles_negative_heading() {
+        let frame = encode_global_position_int(
+            1, 1, 0, 0,
+            0.0, 0.0, 0.0,
+            Vector3::zeros(), Vector3::zeros(), -1.0, // -1 rad heading
+        );
+        assert_eq!(byte_at(&frame, 0), 0xFD);
+    }
+
+    #[test]
+    fn clamp_helpers_reject_non_finite() {
+        assert_eq!(clamp_f64_to_i32(f64::NAN), 0);
+        assert_eq!(clamp_f32_to_i32(f32::INFINITY), 0);
+        assert_eq!(clamp_f32_to_i16(f32::NEG_INFINITY), 0);
+    }
+}

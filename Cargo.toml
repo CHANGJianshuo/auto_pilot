@@ -71,6 +71,11 @@ embassy-stm32 = { version = "0.1", features = ["stm32h753ii", "time-driver-tim2"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 postcard = { version = "1.0", default-features = false }
 
+# MAVLink 2 parser / encoder. `default-features = false` disables std so
+# the same crate works on embedded targets; `common` is the standard
+# dialect covering HEARTBEAT / ATTITUDE / GLOBAL_POSITION_INT, etc.
+mavlink = { version = "0.14", default-features = false, features = ["common", "embedded"] }
+
 # Host-side deps
 tokio = { version = "1.40", features = ["full"] }
 tracing = "0.1"
