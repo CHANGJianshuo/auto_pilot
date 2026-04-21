@@ -24,3 +24,4 @@ core-hal = { path = "../core-hal" }
 [dev-dependencies]
 app-copter = { path = "../app-copter" }
 algo-nmpc = { path = "../algo-nmpc" }
+algo-fdir = { path = "../algo-fdir" }

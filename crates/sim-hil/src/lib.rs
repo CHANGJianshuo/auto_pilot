@@ -294,10 +294,39 @@ pub fn accel_world(cfg: &SimConfig, state: &SimState) -> Vector3<f32> {
 /// GPS position reading with additive noise per `cfg.noise.gps_pos_sigma`.
 #[must_use]
 pub fn sense_gps(cfg: &SimConfig, state: &SimState, rng: &mut SimRng) -> GpsMeasurement {
+    sense_gps_with_fault(cfg, state, rng, GpsFault::None)
+}
+
+/// Optional GPS fault injected for a single observation.
+#[derive(Clone, Copy, Debug)]
+pub enum GpsFault {
+    /// No fault — normal noisy reading.
+    None,
+    /// Add a constant world-frame offset (m) on top of the real position.
+    /// Useful for modelling multipath or spoofing.
+    Offset(Vector3<f32>),
+    /// Sensor stuck at an absolute position. Simulates hung driver.
+    Stuck(Vector3<f32>),
+}
+
+/// GPS reading with an optional injected fault mode. Call this from test
+/// / simulation drivers that want to exercise FDIR.
+#[must_use]
+pub fn sense_gps_with_fault(
+    cfg: &SimConfig,
+    state: &SimState,
+    rng: &mut SimRng,
+    fault: GpsFault,
+) -> GpsMeasurement {
     let sigma = cfg.noise.gps_pos_sigma;
     let reported_sigma = sigma.max(0.1);
+    let position_ned = match fault {
+        GpsFault::None => state.position_ned + rng.gaussian_vec3(sigma),
+        GpsFault::Offset(off) => state.position_ned + off + rng.gaussian_vec3(sigma),
+        GpsFault::Stuck(p) => p,
+    };
     GpsMeasurement {
-        position_ned: state.position_ned + rng.gaussian_vec3(sigma),
+        position_ned,
         sigma: Vector3::new(reported_sigma, reported_sigma, reported_sigma * 1.3),
     }
 }
@@ -543,6 +572,88 @@ mod tests {
         let dot = est.dot(&true_ne) / (est.norm() * true_ne.norm() + 1.0e-6);
         assert!(est.norm() > 0.3, "wind estimate too small: {est:?}");
         assert!(dot > 0.5, "wind direction mismatch: est={est:?} truth={true_ne:?} cos={dot}");
+    }
+
+    #[test]
+    fn gps_outliers_degrade_sensor_health() {
+        use algo_fdir::HealthLevel;
+        use algo_nmpc::Setpoint;
+        use app_copter::{
+            apply_baro_measurement, apply_gps_measurement, apply_mag_measurement,
+            default_config_250g, outer_step, FlightState,
+        };
+
+        let sim_cfg = SimConfig::default();
+        let mut sim_state = SimState {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..SimState::default()
+        };
+        let mut rng = SimRng::new(99);
+        let mut app_cfg = default_config_250g();
+        let mut flight = FlightState::default();
+        let _ = apply_baro_measurement(
+            &mut flight,
+            &sense_baro(&sim_cfg, &sim_state, &mut rng),
+        );
+        let _ = apply_gps_measurement(
+            &mut flight,
+            &sense_gps(&sim_cfg, &sim_state, &mut rng),
+        );
+
+        let setpoint = Setpoint {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..Setpoint::default()
+        };
+
+        let dt = 0.001_f32;
+        // Inject sustained GPS outliers during the second half of the run.
+        let outlier_offset = Vector3::new(500.0, 0.0, 0.0); // way out of any χ² gate
+        for i in 0..6000 {
+            let accel_w = accel_world(&sim_cfg, &sim_state);
+            let imu = sense_imu(&sim_cfg, &sim_state, accel_w, &mut rng);
+            let out = outer_step(&mut app_cfg, &mut flight, imu, dt, &setpoint);
+            step(&sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
+            if i % 200 == 0 {
+                let fault = if i >= 2000 {
+                    GpsFault::Offset(outlier_offset)
+                } else {
+                    GpsFault::None
+                };
+                let gps = sense_gps_with_fault(&sim_cfg, &sim_state, &mut rng, fault);
+                let _ = apply_gps_measurement(&mut flight, &gps);
+            }
+            if i % 40 == 0 {
+                let _ = apply_mag_measurement(
+                    &mut flight,
+                    &sense_mag(&sim_cfg, &sim_state, &mut rng),
+                );
+            }
+            if i % 20 == 0 {
+                let _ = apply_baro_measurement(
+                    &mut flight,
+                    &sense_baro(&sim_cfg, &sim_state, &mut rng),
+                );
+            }
+        }
+
+        // After 4 s of 200-ms-spaced outliers (20 outlier samples), the
+        // GPS health counter should have escalated past Healthy.
+        let gps_lvl = flight.gps_health.level();
+        let overall = flight.overall_health();
+        assert!(
+            gps_lvl.severity() >= HealthLevel::Degraded.severity(),
+            "gps health stayed {gps_lvl:?}, streak {}",
+            flight.gps_health.streak()
+        );
+        assert!(
+            overall.severity() >= gps_lvl.severity(),
+            "overall health {overall:?} should track worst source"
+        );
+        // Vehicle didn't fall out of the sky — mag + baro still anchor
+        // attitude and altitude.
+        assert!(sim_state.position_ned.norm() < 50.0,
+            "vehicle lost control: pos = {}", sim_state.position_ned);
+        assert!((sim_state.attitude.norm() - 1.0).abs() < 1.0e-3);
     }
 
     #[test]
