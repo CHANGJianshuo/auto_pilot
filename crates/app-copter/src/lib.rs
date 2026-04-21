@@ -20,21 +20,21 @@
 //! ```
 
 use algo_ekf::{
-    baro_update, gps_update, mag_update, predict_step_with_drag, BaroMeasurement, Covariance,
-    GpsMeasurement, ImuMeasurement, MagMeasurement, ProcessNoise, State,
+    BaroMeasurement, Covariance, GpsMeasurement, ImuMeasurement, MagMeasurement, ProcessNoise,
+    State, baro_update, gps_update, mag_update, predict_step_with_drag,
 };
 use algo_fdir::{HealthLevel, SensorRejectionCounter};
 use algo_indi::{
-    attitude_to_rate, compute_torque_increment, AttitudeGain, IndiInput, Inertia,
-    LowPassFilterVec3, RateCommand, RateGain,
+    AttitudeGain, IndiInput, Inertia, LowPassFilterVec3, RateCommand, RateGain, attitude_to_rate,
+    compute_torque_increment,
 };
-use algo_nmpc::{position_to_attitude_thrust_pi, PositionGains, Setpoint};
+use algo_nmpc::{PositionGains, Setpoint, position_to_attitude_thrust_pi};
 use core_hal::traits::ImuSample;
 use nalgebra::{Matrix4, SVector, Vector3};
 
 pub use algo_alloc::{
-    allocate, build_effectiveness, invert_quad_effectiveness, saturate, standard_x_quad,
-    MotorGeometry, VirtualCommand,
+    MotorGeometry, VirtualCommand, allocate, build_effectiveness, invert_quad_effectiveness,
+    saturate, standard_x_quad,
 };
 
 /// Per-flight tunable parameters that are static at boot.
@@ -66,6 +66,18 @@ pub struct RateLoopConfig {
     pub drag_over_mass_hz: f32,
 }
 
+/// Whether the vehicle is allowed to drive its motors.
+///
+/// Disarmed is the safe default: every rate-loop step short-circuits to
+/// zero motor thrust, even if the controller commands something non-zero.
+/// Required by all GCS (QGC, MP, MAVROS) before flight.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ArmState {
+    #[default]
+    Disarmed,
+    Armed,
+}
+
 /// Dynamic flight state held across iterations.
 #[derive(Clone, Copy, Debug)]
 pub struct FlightState {
@@ -79,6 +91,9 @@ pub struct FlightState {
     /// Velocity-loop integrator (anti-windup-bounded). Advanced by
     /// [`outer_step`] each call.
     pub vel_integrator: Vector3<f32>,
+    /// Arm state; `Disarmed` forces motor output to zero regardless of
+    /// controller output.
+    pub arm_state: ArmState,
 }
 
 impl Default for FlightState {
@@ -91,6 +106,7 @@ impl Default for FlightState {
             mag_health: SensorRejectionCounter::new(),
             baro_health: SensorRejectionCounter::new(),
             vel_integrator: Vector3::zeros(),
+            arm_state: ArmState::default(),
         }
     }
 }
@@ -99,10 +115,14 @@ impl FlightState {
     /// Roll-up of every sensor stream's health level (worst wins).
     #[must_use]
     pub fn overall_health(&self) -> HealthLevel {
-        [self.gps_health.level(), self.mag_health.level(), self.baro_health.level()]
-            .into_iter()
-            .max_by_key(|l| l.severity())
-            .unwrap_or(HealthLevel::Healthy)
+        [
+            self.gps_health.level(),
+            self.mag_health.level(),
+            self.baro_health.level(),
+        ]
+        .into_iter()
+        .max_by_key(|l| l.severity())
+        .unwrap_or(HealthLevel::Healthy)
     }
 }
 
@@ -172,8 +192,14 @@ pub fn rate_loop_step(
     let raw = allocate(&cfg.e_inv, &virtual_cmd);
     let clipped = saturate(raw, cfg.motor_min_n, cfg.motor_max_n);
 
+    // Arm-state gate: disarmed vehicles emit zero thrust unconditionally.
+    let final_thrusts = match flight.arm_state {
+        ArmState::Armed => clipped,
+        ArmState::Disarmed => SVector::<f32, 4>::zeros(),
+    };
+
     RateLoopOutput {
-        motor_thrusts_n: clipped,
+        motor_thrusts_n: final_thrusts,
         virtual_cmd,
     }
 }
@@ -331,7 +357,10 @@ mod tests {
     #[test]
     fn rate_loop_runs_one_step() {
         let mut cfg = default_config_250g();
-        let mut flight = FlightState::default();
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
         let imu = stationary_imu(0);
         let out = rate_loop_step(&mut cfg, &mut flight, imu, 0.001, RateCommand::default());
         // With zero rate cmd and stationary IMU, motor thrusts should all be
@@ -393,7 +422,10 @@ mod tests {
     #[test]
     fn baro_measurement_updates_health_and_altitude() {
         let mut flight = FlightState::default();
-        let m = algo_ekf::BaroMeasurement { altitude_m: 2.0, sigma_m: 0.1 };
+        let m = algo_ekf::BaroMeasurement {
+            altitude_m: 2.0,
+            sigma_m: 0.1,
+        };
         let _ = apply_baro_measurement(&mut flight, &m);
         // position_ned.z is negative-Down, altitude is -z.
         let altitude = -flight.state.position_ned.z;
@@ -467,8 +499,10 @@ mod tests {
         // branch should have (near) zero (gravity only).
         let vx_on = flight_on.state.velocity_ned.x;
         let vx_off = flight_off.state.velocity_ned.x;
-        assert!(vx_on > vx_off + 0.01,
-            "drag FF inactive: vx_on={vx_on} vx_off={vx_off}");
+        assert!(
+            vx_on > vx_off + 0.01,
+            "drag FF inactive: vx_on={vx_on} vx_off={vx_off}"
+        );
     }
 
     #[test]
@@ -476,7 +510,10 @@ mod tests {
         // With a known horizontal wind, the controller should tilt
         // *into* the wind to cancel drag — even at zero pos/vel error.
         let mut cfg = default_config_250g();
-        let mut flight = FlightState::default();
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
         // Pretend the EKF has identified +3 m/s east wind.
         flight.state.wind_ne = nalgebra::Vector2::new(0.0, 3.0);
         let imu = stationary_imu(0);
@@ -486,7 +523,10 @@ mod tests {
         // Same scenario but with wind FF disabled.
         let mut cfg_no_ff = default_config_250g();
         cfg_no_ff.wind_ff_gain = 0.0;
-        let mut flight_no_ff = FlightState::default();
+        let mut flight_no_ff = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
         flight_no_ff.state.wind_ne = nalgebra::Vector2::new(0.0, 3.0);
         let out_no = outer_step(&mut cfg_no_ff, &mut flight_no_ff, imu, 0.001, &setpoint);
 
@@ -500,13 +540,19 @@ mod tests {
                 .abs()
             })
             .sum();
-        assert!(diff > 1.0e-3, "wind FF had no effect on motors: diff={diff}");
+        assert!(
+            diff > 1.0e-3,
+            "wind FF had no effect on motors: diff={diff}"
+        );
     }
 
     #[test]
     fn outer_step_altitude_setpoint_raises_thrust() {
         let mut cfg = default_config_250g();
-        let mut flight = FlightState::default();
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
         // Climb to 1 m altitude (z = -1 in NED).
         let setpoint = Setpoint {
             position_ned: Vector3::new(0.0, 0.0, -1.0),
@@ -522,15 +568,59 @@ mod tests {
     }
 
     #[test]
+    fn disarmed_vehicle_outputs_zero_thrust_regardless_of_command() {
+        let mut cfg = default_config_250g();
+        let mut flight = FlightState::default(); // Disarmed by default
+        assert_eq!(flight.arm_state, ArmState::Disarmed);
+        // Aggressive setpoint that would normally saturate motors.
+        let setpoint = Setpoint {
+            position_ned: Vector3::new(100.0, 0.0, -10.0),
+            ..Setpoint::default()
+        };
+        let imu = stationary_imu(0);
+        let out = outer_step(&mut cfg, &mut flight, imu, 0.001, &setpoint);
+        for i in 0..4 {
+            let t = out.motor_thrusts_n.fixed_view::<1, 1>(i, 0).to_scalar();
+            assert_eq!(t, 0.0, "disarmed motor {i} should be 0, got {t}");
+        }
+    }
+
+    #[test]
+    fn arming_enables_motor_output() {
+        let mut cfg = default_config_250g();
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
+        let imu = stationary_imu(0);
+        let out = outer_step(&mut cfg, &mut flight, imu, 0.001, &Setpoint::default());
+        // Armed + zero setpoint → hover thrust on each motor.
+        let total: f32 = (0..4)
+            .map(|i| out.motor_thrusts_n.fixed_view::<1, 1>(i, 0).to_scalar())
+            .sum();
+        assert!(total > 0.0);
+    }
+
+    #[test]
     fn rate_loop_commands_positive_roll_shifts_motors_asymmetrically() {
         let mut cfg = default_config_250g();
-        let mut flight = FlightState::default();
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
         // Seed the filters with 10 stationary samples.
         for i in 0..10 {
-            let _ =
-                rate_loop_step(&mut cfg, &mut flight, stationary_imu(i), 0.001, RateCommand::default());
+            let _ = rate_loop_step(
+                &mut cfg,
+                &mut flight,
+                stationary_imu(i),
+                0.001,
+                RateCommand::default(),
+            );
         }
-        let cmd = RateCommand { body_rate_rad_s: Vector3::new(2.0, 0.0, 0.0) };
+        let cmd = RateCommand {
+            body_rate_rad_s: Vector3::new(2.0, 0.0, 0.0),
+        };
         let out = rate_loop_step(&mut cfg, &mut flight, stationary_imu(11), 0.001, cmd);
         // Positive roll cmd → y<0 motors (M2, M3) get more thrust than y>0 motors (M1, M4).
         let m1 = out.motor_thrusts_n.fixed_view::<1, 1>(0, 0).to_scalar();

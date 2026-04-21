@@ -18,14 +18,14 @@
 use algo_ekf::GRAVITY_M_S2;
 use algo_nmpc::Setpoint;
 use app_copter::{
-    apply_baro_measurement, apply_gps_measurement, apply_mag_measurement,
-    default_config_250g, outer_step, FlightState,
+    ArmState, FlightState, apply_baro_measurement, apply_gps_measurement, apply_mag_measurement,
+    default_config_250g, outer_step,
 };
 use nalgebra::Vector3;
 use sim_hil::{
-    accel_world,
-    mavlink_udp::{setpoint_from_mav_message, MavlinkUdpSink},
-    sense_baro, sense_gps, sense_imu, sense_mag, step, SimConfig, SimRng, SimState,
+    SimConfig, SimRng, SimState, accel_world,
+    mavlink_udp::{MavlinkUdpSink, arm_change_from_mav_message, setpoint_from_mav_message},
+    sense_baro, sense_gps, sense_imu, sense_mag, step,
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,7 +35,9 @@ const DEFAULT_GCS: &str = "127.0.0.1:14550";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let target = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_GCS.into());
+    let target = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_GCS.into());
     tracing_subscriber::fmt::init();
     tracing::info!(%target, "sitl_mavlink: sending MAVLink telemetry");
 
@@ -54,7 +56,12 @@ async fn main() -> anyhow::Result<()> {
     }));
     let setpoint_sim = Arc::clone(&setpoint);
 
-    let sim_task = tokio::task::spawn_blocking(move || run_sim(tx, setpoint_sim));
+    // Shared arm state. Demo starts disarmed so the GCS must actually
+    // send MAV_CMD_COMPONENT_ARM_DISARM before motors spin up.
+    let arm_state = Arc::new(Mutex::new(ArmState::Disarmed));
+    let arm_state_sim = Arc::clone(&arm_state);
+
+    let sim_task = tokio::task::spawn_blocking(move || run_sim(tx, setpoint_sim, arm_state_sim));
 
     let start = Instant::now();
     let mut last_hb = Instant::now() - Duration::from_secs(1);
@@ -67,8 +74,9 @@ async fn main() -> anyhow::Result<()> {
         while let Ok(snap) = rx.try_recv() {
             latest = Some(snap);
         }
-        // Drain any incoming MAVLink frames. Update setpoint if GCS
-        // sent SET_POSITION_TARGET_LOCAL_NED.
+        // Drain any incoming MAVLink frames. Route each recognised
+        // message to the appropriate shared state: SET_POSITION_TARGET
+        // → setpoint, COMMAND_LONG(ARM_DISARM) → arm_state.
         while let Ok(Some((_hdr, msg, _src))) = sink.try_recv() {
             if let Some(new_sp) = setpoint_from_mav_message(&msg) {
                 if let Ok(mut sp) = setpoint.lock() {
@@ -77,6 +85,19 @@ async fn main() -> anyhow::Result<()> {
                         target_ned = ?new_sp.position_ned,
                         "received new setpoint from GCS"
                     );
+                }
+            }
+            if let Some(arm) = arm_change_from_mav_message(&msg) {
+                if let Ok(mut a) = arm_state.lock() {
+                    let new = if arm {
+                        ArmState::Armed
+                    } else {
+                        ArmState::Disarmed
+                    };
+                    if *a != new {
+                        *a = new;
+                        tracing::info!(?new, "arm state changed by GCS");
+                    }
                 }
             }
         }
@@ -95,13 +116,8 @@ async fn main() -> anyhow::Result<()> {
             }
             if now.duration_since(last_pos) >= Duration::from_millis(200) {
                 sink.send_global_position_int(
-                    t_ms,
-                    47.397_742,  // Zurich (Agilicious's home)
-                    8.545_594,
-                    408.0,
-                    s.position,
-                    s.velocity,
-                    s.heading,
+                    t_ms, 47.397_742, // Zurich (Agilicious's home)
+                    8.545_594, 408.0, s.position, s.velocity, s.heading,
                 )
                 .await
                 .ok();
@@ -130,7 +146,11 @@ struct Snapshot {
     heading: f32,
 }
 
-fn run_sim(tx: mpsc::UnboundedSender<Snapshot>, setpoint: Arc<Mutex<Setpoint>>) {
+fn run_sim(
+    tx: mpsc::UnboundedSender<Snapshot>,
+    setpoint: Arc<Mutex<Setpoint>>,
+    arm_state: Arc<Mutex<ArmState>>,
+) {
     let sim_cfg = SimConfig::realistic_dynamics(Vector3::zeros());
     let mut sim_state = SimState {
         position_ned: Vector3::new(0.0, 0.0, -1.0),
@@ -139,14 +159,8 @@ fn run_sim(tx: mpsc::UnboundedSender<Snapshot>, setpoint: Arc<Mutex<Setpoint>>) 
     let mut rng = SimRng::new(42);
     let mut app_cfg = default_config_250g();
     let mut flight = FlightState::default();
-    let _ = apply_baro_measurement(
-        &mut flight,
-        &sense_baro(&sim_cfg, &sim_state, &mut rng),
-    );
-    let _ = apply_gps_measurement(
-        &mut flight,
-        &sense_gps(&sim_cfg, &sim_state, &mut rng),
-    );
+    let _ = apply_baro_measurement(&mut flight, &sense_baro(&sim_cfg, &sim_state, &mut rng));
+    let _ = apply_gps_measurement(&mut flight, &sense_gps(&sim_cfg, &sim_state, &mut rng));
     let dt = 0.001_f32;
     let step_duration = Duration::from_millis(1);
     let mut next_wake = Instant::now();
@@ -159,26 +173,19 @@ fn run_sim(tx: mpsc::UnboundedSender<Snapshot>, setpoint: Arc<Mutex<Setpoint>>) 
             position_ned: Vector3::new(0.0, 0.0, -1.0),
             ..Setpoint::default()
         });
+        flight.arm_state = arm_state.lock().map(|a| *a).unwrap_or(ArmState::Disarmed);
         let out = outer_step(&mut app_cfg, &mut flight, imu, dt, &current_sp);
         step(&sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
 
         if i % 200 == 0 {
-            let _ = apply_gps_measurement(
-                &mut flight,
-                &sense_gps(&sim_cfg, &sim_state, &mut rng),
-            );
+            let _ = apply_gps_measurement(&mut flight, &sense_gps(&sim_cfg, &sim_state, &mut rng));
         }
         if i % 40 == 0 {
-            let _ = apply_mag_measurement(
-                &mut flight,
-                &sense_mag(&sim_cfg, &sim_state, &mut rng),
-            );
+            let _ = apply_mag_measurement(&mut flight, &sense_mag(&sim_cfg, &sim_state, &mut rng));
         }
         if i % 20 == 0 {
-            let _ = apply_baro_measurement(
-                &mut flight,
-                &sense_baro(&sim_cfg, &sim_state, &mut rng),
-            );
+            let _ =
+                apply_baro_measurement(&mut flight, &sense_baro(&sim_cfg, &sim_state, &mut rng));
         }
 
         // Publish a snapshot at ~100 Hz (every 10 ticks).

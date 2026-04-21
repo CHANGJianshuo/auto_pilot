@@ -406,7 +406,7 @@ mod tests {
     fn run_closed_loop_flight(sim_cfg: &SimConfig, seed: u64, steps: usize) -> SimState {
         use app_copter::{
             apply_baro_measurement, apply_gps_measurement, apply_mag_measurement,
-            default_config_250g, outer_step, FlightState,
+            default_config_250g, outer_step, ArmState, FlightState,
         };
         use algo_nmpc::Setpoint;
 
@@ -417,7 +417,10 @@ mod tests {
         let mut rng = SimRng::new(seed);
 
         let mut app_cfg = default_config_250g();
-        let mut flight = FlightState::default();
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
         let _ = apply_baro_measurement(&mut flight, &sense_baro(sim_cfg, &sim_state, &mut rng));
         let _ = apply_gps_measurement(&mut flight, &sense_gps(sim_cfg, &sim_state, &mut rng));
 
@@ -582,7 +585,7 @@ mod tests {
         use algo_nmpc::Setpoint;
         use app_copter::{
             apply_baro_measurement, apply_gps_measurement, apply_mag_measurement,
-            default_config_250g, outer_step, FlightState,
+            default_config_250g, outer_step, ArmState, FlightState,
         };
 
         let sim_cfg = SimConfig::default();
@@ -592,7 +595,10 @@ mod tests {
         };
         let mut rng = SimRng::new(99);
         let mut app_cfg = default_config_250g();
-        let mut flight = FlightState::default();
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
         let _ = apply_baro_measurement(
             &mut flight,
             &sense_baro(&sim_cfg, &sim_state, &mut rng),

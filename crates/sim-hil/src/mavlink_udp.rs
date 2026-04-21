@@ -14,11 +14,11 @@
 
 use algo_nmpc::Setpoint;
 use comms_mavlink::{
-    encode_attitude, encode_global_position_int, encode_heartbeat, parse_frame, FrameBuffer,
-    ParseError,
+    FrameBuffer, ParseError, encode_attitude, encode_global_position_int, encode_heartbeat,
+    parse_frame,
 };
-use mavlink::common::MavMessage;
 use mavlink::MavHeader;
+use mavlink::common::MavMessage;
 use nalgebra::{Quaternion, Vector3};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -49,6 +49,28 @@ pub fn setpoint_from_mav_message(msg: &MavMessage) -> Option<Setpoint> {
     }
 }
 
+/// Extract an ARM/DISARM request from a MAVLink message.
+///
+/// MAV_CMD_COMPONENT_ARM_DISARM (id 400) is carried in COMMAND_LONG with
+/// `param1 = 1.0` (arm) or `param1 = 0.0` (disarm). Returns `Some(true)`
+/// to arm, `Some(false)` to disarm, `None` for anything else.
+///
+/// Any COMMAND_LONG with a different command id, or any other message
+/// type, returns `None` — the caller should treat that as "ignore".
+///
+/// `target_system` / `target_component` are not checked here: demo /
+/// SITL accepts all. Production firmware must verify they match the
+/// local IDs before acting.
+#[must_use]
+pub fn arm_change_from_mav_message(msg: &MavMessage) -> Option<bool> {
+    if let MavMessage::COMMAND_LONG(data) = msg {
+        if data.command == mavlink::common::MavCmd::MAV_CMD_COMPONENT_ARM_DISARM {
+            return Some(data.param1 >= 0.5);
+        }
+    }
+    None
+}
+
 /// One-way MAVLink sender that broadcasts telemetry to a fixed remote
 /// address (the GCS). Sequence numbers auto-increment.
 #[derive(Debug)]
@@ -66,11 +88,9 @@ impl MavlinkUdpSink {
     /// (default QGC listen port is 14550).
     pub async fn bind(local: &str, remote: &str) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(local).await?;
-        let remote: SocketAddr = remote
-            .parse()
-            .map_err(|e: std::net::AddrParseError| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-            })?;
+        let remote: SocketAddr = remote.parse().map_err(|e: std::net::AddrParseError| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
+        })?;
         Ok(Self {
             socket,
             remote,
@@ -179,13 +199,11 @@ mod tests {
             .unwrap();
         sink.send_heartbeat().await.unwrap();
         let mut buf = [0u8; 512];
-        let (n, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            recv.recv_from(&mut buf),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
         assert!(n >= 12, "frame too small: {n}");
         assert_eq!(buf.first().copied(), Some(0xFD), "expected v2 magic");
     }
@@ -240,31 +258,86 @@ mod tests {
 
     #[test]
     fn setpoint_from_target_message_maps_fields() {
-        use mavlink::common::{MavFrame, SET_POSITION_TARGET_LOCAL_NED_DATA, PositionTargetTypemask};
-        let msg = MavMessage::SET_POSITION_TARGET_LOCAL_NED(
-            SET_POSITION_TARGET_LOCAL_NED_DATA {
-                time_boot_ms: 0,
-                target_system: 1,
-                target_component: 1,
-                coordinate_frame: MavFrame::MAV_FRAME_LOCAL_NED,
-                type_mask: PositionTargetTypemask::empty(),
-                x: 1.0,
-                y: 2.0,
-                z: -3.0,
-                vx: 0.1,
-                vy: 0.2,
-                vz: 0.3,
-                afx: 0.0,
-                afy: 0.0,
-                afz: 0.0,
-                yaw: 1.2,
-                yaw_rate: 0.0,
-            },
-        );
+        use mavlink::common::{
+            MavFrame, PositionTargetTypemask, SET_POSITION_TARGET_LOCAL_NED_DATA,
+        };
+        let msg = MavMessage::SET_POSITION_TARGET_LOCAL_NED(SET_POSITION_TARGET_LOCAL_NED_DATA {
+            time_boot_ms: 0,
+            target_system: 1,
+            target_component: 1,
+            coordinate_frame: MavFrame::MAV_FRAME_LOCAL_NED,
+            type_mask: PositionTargetTypemask::empty(),
+            x: 1.0,
+            y: 2.0,
+            z: -3.0,
+            vx: 0.1,
+            vy: 0.2,
+            vz: 0.3,
+            afx: 0.0,
+            afy: 0.0,
+            afz: 0.0,
+            yaw: 1.2,
+            yaw_rate: 0.0,
+        });
         let sp = setpoint_from_mav_message(&msg).expect("setpoint extracted");
         assert_eq!(sp.position_ned, Vector3::new(1.0, 2.0, -3.0));
         assert_eq!(sp.velocity_ned, Vector3::new(0.1, 0.2, 0.3));
         assert!((sp.yaw_rad - 1.2).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn arm_change_from_non_command_message_is_none() {
+        use mavlink::common::HEARTBEAT_DATA;
+        let msg = MavMessage::HEARTBEAT(HEARTBEAT_DATA {
+            custom_mode: 0,
+            mavtype: mavlink::common::MavType::MAV_TYPE_QUADROTOR,
+            autopilot: mavlink::common::MavAutopilot::MAV_AUTOPILOT_GENERIC,
+            base_mode: mavlink::common::MavModeFlag::empty(),
+            system_status: mavlink::common::MavState::MAV_STATE_STANDBY,
+            mavlink_version: 3,
+        });
+        assert!(arm_change_from_mav_message(&msg).is_none());
+    }
+
+    #[test]
+    fn arm_change_from_wrong_command_is_none() {
+        use mavlink::common::COMMAND_LONG_DATA;
+        let msg = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+            param1: 1.0,
+            param2: 0.0,
+            param3: 0.0,
+            param4: 0.0,
+            param5: 0.0,
+            param6: 0.0,
+            param7: 0.0,
+            command: mavlink::common::MavCmd::MAV_CMD_NAV_TAKEOFF,
+            target_system: 1,
+            target_component: 1,
+            confirmation: 0,
+        });
+        assert!(arm_change_from_mav_message(&msg).is_none());
+    }
+
+    #[test]
+    fn arm_change_arm_and_disarm_round_trip() {
+        use mavlink::common::COMMAND_LONG_DATA;
+        let make = |p1: f32| {
+            MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+                param1: p1,
+                param2: 0.0,
+                param3: 0.0,
+                param4: 0.0,
+                param5: 0.0,
+                param6: 0.0,
+                param7: 0.0,
+                command: mavlink::common::MavCmd::MAV_CMD_COMPONENT_ARM_DISARM,
+                target_system: 1,
+                target_component: 1,
+                confirmation: 0,
+            })
+        };
+        assert_eq!(arm_change_from_mav_message(&make(1.0)), Some(true));
+        assert_eq!(arm_change_from_mav_message(&make(0.0)), Some(false));
     }
 
     #[tokio::test]
@@ -280,13 +353,11 @@ mod tests {
         let mut buf = [0u8; 512];
         let mut seqs = Vec::new();
         for _ in 0..3 {
-            let (n, _) = tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                recv.recv_from(&mut buf),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            let (n, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
             assert!(n >= 12);
             seqs.push(buf.get(4).copied().unwrap_or(0));
         }
