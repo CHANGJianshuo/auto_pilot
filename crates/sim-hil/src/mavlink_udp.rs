@@ -14,11 +14,11 @@
 
 use algo_nmpc::Setpoint;
 use comms_mavlink::{
-    FrameBuffer, ParseError, encode_attitude, encode_global_position_int, encode_heartbeat,
-    parse_frame,
+    FrameBuffer, ParseError, encode_attitude, encode_command_ack, encode_global_position_int,
+    encode_heartbeat, parse_frame,
 };
 use mavlink::MavHeader;
-use mavlink::common::MavMessage;
+use mavlink::common::{MavCmd, MavMessage, MavResult};
 use nalgebra::{Quaternion, Vector3};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -127,6 +127,22 @@ impl MavlinkUdpSink {
     /// Emit a HEARTBEAT.
     pub async fn send_heartbeat(&self) -> std::io::Result<()> {
         let frame = encode_heartbeat(self.system_id, self.component_id, self.next_seq());
+        self.send_frame(&frame).await
+    }
+
+    /// Emit a COMMAND_ACK in response to a prior COMMAND_LONG.
+    pub async fn send_command_ack(
+        &self,
+        command: MavCmd,
+        result: MavResult,
+    ) -> std::io::Result<()> {
+        let frame = encode_command_ack(
+            self.system_id,
+            self.component_id,
+            self.next_seq(),
+            command,
+            result,
+        );
         self.send_frame(&frame).await
     }
 
@@ -352,6 +368,36 @@ mod tests {
         };
         assert_eq!(arm_change_from_mav_message(&make(1.0)), Some(true));
         assert_eq!(arm_change_from_mav_message(&make(0.0)), Some(false));
+    }
+
+    #[tokio::test]
+    async fn command_ack_round_trips_to_receiver() {
+        let recv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+        let sink = MavlinkUdpSink::bind("127.0.0.1:0", &recv_addr.to_string())
+            .await
+            .unwrap();
+        sink.send_command_ack(
+            MavCmd::MAV_CMD_COMPONENT_ARM_DISARM,
+            MavResult::MAV_RESULT_ACCEPTED,
+        )
+        .await
+        .unwrap();
+        let mut buf = [0u8; 512];
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        let slice = buf.get(..n).unwrap_or(&[]);
+        let (_hdr, msg) = parse_frame(slice).expect("parses");
+        match msg {
+            MavMessage::COMMAND_ACK(data) => {
+                assert_eq!(data.command, MavCmd::MAV_CMD_COMPONENT_ARM_DISARM);
+                assert!(matches!(data.result, MavResult::MAV_RESULT_ACCEPTED));
+            }
+            _ => panic!("expected COMMAND_ACK, got {msg:?}"),
+        }
     }
 
     #[test]

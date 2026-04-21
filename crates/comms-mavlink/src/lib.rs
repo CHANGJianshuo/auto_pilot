@@ -10,7 +10,10 @@
 //! We deliberately take raw numeric types rather than `algo_ekf::State` so
 //! `comms-mavlink` does not depend on the filter crate.
 
-use mavlink::common::{MavMessage, ATTITUDE_DATA, GLOBAL_POSITION_INT_DATA, HEARTBEAT_DATA};
+use mavlink::common::{
+    ATTITUDE_DATA, COMMAND_ACK_DATA, GLOBAL_POSITION_INT_DATA, HEARTBEAT_DATA, MavCmd, MavMessage,
+    MavResult,
+};
 use mavlink::{MAVLinkV2MessageRaw, MavHeader};
 use nalgebra::{Quaternion, Vector3};
 
@@ -70,6 +73,29 @@ pub fn quaternion_to_euler(q: Quaternion<f32>) -> (f32, f32, f32) {
     let cosy_cosp = 1.0 - 2.0 * (y * y + z * z);
     let yaw = libm::atan2f(siny_cosp, cosy_cosp);
     (roll, pitch, yaw)
+}
+
+/// Build a `COMMAND_ACK` frame acknowledging a prior `COMMAND_LONG`.
+///
+/// Per MAVLink spec, the responder must ACK every `COMMAND_LONG` with
+/// the echoed `command` id and a [`MavResult`] outcome. QGroundControl's
+/// UI buttons (Arm, Land) spin until ACK arrives; without this, users
+/// see stuck spinners even when the command was accepted.
+#[must_use]
+pub fn encode_command_ack(
+    system_id: u8,
+    component_id: u8,
+    sequence: u8,
+    command: MavCmd,
+    result: MavResult,
+) -> FrameBuffer {
+    let msg = MavMessage::COMMAND_ACK(COMMAND_ACK_DATA { command, result });
+    let header = MavHeader {
+        system_id,
+        component_id,
+        sequence,
+    };
+    encode(&header, &msg)
 }
 
 /// Build an `ATTITUDE` frame from a unit quaternion + angular rate.

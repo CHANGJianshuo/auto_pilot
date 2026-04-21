@@ -21,6 +21,7 @@ use app_copter::{
     ArmState, FlightState, LandingState, apply_baro_measurement, apply_gps_measurement,
     apply_mag_measurement, default_config_250g, outer_step,
 };
+use mavlink::common::{MavCmd, MavMessage, MavResult};
 use nalgebra::Vector3;
 use sim_hil::{
     SimConfig, SimRng, SimState, accel_world,
@@ -86,7 +87,9 @@ async fn main() -> anyhow::Result<()> {
         }
         // Drain any incoming MAVLink frames. Route each recognised
         // message to the appropriate shared state: SET_POSITION_TARGET
-        // → setpoint, COMMAND_LONG(ARM_DISARM) → arm_state.
+        // → setpoint, COMMAND_LONG(ARM_DISARM) → arm_state,
+        // COMMAND_LONG(NAV_LAND) → landing_state. Every COMMAND_LONG
+        // gets a COMMAND_ACK back so QGC's UI spinners settle.
         while let Ok(Some((_hdr, msg, _src))) = sink.try_recv() {
             if let Some(new_sp) = setpoint_from_mav_message(&msg) {
                 if let Ok(mut sp) = setpoint.lock() {
@@ -117,6 +120,18 @@ async fn main() -> anyhow::Result<()> {
                         tracing::info!("LAND command received — starting autoland");
                     }
                 }
+            }
+            // Ack any COMMAND_LONG so the GCS doesn't sit waiting. We
+            // accept both commands we understand (ARM_DISARM, NAV_LAND)
+            // and reply UNSUPPORTED for anything else.
+            if let MavMessage::COMMAND_LONG(data) = &msg {
+                let result = match data.command {
+                    MavCmd::MAV_CMD_COMPONENT_ARM_DISARM | MavCmd::MAV_CMD_NAV_LAND => {
+                        MavResult::MAV_RESULT_ACCEPTED
+                    }
+                    _ => MavResult::MAV_RESULT_UNSUPPORTED,
+                };
+                sink.send_command_ack(data.command, result).await.ok();
             }
         }
 
