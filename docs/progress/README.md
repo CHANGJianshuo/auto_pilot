@@ -39,6 +39,7 @@
 | [0033](./0033-sitl-first-hover.md) | 2026-04-21 | 🚁 M3.1a SITL 首次闭环悬停 | `6cb7c96` | 6-DoF 欧拉 rigid-body 仿真器（Newton-Euler 含 `ω×Jω` 项）+ 无噪声传感器；3 秒 1 kHz 闭环悬停测试通过，altitude/水平误差 < 0.5 m。**控制栈首次系统级验证**。 |
 | [0034](./0034-realistic-sitl.md) | 2026-04-21 | M3.1b 真实 SITL（噪声+滞后+阻力+风）| `ac59ea2` | Xorshift + Box-Muller SimRng；`NoiseConfig::realistic()`；电机 τ=20 ms 滞后；线性+二次阻力；恒风扰；3 闭环场景（ideal/realistic/wind）全通过。 |
 | [0035](./0035-pi-cascade.md) | 2026-04-21 | M3.2 PI cascade（积分项）| `0004831` | velocity-loop 加 I + conditional anti-windup + integrator clamp；realistic SITL 稳态误差 **2m → 0.6m**；向后兼容旧函数。 |
+| [0036](./0036-wind-feedforward.md) | 2026-04-21 | M3.3 风扰前馈 | `9eeaaa9` | `outer_step` 用 EKF.wind_ne 做 accel FF；`wind_ff_gain = k_drag/mass`；I 项处理慢变，FF 处理已知风；未来加 EKF 风观测时零改动。 |
 
 ## 写新文档时遵守的模板
 
