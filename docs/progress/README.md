@@ -35,6 +35,7 @@
 | [0029](./0029-attitude-loop.md) | 2026-04-21 | M2.4 姿态环（四元数误差）| `7e4ddec` | `attitude_to_rate(q_current, q_desired, k_att)`；最短旋转判定；退化 q 返回 0；small-angle proptest 256 样本验证 ω ≈ k⊙r。 |
 | [0030](./0030-position-loop-baseline.md) | 2026-04-21 | M2.5 位置环基线 | `851a79c` | P-P 级联：`p_sp → v → a → (q_desired, thrust)`；推力向量法避开姿态奇异；256 proptest 所有输入下 q 单位、thrust 有限非负。M4 NMPC 将透明替换。 |
 | [0031](./0031-outer-step-stitching.md) | 2026-04-21 | M2.6 outer_step 缝合 | `43f3226` | `app-copter::outer_step(setpoint) → motor_thrusts`：position → attitude → rate → allocation 全栈调用。悬停 1000 ticks + 高度目标 thrust 增长测试。**控制栈整链首次可驱动**。 |
+| [0032](./0032-measurement-hooks-fdir.md) | 2026-04-21 | M3.0 GPS/mag/baro + FDIR | `870f146` | `FlightState` 三传感器 `SensorRejectionCounter` + `apply_*_measurement` + `overall_health`；15 连拒 GPS → Degraded；EKF predict+update 闭环 + FDIR 在 app 层打通。 |
 
 ## 写新文档时遵守的模板
 
