@@ -45,6 +45,7 @@
 | [0039](./0039-wind-observable-jacobian.md) | 2026-04-21 | M4.0 风可观测 F Jacobian | `b875322` | `build_transition_jacobian_with_drag`：∂v/∂v + ∂v/∂wind_ne + ∂p/∂v + ∂p/∂wind_ne 修正/新块；2 个有限差分 proptest；EKF 现在**能从测量学 wind**。 |
 | [0040](./0040-wind-identification-sitl.md) | 2026-04-21 | M4.1 端到端 wind 识别 SITL | `52421fe` | 开环 SITL 注入 (+2, -1) 风，15 s 后 EKF wind_ne 方向正确（cos > 0.5）；闭环下 controller FF 干扰识别 → 开环隔离；默认仍 opt-in 避免回归 PI。 |
 | [0041](./0041-gps-fault-injection.md) | 2026-04-21 | M5.0 GPS 故障注入 + FDIR 端到端 | `c53099e` | `GpsFault::{None, Offset, Stuck}` 故障模式；SITL 注入 500m 偏移 4 s → gps_health ≥ Degraded；vehicle 靠 baro+mag 存活。**FDIR 全链路首次系统级验证**。 |
+| [0042](./0042-mavlink-basic-encoding.md) | 2026-04-21 | M5.1 MAVLink 基础编码 | `fbcbbe5` | `mavlink` v0.14 接入 workspace；`encode_heartbeat / encode_attitude / encode_global_position_int`；no_std；clamp_f32_to_i* 防 panic；5 测试。 |
 
 ## 写新文档时遵守的模板
 
