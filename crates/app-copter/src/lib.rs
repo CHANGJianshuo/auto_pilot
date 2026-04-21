@@ -20,7 +20,7 @@
 //! ```
 
 use algo_ekf::{
-    baro_update, gps_update, mag_update, predict_step, BaroMeasurement, Covariance,
+    baro_update, gps_update, mag_update, predict_step_with_drag, BaroMeasurement, Covariance,
     GpsMeasurement, ImuMeasurement, MagMeasurement, ProcessNoise, State,
 };
 use algo_fdir::{HealthLevel, SensorRejectionCounter};
@@ -60,6 +60,10 @@ pub struct RateLoopConfig {
     /// is added to the commanded acceleration. Roughly `k_drag / mass`
     /// for the airframe — set to zero to disable wind FF.
     pub wind_ff_gain: f32,
+    /// Drag-over-mass (s⁻¹) fed into the EKF predict step so the filter's
+    /// own velocity propagation accounts for aerodynamic drag. Same
+    /// physical parameter as `wind_ff_gain`; typically they're equal.
+    pub drag_over_mass_hz: f32,
 }
 
 /// Dynamic flight state held across iterations.
@@ -129,12 +133,13 @@ pub fn rate_loop_step(
         gyro_rad_s: imu.gyro_rad_s,
         accel_m_s2: imu.accel_m_s2,
     };
-    let (next_state, next_cov) = predict_step(
+    let (next_state, next_cov) = predict_step_with_drag(
         &flight.state,
         &flight.covariance,
         measurement,
         cfg.process_noise,
         dt_s,
+        cfg.drag_over_mass_hz,
     );
     flight.state = next_state;
     flight.covariance = next_cov;
@@ -200,6 +205,11 @@ pub fn default_config_250g() -> RateLoopConfig {
         // k_drag ≈ 0.05 N·s/m, mass 0.25 kg → ~0.2 s⁻¹ scales wind (m/s) to
         // the drag-canceling accel (m/s²). Set 0 to disable.
         wind_ff_gain: 0.2,
+        // EKF-side drag is opt-in: without the matching ∂v/∂wind_ne
+        // Jacobian block (queued for M4), a non-zero value here shifts
+        // the PI integrator tuning. Leave off until wind observability
+        // is real; app callers can set it explicitly for tests.
+        drag_over_mass_hz: 0.0,
     }
 }
 
@@ -414,6 +424,49 @@ mod tests {
         assert!((flight.state.attitude.norm() - 1.0).abs() < 1.0e-4);
         assert!(flight.state.position_ned.norm() < 0.05);
         assert!(flight.state.velocity_ned.norm() < 0.1);
+    }
+
+    #[test]
+    fn rate_loop_drag_influences_predicted_velocity_when_wind_set() {
+        // With a known wind in state.wind_ne and drag enabled, predict
+        // should push the estimated velocity along the wind direction,
+        // even with level-hover IMU reads.
+        let mut cfg_on = default_config_250g();
+        cfg_on.drag_over_mass_hz = 0.4;
+        let mut cfg_off = default_config_250g();
+        cfg_off.drag_over_mass_hz = 0.0;
+
+        let make_state = || {
+            let mut f = FlightState::default();
+            f.state.wind_ne = nalgebra::Vector2::new(2.0, 0.0); // +x wind 2 m/s
+            f
+        };
+        let mut flight_on = make_state();
+        let mut flight_off = make_state();
+
+        for i in 0..100u64 {
+            let imu = stationary_imu(i);
+            let _ = rate_loop_step(
+                &mut cfg_on,
+                &mut flight_on,
+                imu,
+                0.001,
+                algo_indi::RateCommand::default(),
+            );
+            let _ = rate_loop_step(
+                &mut cfg_off,
+                &mut flight_off,
+                imu,
+                0.001,
+                algo_indi::RateCommand::default(),
+            );
+        }
+        // Drag-on branch should have accumulated some +x velocity; drag-off
+        // branch should have (near) zero (gravity only).
+        let vx_on = flight_on.state.velocity_ned.x;
+        let vx_off = flight_off.state.velocity_ned.x;
+        assert!(vx_on > vx_off + 0.01,
+            "drag FF inactive: vx_on={vx_on} vx_off={vx_off}");
     }
 
     #[test]
