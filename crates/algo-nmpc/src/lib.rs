@@ -25,15 +25,24 @@ pub struct Setpoint {
     pub yaw_rad: f32,
 }
 
-/// Cascade-P gains.
+/// Cascade-PI gains.
+///
+/// `k_i_vel` enables an integral term on the velocity-error loop to cancel
+/// steady-state bias introduced by drag, motor lag, and wind. Default is
+/// zero (pure P-P behaviour) so pre-M3.2 callers get unchanged output.
 #[derive(Clone, Copy, Debug)]
 pub struct PositionGains {
     pub k_pos: Vector3<f32>,
     pub k_vel: Vector3<f32>,
+    pub k_i_vel: Vector3<f32>,
     /// Saturation on the commanded NED acceleration magnitude (m/s²). Keeps
     /// aggressive setpoints from producing tilt commands that exceed the
     /// feasible thrust envelope.
     pub max_accel: f32,
+    /// Per-axis cap on the velocity integrator magnitude (m/s² equivalent,
+    /// because the integrator output is added to accel_cmd). Prevents
+    /// integrator wind-up during long saturation events.
+    pub max_integrator: f32,
 }
 
 impl Default for PositionGains {
@@ -41,7 +50,9 @@ impl Default for PositionGains {
         Self {
             k_pos: Vector3::new(1.0, 1.0, 2.0),
             k_vel: Vector3::new(3.0, 3.0, 5.0),
+            k_i_vel: Vector3::zeros(),
             max_accel: 8.0,
+            max_integrator: 5.0,
         }
     }
 }
@@ -55,11 +66,9 @@ pub struct AttitudeAndThrust {
     pub thrust_n: f32,
 }
 
-/// Baseline cascade controller.
-///
-/// Returns `(q_desired, thrust_n)` so the attitude loop can take over.
-/// Never panics — when the thrust vector or heading is degenerate it
-/// falls back to level attitude pointing north with zero thrust.
+/// Pure-P baseline (no integrator). Kept for callers who don't want to
+/// carry integrator state. See [`position_to_attitude_thrust_pi`] for
+/// the PI-enabled version used in closed-loop SITL with drag/wind.
 #[must_use]
 pub fn position_to_attitude_thrust(
     setpoint: &Setpoint,
@@ -68,21 +77,67 @@ pub fn position_to_attitude_thrust(
     mass_kg: f32,
     gains: &PositionGains,
 ) -> AttitudeAndThrust {
-    // 1. P–P cascade to get commanded acceleration.
+    let (att, _) = position_to_attitude_thrust_pi(
+        setpoint,
+        current_position,
+        current_velocity,
+        mass_kg,
+        gains,
+        Vector3::zeros(),
+        0.0,
+    );
+    att
+}
+
+/// Cascade PI controller: same math as the baseline plus a bounded
+/// integrator on the velocity error.
+///
+/// Returns `(AttitudeAndThrust, new_integrator_vel)`. The integrator is
+/// the caller's responsibility to carry between steps — we stay pure so
+/// unit tests and Kani remain straightforward.
+///
+/// Anti-windup: the integrator only accumulates when the commanded
+/// acceleration is not saturated against `max_accel`. This is the
+/// "conditional integration" scheme, the cheapest correct one.
+#[must_use]
+pub fn position_to_attitude_thrust_pi(
+    setpoint: &Setpoint,
+    current_position: Vector3<f32>,
+    current_velocity: Vector3<f32>,
+    mass_kg: f32,
+    gains: &PositionGains,
+    integrator_vel: Vector3<f32>,
+    dt_s: f32,
+) -> (AttitudeAndThrust, Vector3<f32>) {
+    // 1. P-PI cascade. P on position error produces velocity command;
+    //    PI on velocity error produces acceleration command.
     let pos_err = setpoint.position_ned - current_position;
     let vel_cmd = gains.k_pos.component_mul(&pos_err) + setpoint.velocity_ned;
     let vel_err = vel_cmd - current_velocity;
-    let accel_cmd = gains.k_vel.component_mul(&vel_err) + setpoint.accel_ned;
+    let accel_raw = gains.k_vel.component_mul(&vel_err) + integrator_vel + setpoint.accel_ned;
 
     // 2. Saturate acceleration magnitude.
-    let accel_mag = accel_cmd.norm();
-    let accel_cmd = if accel_mag.is_finite() && accel_mag > gains.max_accel {
-        accel_cmd * (gains.max_accel / accel_mag)
+    let accel_mag = accel_raw.norm();
+    let saturated = accel_mag.is_finite() && accel_mag > gains.max_accel;
+    let accel_cmd = if saturated {
+        accel_raw * (gains.max_accel / accel_mag)
     } else {
-        accel_cmd
+        accel_raw
     };
 
-    // 3. Force balance: the vehicle must generate thrust `F = m·(a - g)`.
+    // 3. Integrator update with conditional integration (anti-windup):
+    //    only accumulate when we're not saturated in the direction of the
+    //    error (cheapest practical anti-windup scheme).
+    let mut new_integrator = integrator_vel;
+    if !saturated && dt_s > 0.0 && dt_s.is_finite() {
+        new_integrator += gains.k_i_vel.component_mul(&vel_err) * dt_s;
+        // Per-axis clamp.
+        new_integrator.x = new_integrator.x.clamp(-gains.max_integrator, gains.max_integrator);
+        new_integrator.y = new_integrator.y.clamp(-gains.max_integrator, gains.max_integrator);
+        new_integrator.z = new_integrator.z.clamp(-gains.max_integrator, gains.max_integrator);
+    }
+
+    // 4. Force balance: the vehicle must generate thrust `F = m·(a - g)`.
     //    Thrust acts in the -body_z direction, so desired body_z direction
     //    is −F̂.
     let g_vec = Vector3::new(0.0, 0.0, GRAVITY_M_S2);
@@ -95,7 +150,7 @@ pub fn position_to_attitude_thrust(
         Vector3::new(0.0, 0.0, -1.0)
     };
 
-    // 4. Project desired heading onto body xy-plane.
+    // 5. Project desired heading onto body xy-plane.
     let cy = libm::cosf(setpoint.yaw_rad);
     let sy = libm::sinf(setpoint.yaw_rad);
     let heading = Vector3::new(cy, sy, 0.0);
@@ -109,15 +164,18 @@ pub fn position_to_attitude_thrust(
     };
     let yb_des = zb_des.cross(&xb_des);
 
-    // 5. Assemble rotation matrix (columns are body axes in world NED),
+    // 6. Assemble rotation matrix (columns are body axes in world NED),
     //    convert to quaternion.
     let r_des = Matrix3::from_columns(&[xb_des, yb_des, zb_des]);
     let q_des = UnitQuaternion::from_matrix(&r_des).into_inner();
 
-    AttitudeAndThrust {
-        q_desired: q_des,
-        thrust_n: thrust_mag,
-    }
+    (
+        AttitudeAndThrust {
+            q_desired: q_des,
+            thrust_n: thrust_mag,
+        },
+        new_integrator,
+    )
 }
 
 #[cfg(test)]
@@ -247,6 +305,67 @@ mod tests {
         let n = out.q_desired.norm();
         assert!((n - 1.0).abs() < 1.0e-4, "‖q‖ = {n}");
         let _ = prop::collection::vec(0..1, 0..1); // silence proptest-unused warn
+    }
+
+    #[test]
+    fn pi_integrator_accumulates_against_bias() {
+        // With a constant velocity error (e.g. permanent wind),
+        // the integrator should grow in the direction that cancels it.
+        let gains = PositionGains {
+            k_i_vel: Vector3::new(0.5, 0.5, 0.5),
+            ..PositionGains::default()
+        };
+        let sp = Setpoint::default();
+        let pos = Vector3::zeros();
+        let vel_bias = Vector3::new(0.2, 0.0, 0.0); // vehicle drifting +x
+        let mut integ = Vector3::zeros();
+        let dt = 0.01;
+        for _ in 0..100 {
+            let (_att, new_integ) = position_to_attitude_thrust_pi(
+                &sp,
+                pos,
+                vel_bias,
+                default_mass(),
+                &gains,
+                integ,
+                dt,
+            );
+            integ = new_integ;
+        }
+        // vel_err = -0.2 (since vel_cmd = 0 − 0.2 bias = −0.2). integrator
+        // accumulates k_i · vel_err · total_dt = 0.5 · (-0.2) · 1.0 = -0.1,
+        // bounded by max_integrator = 5.
+        assert!(integ.x < 0.0, "integ.x = {}", integ.x);
+        assert!(integ.x > -gains.max_integrator);
+    }
+
+    #[test]
+    fn pi_integrator_stays_bounded_under_saturation() {
+        // Far setpoint → saturated → integrator should not accumulate.
+        let gains = PositionGains {
+            k_i_vel: Vector3::new(1.0, 1.0, 1.0),
+            max_accel: 3.0, // tight cap to trigger saturation
+            ..PositionGains::default()
+        };
+        let sp = Setpoint {
+            position_ned: Vector3::new(100.0, 0.0, 0.0),
+            ..Setpoint::default()
+        };
+        let mut integ = Vector3::zeros();
+        for _ in 0..1000 {
+            let (_, new_integ) = position_to_attitude_thrust_pi(
+                &sp,
+                Vector3::zeros(),
+                Vector3::zeros(),
+                default_mass(),
+                &gains,
+                integ,
+                0.01,
+            );
+            integ = new_integ;
+        }
+        // Anti-windup: integrator stays near zero despite huge pos error.
+        assert!(integ.norm() < 0.1, "integrator ran away: {integ}");
     }
 
     use proptest::prelude::*;

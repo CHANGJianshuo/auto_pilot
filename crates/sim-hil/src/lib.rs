@@ -441,20 +441,19 @@ mod tests {
     #[test]
     fn closed_loop_sitl_with_realistic_noise_and_dynamics() {
         // Real-world conditions: sensor noise + motor lag + linear drag.
-        // Assertion is "doesn't diverge" — the P-P cascade has a known
-        // steady-state bias under drag + lag + noise; integral terms
-        // (M3.3) tighten this.
+        // M3.2 added the integral term on the velocity loop; steady-state
+        // bias under drag/lag is driven to ~cm level over a few seconds.
         let mut sim_cfg = SimConfig::realistic_dynamics(Vector3::zeros());
         sim_cfg.noise = NoiseConfig::realistic();
-        let sim_state = run_closed_loop_flight(&sim_cfg, 42, 5000); // 5 s
+        let sim_state = run_closed_loop_flight(&sim_cfg, 42, 8000); // 8 s
         let altitude_err = (-sim_state.position_ned.z - 1.0).abs();
-        assert!(altitude_err < 3.0, "altitude err = {altitude_err} m (diverged)");
-        assert!(sim_state.position_ned.xy().norm() < 3.0,
-            "horiz = {} m (diverged)", sim_state.position_ned.xy().norm());
+        // Integral action: tight tolerance even under full realism.
+        assert!(altitude_err < 0.6, "altitude err = {altitude_err} m");
+        assert!(sim_state.position_ned.xy().norm() < 1.0,
+            "horiz = {} m", sim_state.position_ned.xy().norm());
         assert!((sim_state.attitude.norm() - 1.0).abs() < 1.0e-3);
-        // Velocity should not be growing unboundedly.
-        assert!(sim_state.velocity_ned.norm() < 5.0,
-            "velocity = {} m/s (diverged)", sim_state.velocity_ned.norm());
+        assert!(sim_state.velocity_ned.norm() < 1.0,
+            "velocity = {} m/s (not settled)", sim_state.velocity_ned.norm());
     }
 
     #[test]

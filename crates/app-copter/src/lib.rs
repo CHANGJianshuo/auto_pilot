@@ -28,7 +28,7 @@ use algo_indi::{
     attitude_to_rate, compute_torque_increment, AttitudeGain, IndiInput, Inertia,
     LowPassFilterVec3, RateCommand, RateGain,
 };
-use algo_nmpc::{position_to_attitude_thrust, PositionGains, Setpoint};
+use algo_nmpc::{position_to_attitude_thrust_pi, PositionGains, Setpoint};
 use core_hal::traits::ImuSample;
 use nalgebra::{Matrix4, SVector, Vector3};
 
@@ -68,6 +68,9 @@ pub struct FlightState {
     pub gps_health: SensorRejectionCounter,
     pub mag_health: SensorRejectionCounter,
     pub baro_health: SensorRejectionCounter,
+    /// Velocity-loop integrator (anti-windup-bounded). Advanced by
+    /// [`outer_step`] each call.
+    pub vel_integrator: Vector3<f32>,
 }
 
 impl Default for FlightState {
@@ -79,6 +82,7 @@ impl Default for FlightState {
             gps_health: SensorRejectionCounter::new(),
             mag_health: SensorRejectionCounter::new(),
             baro_health: SensorRejectionCounter::new(),
+            vel_integrator: Vector3::zeros(),
         }
     }
 }
@@ -185,7 +189,10 @@ pub fn default_config_250g() -> RateLoopConfig {
         motor_min_n: 0.0,
         motor_max_n: 6.0,
         hover_thrust_n: 2.45, // m=0.25 kg × g=9.8 m/s²
-        position_gains: PositionGains::default(),
+        position_gains: PositionGains {
+            k_i_vel: Vector3::new(0.5, 0.5, 0.8),
+            ..PositionGains::default()
+        },
     }
 }
 
@@ -243,14 +250,18 @@ pub fn outer_step(
     dt_s: f32,
     setpoint: &Setpoint,
 ) -> RateLoopOutput {
-    // Outer loop: position → (q_desired, thrust).
-    let att = position_to_attitude_thrust(
+    // Outer loop: position → (q_desired, thrust). PI cascade, so we
+    // carry the integrator forward through flight.vel_integrator.
+    let (att, new_integ) = position_to_attitude_thrust_pi(
         setpoint,
         flight.state.position_ned,
         flight.state.velocity_ned,
         cfg.mass_kg,
         &cfg.position_gains,
+        flight.vel_integrator,
+        dt_s,
     );
+    flight.vel_integrator = new_integ;
 
     // Inner (middle): q_desired → rate command.
     let rate_cmd = attitude_to_rate(flight.state.attitude, att.q_desired, &cfg.k_attitude);
