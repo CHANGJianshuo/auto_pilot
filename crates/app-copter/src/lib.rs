@@ -19,7 +19,11 @@
 //!       └─► control allocation     (M2.1: allocate → motor thrusts)
 //! ```
 
-use algo_ekf::{predict_step, Covariance, ImuMeasurement, ProcessNoise, State};
+use algo_ekf::{
+    baro_update, gps_update, mag_update, predict_step, BaroMeasurement, Covariance,
+    GpsMeasurement, ImuMeasurement, MagMeasurement, ProcessNoise, State,
+};
+use algo_fdir::{HealthLevel, SensorRejectionCounter};
 use algo_indi::{
     attitude_to_rate, compute_torque_increment, AttitudeGain, IndiInput, Inertia,
     LowPassFilterVec3, RateCommand, RateGain,
@@ -60,6 +64,10 @@ pub struct FlightState {
     pub state: State,
     pub covariance: Covariance,
     pub last_gyro_filtered: Vector3<f32>,
+    /// Per-sensor rejection counters; `apply_*_measurement` updates them.
+    pub gps_health: SensorRejectionCounter,
+    pub mag_health: SensorRejectionCounter,
+    pub baro_health: SensorRejectionCounter,
 }
 
 impl Default for FlightState {
@@ -68,7 +76,21 @@ impl Default for FlightState {
             state: State::default(),
             covariance: algo_ekf::initial_covariance(),
             last_gyro_filtered: Vector3::zeros(),
+            gps_health: SensorRejectionCounter::new(),
+            mag_health: SensorRejectionCounter::new(),
+            baro_health: SensorRejectionCounter::new(),
         }
+    }
+}
+
+impl FlightState {
+    /// Roll-up of every sensor stream's health level (worst wins).
+    #[must_use]
+    pub fn overall_health(&self) -> HealthLevel {
+        [self.gps_health.level(), self.mag_health.level(), self.baro_health.level()]
+            .into_iter()
+            .max_by_key(|l| l.severity())
+            .unwrap_or(HealthLevel::Healthy)
     }
 }
 
@@ -167,6 +189,44 @@ pub fn default_config_250g() -> RateLoopConfig {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Measurement-update hooks
+// ----------------------------------------------------------------------------
+
+/// Fold a GPS observation into the filter and update the GPS health
+/// counter. Returns the computed NIS so the caller can log it.
+pub fn apply_gps_measurement(flight: &mut FlightState, measurement: &GpsMeasurement) -> f32 {
+    let r = gps_update(&flight.state, &flight.covariance, measurement);
+    if r.applied {
+        flight.state = r.state;
+        flight.covariance = r.covariance;
+    }
+    flight.gps_health.observe(r.applied);
+    r.nis
+}
+
+/// Fold a magnetometer observation into the filter.
+pub fn apply_mag_measurement(flight: &mut FlightState, measurement: &MagMeasurement) -> f32 {
+    let r = mag_update(&flight.state, &flight.covariance, measurement);
+    if r.applied {
+        flight.state = r.state;
+        flight.covariance = r.covariance;
+    }
+    flight.mag_health.observe(r.applied);
+    r.nis
+}
+
+/// Fold a barometer observation into the filter.
+pub fn apply_baro_measurement(flight: &mut FlightState, measurement: &BaroMeasurement) -> f32 {
+    let r = baro_update(&flight.state, &flight.covariance, measurement);
+    if r.applied {
+        flight.state = r.state;
+        flight.covariance = r.covariance;
+    }
+    flight.baro_health.observe(r.applied);
+    r.nis
+}
+
 /// Outer-to-inner single-step control.
 ///
 /// Runs `position_to_attitude_thrust` → `attitude_to_rate` →
@@ -255,6 +315,58 @@ mod tests {
             let v = flight.covariance.fixed_view::<1, 1>(i, i).to_scalar();
             assert!(v > 0.0 && v.is_finite(), "P[{i},{i}]={v}");
         }
+    }
+
+    #[test]
+    fn gps_measurement_pulls_state_and_updates_health() {
+        let mut flight = FlightState::default();
+        assert_eq!(flight.overall_health(), HealthLevel::Healthy);
+        let m = algo_ekf::GpsMeasurement {
+            position_ned: Vector3::new(1.0, -0.5, 0.3),
+            sigma: Vector3::new(0.3, 0.3, 0.4),
+        };
+        let nis = apply_gps_measurement(&mut flight, &m);
+        assert!(nis.is_finite());
+        // Position must have moved toward measurement.
+        assert!(flight.state.position_ned.norm() > 0.0);
+        // A first accepted measurement keeps health Healthy.
+        assert_eq!(flight.gps_health.level(), HealthLevel::Healthy);
+    }
+
+    #[test]
+    fn repeated_gps_outliers_degrade_health() {
+        let mut flight = FlightState::default();
+        let bad = algo_ekf::GpsMeasurement {
+            position_ned: Vector3::new(10_000.0, 0.0, 0.0),
+            sigma: Vector3::new(0.5, 0.5, 0.5),
+        };
+        for _ in 0..15 {
+            let _ = apply_gps_measurement(&mut flight, &bad);
+        }
+        assert_ne!(flight.gps_health.level(), HealthLevel::Healthy);
+        assert_eq!(flight.overall_health(), flight.gps_health.level());
+    }
+
+    #[test]
+    fn baro_measurement_updates_health_and_altitude() {
+        let mut flight = FlightState::default();
+        let m = algo_ekf::BaroMeasurement { altitude_m: 2.0, sigma_m: 0.1 };
+        let _ = apply_baro_measurement(&mut flight, &m);
+        // position_ned.z is negative-Down, altitude is -z.
+        let altitude = -flight.state.position_ned.z;
+        assert!(altitude > 0.0, "altitude did not climb: {altitude}");
+    }
+
+    #[test]
+    fn mag_measurement_does_not_corrupt_attitude_at_alignment() {
+        let mut flight = FlightState::default();
+        // Body-frame reading = world mag_ned when q = identity.
+        let m = algo_ekf::MagMeasurement {
+            body_field: flight.state.mag_ned,
+            sigma: Vector3::new(0.01, 0.01, 0.01),
+        };
+        let _ = apply_mag_measurement(&mut flight, &m);
+        assert!((flight.state.attitude.norm() - 1.0).abs() < 1.0e-4);
     }
 
     #[test]
