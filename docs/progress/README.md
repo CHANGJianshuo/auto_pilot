@@ -42,6 +42,7 @@
 | [0036](./0036-wind-feedforward.md) | 2026-04-21 | M3.3 风扰前馈 | `9eeaaa9` | `outer_step` 用 EKF.wind_ne 做 accel FF；`wind_ff_gain = k_drag/mass`；I 项处理慢变，FF 处理已知风；未来加 EKF 风观测时零改动。 |
 | [0037](./0037-drag-aware-predict.md) | 2026-04-21 | M3.4 drag-aware predict | `a39e2ad` | `State::predict_with_drag` + `predict_step_with_drag`；outer loop 的 wind FF (M3.3) 现在有了估计器配对 —— predict 出的速度会反映风拖动。Jacobian 更新（wind observability）queue 到 M4。 |
 | [0038](./0038-app-drag-wiring.md) | 2026-04-21 | M3.5 app 接 drag predict（opt-in）| `51708f9` | `RateLoopConfig::drag_over_mass_hz` 默认 0；`rate_loop_step` 调 `predict_step_with_drag`；机械件就位，M4 加 Jacobian 后再默认开启。 |
+| [0039](./0039-wind-observable-jacobian.md) | 2026-04-21 | M4.0 风可观测 F Jacobian | `b875322` | `build_transition_jacobian_with_drag`：∂v/∂v + ∂v/∂wind_ne + ∂p/∂v + ∂p/∂wind_ne 修正/新块；2 个有限差分 proptest；EKF 现在**能从测量学 wind**。 |
 
 ## 写新文档时遵守的模板
 
