@@ -49,6 +49,7 @@
 | [0043](./0043-mavlink-udp-transport.md) | 2026-04-21 | M5.2 MAVLink UDP 传输 | `4acaba7` | `MavlinkUdpSink` tokio `UdpSocket` 封装；AtomicU8 序号；2 集成测试（bind+send 和 seq 递增）；QGC 可直接监听 14550。 |
 | [0044](./0044-sitl-mavlink-demo.md) | 2026-04-21 | M5.3 `sitl_mavlink` demo | `849c9f3` | `cargo run -p sim-hil --example sitl_mavlink` 一键启动实时 SITL + MAVLink telemetry；spawn_blocking sim + tokio fan-out + wall-clock pacing；HEARTBEAT/ATTITUDE/GLOBAL_POSITION_INT 分速率。 |
 | [0045](./0045-mavlink-parse.md) | 2026-04-21 | M5.4 MAVLink 解析器 | `fcb2b09` | `parse_frame(&[u8]) -> (MavHeader, MavMessage)`；&[u8] 直接实现 embedded_io::Read 保持 no_std；4 round-trip/边界/CRC-corruption 测试。 |
+| [0046](./0046-mavlink-bidirectional.md) | 2026-04-21 | M5.5 MAVLink 双向 + setpoint | `7570dcb` | `try_recv()` + `setpoint_from_mav_message`；demo `Arc<Mutex<Setpoint>>` 共享，QGC "Go To Location" 能真驱动 SITL 飞过去；4 新测试。 |
 
 ## 写新文档时遵守的模板
 
