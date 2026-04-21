@@ -52,6 +52,7 @@
 | [0046](./0046-mavlink-bidirectional.md) | 2026-04-21 | M5.5 MAVLink 双向 + setpoint | `7570dcb` | `try_recv()` + `setpoint_from_mav_message`；demo `Arc<Mutex<Setpoint>>` 共享，QGC "Go To Location" 能真驱动 SITL 飞过去；4 新测试。 |
 | [0047](./0047-arm-disarm.md) | 2026-04-21 | M5.6 ARM/DISARM via MAVLink | `498ba23` | `ArmState { Disarmed(Default), Armed }` + `rate_loop_step` 末尾硬性短路；`arm_change_from_mav_message` 解 COMMAND_LONG(400)；demo `Arc<Mutex<ArmState>>` 共享；5 新测试，183 单元测试全绿。 |
 | [0048](./0048-land-autodisarm.md) | 2026-04-21 | M5.7 LAND + 触地 auto-disarm | `4191611` | `LandingState { Idle(Default), Landing }` + `TouchdownDetector`（三条件 AND + 1s 持续）；Landing 态 outer_step 覆盖 setpoint 原地下降 0.5 m/s 并在触地时自动 disarm；`land_request_from_mav_message` 解 COMMAND_LONG(21)；demo 双向同步；5 新测试，188 单元测试全绿。 |
+| [0049](./0049-command-ack.md) | 2026-04-21 | M5.8 COMMAND_ACK | `a7e24c6` | `encode_command_ack` + `send_command_ack`；demo 对每个 COMMAND_LONG 回 ACCEPTED/UNSUPPORTED，消除 QGC 按钮 spinner；round-trip 测试验证 encode/parse 双向兼容。 |
 
 ## 写新文档时遵守的模板
 
