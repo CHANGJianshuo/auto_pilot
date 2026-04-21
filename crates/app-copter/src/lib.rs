@@ -56,6 +56,10 @@ pub struct RateLoopConfig {
     pub hover_thrust_n: f32,
     /// Outer-loop gains (position / velocity).
     pub position_gains: PositionGains,
+    /// Feed-forward gain applied to the EKF's estimated wind before it
+    /// is added to the commanded acceleration. Roughly `k_drag / mass`
+    /// for the airframe — set to zero to disable wind FF.
+    pub wind_ff_gain: f32,
 }
 
 /// Dynamic flight state held across iterations.
@@ -193,6 +197,9 @@ pub fn default_config_250g() -> RateLoopConfig {
             k_i_vel: Vector3::new(0.5, 0.5, 0.8),
             ..PositionGains::default()
         },
+        // k_drag ≈ 0.05 N·s/m, mass 0.25 kg → ~0.2 s⁻¹ scales wind (m/s) to
+        // the drag-canceling accel (m/s²). Set 0 to disable.
+        wind_ff_gain: 0.2,
     }
 }
 
@@ -250,10 +257,23 @@ pub fn outer_step(
     dt_s: f32,
     setpoint: &Setpoint,
 ) -> RateLoopOutput {
+    // Wind feed-forward: add k·wind_estimate to the setpoint's accel
+    // feedforward channel. Zero-latency disturbance compensation that
+    // complements the velocity-loop integrator.
+    let wind_ff = Vector3::new(
+        flight.state.wind_ne.x * cfg.wind_ff_gain,
+        flight.state.wind_ne.y * cfg.wind_ff_gain,
+        0.0,
+    );
+    let adjusted_setpoint = Setpoint {
+        accel_ned: setpoint.accel_ned + wind_ff,
+        ..*setpoint
+    };
+
     // Outer loop: position → (q_desired, thrust). PI cascade, so we
     // carry the integrator forward through flight.vel_integrator.
     let (att, new_integ) = position_to_attitude_thrust_pi(
-        setpoint,
+        &adjusted_setpoint,
         flight.state.position_ned,
         flight.state.velocity_ned,
         cfg.mass_kg,
@@ -394,6 +414,38 @@ mod tests {
         assert!((flight.state.attitude.norm() - 1.0).abs() < 1.0e-4);
         assert!(flight.state.position_ned.norm() < 0.05);
         assert!(flight.state.velocity_ned.norm() < 0.1);
+    }
+
+    #[test]
+    fn outer_step_wind_feedforward_tilts_against_wind() {
+        // With a known horizontal wind, the controller should tilt
+        // *into* the wind to cancel drag — even at zero pos/vel error.
+        let mut cfg = default_config_250g();
+        let mut flight = FlightState::default();
+        // Pretend the EKF has identified +3 m/s east wind.
+        flight.state.wind_ne = nalgebra::Vector2::new(0.0, 3.0);
+        let imu = stationary_imu(0);
+        let setpoint = Setpoint::default();
+        let out = outer_step(&mut cfg, &mut flight, imu, 0.001, &setpoint);
+
+        // Same scenario but with wind FF disabled.
+        let mut cfg_no_ff = default_config_250g();
+        cfg_no_ff.wind_ff_gain = 0.0;
+        let mut flight_no_ff = FlightState::default();
+        flight_no_ff.state.wind_ne = nalgebra::Vector2::new(0.0, 3.0);
+        let out_no = outer_step(&mut cfg_no_ff, &mut flight_no_ff, imu, 0.001, &setpoint);
+
+        // Without wind FF, controller can't feel the wind → zero east-axis
+        // torque. With wind FF, east accel is commanded, so motor thrusts
+        // differ by a measurable amount.
+        let diff: f32 = (0..4)
+            .map(|i| {
+                (out.motor_thrusts_n.fixed_view::<1, 1>(i, 0).to_scalar()
+                    - out_no.motor_thrusts_n.fixed_view::<1, 1>(i, 0).to_scalar())
+                .abs()
+            })
+            .sum();
+        assert!(diff > 1.0e-3, "wind FF had no effect on motors: diff={diff}");
     }
 
     #[test]
