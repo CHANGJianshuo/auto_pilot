@@ -457,6 +457,95 @@ mod tests {
     }
 
     #[test]
+    fn ekf_identifies_wind_with_drag_aware_predict_open_loop() {
+        // Open-loop wind identification: motors stay at hover, vehicle
+        // drifts in the wind, GPS sees the drift, EKF's wind_ne state
+        // tracks the true wind direction through the drag-aware Jacobian.
+        //
+        // Closed-loop testing is misleading here — a well-tuned
+        // controller cancels the drift so fast that wind_ne residual
+        // never grows.
+        use algo_ekf::{predict_step_with_drag, ProcessNoise};
+        use app_copter::{
+            apply_baro_measurement, apply_gps_measurement, apply_mag_measurement,
+            FlightState,
+        };
+
+        let true_wind = Vector3::new(2.0, -1.0, 0.0);
+        let sim_cfg = SimConfig::realistic_dynamics(true_wind);
+        let mut sim_state = SimState::default();
+        let mut rng = SimRng::new(1234);
+
+        let mut flight = FlightState::default();
+        // Prime with initial baro + gps so the filter knows position.
+        let _ = apply_baro_measurement(
+            &mut flight,
+            &sense_baro(&sim_cfg, &sim_state, &mut rng),
+        );
+        let _ = apply_gps_measurement(
+            &mut flight,
+            &sense_gps(&sim_cfg, &sim_state, &mut rng),
+        );
+
+        // Bump wind process noise so the filter believes wind can change
+        // fast enough to track within a few seconds.
+        let noise = ProcessNoise {
+            wind_per_s: 0.2,
+            ..ProcessNoise::default()
+        };
+        let drag = 0.2_f32;
+        // Fix motors at hover.
+        let hover_thrusts =
+            SVector::<f32, 4>::repeat(sim_cfg.mass_kg * GRAVITY_M_S2 / 4.0);
+
+        let dt = 0.001_f32;
+        for i in 0..15_000 {
+            let accel_w = accel_world(&sim_cfg, &sim_state);
+            let imu = sense_imu(&sim_cfg, &sim_state, accel_w, &mut rng);
+            // Drive the EKF directly.
+            let measurement = algo_ekf::ImuMeasurement {
+                gyro_rad_s: imu.gyro_rad_s,
+                accel_m_s2: imu.accel_m_s2,
+            };
+            let (next_state, next_cov) = predict_step_with_drag(
+                &flight.state,
+                &flight.covariance,
+                measurement,
+                noise,
+                dt,
+                drag,
+            );
+            flight.state = next_state;
+            flight.covariance = next_cov;
+            // Physics uses fixed hover thrust (open loop).
+            step(&sim_cfg, &mut sim_state, &hover_thrusts, dt);
+            if i % 100 == 0 {
+                // More frequent GPS than normal to accelerate convergence.
+                let _ = apply_gps_measurement(
+                    &mut flight,
+                    &sense_gps(&sim_cfg, &sim_state, &mut rng),
+                );
+            }
+            if i % 40 == 0 {
+                let _ = apply_mag_measurement(
+                    &mut flight,
+                    &sense_mag(&sim_cfg, &sim_state, &mut rng),
+                );
+            }
+        }
+
+        // The true wind produces sim drift that the EKF explains via
+        // wind_ne. Direction should match; magnitude may be off by a
+        // factor of the drag-model mismatch (linear-only in EKF, linear
+        // + quadratic in sim), so we assert on direction alignment.
+        let est = flight.state.wind_ne;
+        let true_ne = nalgebra::Vector2::new(true_wind.x, true_wind.y);
+        let dot = est.dot(&true_ne) / (est.norm() * true_ne.norm() + 1.0e-6);
+        assert!(est.norm() > 0.3, "wind estimate too small: {est:?}");
+        assert!(dot > 0.5, "wind direction mismatch: est={est:?} truth={true_ne:?} cos={dot}");
+    }
+
+    #[test]
     fn closed_loop_sitl_with_steady_wind() {
         // 3 m/s head-wind along +x; drag pulls vehicle back.
         let sim_cfg = SimConfig::realistic_dynamics(Vector3::new(3.0, 0.0, 0.0));

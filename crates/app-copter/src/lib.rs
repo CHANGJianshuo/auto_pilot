@@ -205,10 +205,12 @@ pub fn default_config_250g() -> RateLoopConfig {
         // k_drag ≈ 0.05 N·s/m, mass 0.25 kg → ~0.2 s⁻¹ scales wind (m/s) to
         // the drag-canceling accel (m/s²). Set 0 to disable.
         wind_ff_gain: 0.2,
-        // EKF-side drag is opt-in: without the matching ∂v/∂wind_ne
-        // Jacobian block (queued for M4), a non-zero value here shifts
-        // the PI integrator tuning. Leave off until wind observability
-        // is real; app callers can set it explicitly for tests.
+        // EKF-side drag. Matching Jacobian lives in
+        // `build_transition_jacobian_with_drag` (M4.0). Default still 0
+        // — the PI integrator (M3.2) is tuned against a drag-free EKF
+        // predict, and enabling drag by default regresses the
+        // drag-free SITL hover. End-to-end wind-identification tests
+        // set this explicitly.
         drag_over_mass_hz: 0.0,
     }
 }
