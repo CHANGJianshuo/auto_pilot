@@ -236,9 +236,30 @@ pub fn predict_step(
     noise: ProcessNoise,
     dt_s: f32,
 ) -> (State, Covariance) {
+    predict_step_with_drag(state, covariance, imu, noise, dt_s, 0.0)
+}
+
+/// Drag-aware variant of [`predict_step`]. `drag_over_mass` scales the
+/// drag term applied to the velocity prediction. Zero recovers the old
+/// behaviour.
+///
+/// Note: this does **not** yet add the `∂v/∂wind_ne` block to the
+/// transition Jacobian, so wind is not observable from measurement
+/// residuals. Wind observability (full Jacobian) is queued for a later
+/// milestone; this step exists so app code can feed externally estimated
+/// wind into the predict step today.
+#[must_use]
+pub fn predict_step_with_drag(
+    state: &State,
+    covariance: &Covariance,
+    imu: ImuMeasurement,
+    noise: ProcessNoise,
+    dt_s: f32,
+    drag_over_mass: f32,
+) -> (State, Covariance) {
     let f = build_transition_jacobian(state, &imu, dt_s);
     let q = build_process_noise(noise, dt_s);
-    let next_state = state.predict(imu, dt_s);
+    let next_state = state.predict_with_drag(imu, dt_s, drag_over_mass);
     let next_covariance = predict_covariance(covariance, &f, &q);
     (next_state, next_covariance)
 }
@@ -413,8 +434,27 @@ impl State {
     /// the returned state keeps the *previous* attitude rather than panic.
     #[must_use]
     pub fn predict(&self, imu: ImuMeasurement, dt_s: f32) -> State {
+        self.predict_with_drag(imu, dt_s, 0.0)
+    }
+
+    /// Drag-aware predict. `drag_over_mass` is `k_drag / mass` in s⁻¹.
+    /// Zero preserves the old `predict` behaviour.
+    ///
+    /// Drag is applied as `a_drag = -drag_over_mass · (v - wind)` where
+    /// `wind = (wind_ne.x, wind_ne.y, 0)` extended to 3D. Adding this to
+    /// the predicted acceleration makes the filter's velocity prediction
+    /// account for aerodynamic drag given a wind estimate — so if the
+    /// caller populates `state.wind_ne` (from an external wind sensor,
+    /// airspeed indicator, or a future predict-time wind observer),
+    /// predict will "feel" the drag on-the-fly.
+    #[must_use]
+    pub fn predict_with_drag(
+        &self,
+        imu: ImuMeasurement,
+        dt_s: f32,
+        drag_over_mass: f32,
+    ) -> State {
         if !dt_s.is_finite() || dt_s < 0.0 {
-            // Clock skew or sensor outage: don't propagate, hold state.
             return *self;
         }
 
@@ -433,13 +473,24 @@ impl State {
         {
             new_q /= libm::sqrtf(q_norm_sq);
         } else {
-            // Degeneracy guard: fall back to previous attitude.
             new_q = self.attitude;
         }
 
         // --- Translation propagation -------------------------------------
         let rot = UnitQuaternion::new_unchecked(new_q);
-        let accel_ned = rot * specific_force + Vector3::new(0.0, 0.0, GRAVITY_M_S2);
+        let thrust_gravity_accel =
+            rot * specific_force + Vector3::new(0.0, 0.0, GRAVITY_M_S2);
+
+        let drag_accel = if drag_over_mass.is_finite() && drag_over_mass > 0.0 {
+            let wind_world =
+                Vector3::new(self.wind_ne.x, self.wind_ne.y, 0.0);
+            let v_rel = self.velocity_ned - wind_world;
+            -drag_over_mass * v_rel
+        } else {
+            Vector3::zeros()
+        };
+
+        let accel_ned = thrust_gravity_accel + drag_accel;
         let new_v = self.velocity_ned + accel_ned * dt_s;
         let new_p = self.position_ned
             + self.velocity_ned * dt_s
@@ -2219,6 +2270,52 @@ mod tests {
             // Round-tripping the vector also gives the same vector.
             let v2 = s2.to_vector();
             prop_assert_eq!(v, v2);
+        }
+
+        /// Drag-aware predict: at zero wind, a moving vehicle decelerates
+        /// proportional to its velocity.
+        #[test]
+        fn predict_with_drag_decelerates_when_wind_zero(
+            drag in 0.1f32..2.0,
+            v0 in 0.5f32..5.0,
+            dt_s in 1.0e-4f32..0.05,
+        ) {
+            let state = State { velocity_ned: Vector3::new(v0, 0.0, 0.0), ..State::default() };
+            let imu = ImuMeasurement {
+                gyro_rad_s: Vector3::zeros(),
+                accel_m_s2: Vector3::new(0.0, 0.0, -GRAVITY_M_S2), // level hover
+            };
+            let next = state.predict_with_drag(imu, dt_s, drag);
+            // Vehicle slows in +x by ~ drag · v0 · dt
+            let expected = v0 * (1.0 - drag * dt_s);
+            prop_assert!((next.velocity_ned.x - expected).abs() < 1.0e-3);
+        }
+
+        /// Drag-aware predict with wind: a stationary vehicle in wind is
+        /// pushed along the wind direction.
+        #[test]
+        fn predict_with_drag_and_wind_pushes_stationary_vehicle(
+            drag in 0.1f32..2.0,
+            wx in -3.0f32..3.0,
+            wy in -3.0f32..3.0,
+            dt_s in 1.0e-4f32..0.05,
+        ) {
+            let state = State {
+                wind_ne: nalgebra::Vector2::new(wx, wy),
+                ..State::default()
+            };
+            let imu = ImuMeasurement {
+                gyro_rad_s: Vector3::zeros(),
+                accel_m_s2: Vector3::new(0.0, 0.0, -GRAVITY_M_S2),
+            };
+            let next = state.predict_with_drag(imu, dt_s, drag);
+            // Δv = drag·(wind − v)·dt = drag·wind·dt at v=0.
+            let expected_vx = drag * wx * dt_s;
+            let expected_vy = drag * wy * dt_s;
+            prop_assert!((next.velocity_ned.x - expected_vx).abs() < 1.0e-3);
+            prop_assert!((next.velocity_ned.y - expected_vy).abs() < 1.0e-3);
+            // z untouched because wind is horizontal.
+            prop_assert!(next.velocity_ned.z.abs() < 1.0e-3);
         }
 
         /// Free fall: zero specific force + zero rate → velocity grows as g·dt
