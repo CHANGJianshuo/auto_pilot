@@ -12,9 +12,13 @@
 //! sink.send_attitude(seq, t_ms, q, omega).await?;
 //! ```
 
+use algo_nmpc::Setpoint;
 use comms_mavlink::{
-    encode_attitude, encode_global_position_int, encode_heartbeat, FrameBuffer,
+    encode_attitude, encode_global_position_int, encode_heartbeat, parse_frame, FrameBuffer,
+    ParseError,
 };
+use mavlink::common::MavMessage;
+use mavlink::MavHeader;
 use nalgebra::{Quaternion, Vector3};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -24,6 +28,26 @@ use tokio::net::UdpSocket;
 /// what QGC expects for a single vehicle.
 pub const DEFAULT_SYSTEM_ID: u8 = 1;
 pub const DEFAULT_COMPONENT_ID: u8 = 1;
+
+/// Extract an `algo_nmpc::Setpoint` from a MAVLink message if it is a
+/// `SET_POSITION_TARGET_LOCAL_NED` — otherwise `None`.
+///
+/// Only position + velocity + yaw fields are honoured; the `type_mask`
+/// bitmap saying "ignore these fields" is currently assumed to be
+/// zeroed (QGC does this). Acceleration FF is taken from the message.
+#[must_use]
+pub fn setpoint_from_mav_message(msg: &MavMessage) -> Option<Setpoint> {
+    if let MavMessage::SET_POSITION_TARGET_LOCAL_NED(data) = msg {
+        Some(Setpoint {
+            position_ned: Vector3::new(data.x, data.y, data.z),
+            velocity_ned: Vector3::new(data.vx, data.vy, data.vz),
+            accel_ned: Vector3::new(data.afx, data.afy, data.afz),
+            yaw_rad: data.yaw,
+        })
+    } else {
+        None
+    }
+}
 
 /// One-way MAVLink sender that broadcasts telemetry to a fixed remote
 /// address (the GCS). Sequence numbers auto-increment.
@@ -90,6 +114,27 @@ impl MavlinkUdpSink {
         self.send_frame(&frame).await
     }
 
+    /// Non-blocking receive. Returns `Ok(None)` when no datagram is
+    /// waiting. Errors come from the socket layer; corrupt or
+    /// incomplete frames produce `Ok(None)` (we silently drop them so
+    /// the caller's poll loop keeps running).
+    pub fn try_recv(&self) -> std::io::Result<Option<(MavHeader, MavMessage, SocketAddr)>> {
+        let mut buf = [0u8; 512];
+        match self.socket.try_recv_from(&mut buf) {
+            Ok((n, src)) => {
+                let slice = buf.get(..n).unwrap_or(&[]);
+                match parse_frame(slice) {
+                    Ok((header, msg)) => Ok(Some((header, msg, src))),
+                    Err(ParseError::Incomplete | ParseError::Corrupt | ParseError::Unknown) => {
+                        Ok(None)
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Emit GLOBAL_POSITION_INT from a local NED position + geodetic origin.
     #[allow(clippy::too_many_arguments)]
     pub async fn send_global_position_int(
@@ -143,6 +188,83 @@ mod tests {
         .unwrap();
         assert!(n >= 12, "frame too small: {n}");
         assert_eq!(buf.first().copied(), Some(0xFD), "expected v2 magic");
+    }
+
+    #[tokio::test]
+    async fn try_recv_returns_none_when_empty() {
+        let sink = MavlinkUdpSink::bind("127.0.0.1:0", "127.0.0.1:14550")
+            .await
+            .unwrap();
+        let res = sink.try_recv().unwrap();
+        assert!(res.is_none());
+    }
+
+    #[tokio::test]
+    async fn try_recv_parses_heartbeat() {
+        // `sender` sends into the sink's bound port.
+        let sink = MavlinkUdpSink::bind("127.0.0.1:0", "127.0.0.1:14550")
+            .await
+            .unwrap();
+        let sink_addr = sink.socket.local_addr().unwrap();
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let frame = comms_mavlink::encode_heartbeat(3, 1, 7);
+        sender.send_to(frame.as_slice(), sink_addr).await.unwrap();
+
+        // Give tokio a moment to deliver.
+        for _ in 0..20 {
+            if let Some((header, msg, _)) = sink.try_recv().unwrap() {
+                assert_eq!(header.system_id, 3);
+                assert_eq!(header.sequence, 7);
+                assert!(matches!(msg, MavMessage::HEARTBEAT(_)));
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("did not receive the heartbeat within 100 ms");
+    }
+
+    #[test]
+    fn setpoint_from_non_target_message_is_none() {
+        use mavlink::common::HEARTBEAT_DATA;
+        let msg = MavMessage::HEARTBEAT(HEARTBEAT_DATA {
+            custom_mode: 0,
+            mavtype: mavlink::common::MavType::MAV_TYPE_QUADROTOR,
+            autopilot: mavlink::common::MavAutopilot::MAV_AUTOPILOT_GENERIC,
+            base_mode: mavlink::common::MavModeFlag::empty(),
+            system_status: mavlink::common::MavState::MAV_STATE_STANDBY,
+            mavlink_version: 3,
+        });
+        assert!(setpoint_from_mav_message(&msg).is_none());
+    }
+
+    #[test]
+    fn setpoint_from_target_message_maps_fields() {
+        use mavlink::common::{MavFrame, SET_POSITION_TARGET_LOCAL_NED_DATA, PositionTargetTypemask};
+        let msg = MavMessage::SET_POSITION_TARGET_LOCAL_NED(
+            SET_POSITION_TARGET_LOCAL_NED_DATA {
+                time_boot_ms: 0,
+                target_system: 1,
+                target_component: 1,
+                coordinate_frame: MavFrame::MAV_FRAME_LOCAL_NED,
+                type_mask: PositionTargetTypemask::empty(),
+                x: 1.0,
+                y: 2.0,
+                z: -3.0,
+                vx: 0.1,
+                vy: 0.2,
+                vz: 0.3,
+                afx: 0.0,
+                afy: 0.0,
+                afz: 0.0,
+                yaw: 1.2,
+                yaw_rate: 0.0,
+            },
+        );
+        let sp = setpoint_from_mav_message(&msg).expect("setpoint extracted");
+        assert_eq!(sp.position_ned, Vector3::new(1.0, 2.0, -3.0));
+        assert_eq!(sp.velocity_ned, Vector3::new(0.1, 0.2, 0.3));
+        assert!((sp.yaw_rad - 1.2).abs() < 1.0e-6);
     }
 
     #[tokio::test]

@@ -19,12 +19,13 @@ nalgebra = { workspace = true }
 libm = { workspace = true }
 algo-ekf = { path = "../algo-ekf" }
 algo-indi = { path = "../algo-indi" }
+algo-nmpc = { path = "../algo-nmpc" }
 core-hal = { path = "../core-hal" }
 comms-mavlink = { path = "../comms-mavlink" }
+mavlink = { workspace = true }
 
 [dev-dependencies]
 app-copter = { path = "../app-copter" }
-algo-nmpc = { path = "../algo-nmpc" }
 algo-fdir = { path = "../algo-fdir" }
 
 [[example]]

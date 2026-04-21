@@ -23,9 +23,11 @@ use app_copter::{
 };
 use nalgebra::Vector3;
 use sim_hil::{
-    accel_world, mavlink_udp::MavlinkUdpSink, sense_baro, sense_gps, sense_imu, sense_mag, step,
-    SimConfig, SimRng, SimState,
+    accel_world,
+    mavlink_udp::{setpoint_from_mav_message, MavlinkUdpSink},
+    sense_baro, sense_gps, sense_imu, sense_mag, step, SimConfig, SimRng, SimState,
 };
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -44,7 +46,15 @@ async fn main() -> anyhow::Result<()> {
     // at per-message rates.
     let (tx, mut rx) = mpsc::unbounded_channel::<Snapshot>();
 
-    let sim_task = tokio::task::spawn_blocking(move || run_sim(tx));
+    // Shared setpoint that the sim thread reads each tick. Incoming
+    // SET_POSITION_TARGET_LOCAL_NED messages overwrite it.
+    let setpoint = Arc::new(Mutex::new(Setpoint {
+        position_ned: Vector3::new(0.0, 0.0, -1.0),
+        ..Setpoint::default()
+    }));
+    let setpoint_sim = Arc::clone(&setpoint);
+
+    let sim_task = tokio::task::spawn_blocking(move || run_sim(tx, setpoint_sim));
 
     let start = Instant::now();
     let mut last_hb = Instant::now() - Duration::from_secs(1);
@@ -56,6 +66,19 @@ async fn main() -> anyhow::Result<()> {
         // Drain any incoming snapshots to keep `latest` fresh.
         while let Ok(snap) = rx.try_recv() {
             latest = Some(snap);
+        }
+        // Drain any incoming MAVLink frames. Update setpoint if GCS
+        // sent SET_POSITION_TARGET_LOCAL_NED.
+        while let Ok(Some((_hdr, msg, _src))) = sink.try_recv() {
+            if let Some(new_sp) = setpoint_from_mav_message(&msg) {
+                if let Ok(mut sp) = setpoint.lock() {
+                    *sp = new_sp;
+                    tracing::info!(
+                        target_ned = ?new_sp.position_ned,
+                        "received new setpoint from GCS"
+                    );
+                }
+            }
         }
 
         let now = Instant::now();
@@ -107,7 +130,7 @@ struct Snapshot {
     heading: f32,
 }
 
-fn run_sim(tx: mpsc::UnboundedSender<Snapshot>) {
+fn run_sim(tx: mpsc::UnboundedSender<Snapshot>, setpoint: Arc<Mutex<Setpoint>>) {
     let sim_cfg = SimConfig::realistic_dynamics(Vector3::zeros());
     let mut sim_state = SimState {
         position_ned: Vector3::new(0.0, 0.0, -1.0),
@@ -124,10 +147,6 @@ fn run_sim(tx: mpsc::UnboundedSender<Snapshot>) {
         &mut flight,
         &sense_gps(&sim_cfg, &sim_state, &mut rng),
     );
-    let setpoint = Setpoint {
-        position_ned: Vector3::new(0.0, 0.0, -1.0),
-        ..Setpoint::default()
-    };
     let dt = 0.001_f32;
     let step_duration = Duration::from_millis(1);
     let mut next_wake = Instant::now();
@@ -136,7 +155,11 @@ fn run_sim(tx: mpsc::UnboundedSender<Snapshot>) {
     loop {
         let accel_w = accel_world(&sim_cfg, &sim_state);
         let imu = sense_imu(&sim_cfg, &sim_state, accel_w, &mut rng);
-        let out = outer_step(&mut app_cfg, &mut flight, imu, dt, &setpoint);
+        let current_sp = setpoint.lock().map(|sp| *sp).unwrap_or_else(|_| Setpoint {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..Setpoint::default()
+        });
+        let out = outer_step(&mut app_cfg, &mut flight, imu, dt, &current_sp);
         step(&sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
 
         if i % 200 == 0 {
