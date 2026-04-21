@@ -257,7 +257,7 @@ pub fn predict_step_with_drag(
     dt_s: f32,
     drag_over_mass: f32,
 ) -> (State, Covariance) {
-    let f = build_transition_jacobian(state, &imu, dt_s);
+    let f = build_transition_jacobian_with_drag(state, &imu, dt_s, drag_over_mass);
     let q = build_process_noise(noise, dt_s);
     let next_state = state.predict_with_drag(imu, dt_s, drag_over_mass);
     let next_covariance = predict_covariance(covariance, &f, &q);
@@ -721,6 +721,86 @@ pub fn build_transition_jacobian(
         idx::ACCEL_BIAS_START,
     );
     dp_dba_block.copy_from(&dp_dba);
+
+    f
+}
+
+/// Drag-aware transition Jacobian. Same as [`build_transition_jacobian`] with
+/// the additional drag-related blocks written on top:
+///
+/// ```text
+///   a_drag = -drag · (v − wind_world)         wind_world = (wind.x, wind.y, 0)
+///   ⇒ ∂v_new/∂v      += -drag·dt · I₃
+///   ⇒ ∂v_new/∂wind_ne = +drag·dt · [I₂; 0]    (3×2, z-row zero)
+///   ⇒ ∂p_new/∂v      += -drag·½·dt² · I₃
+///   ⇒ ∂p_new/∂wind_ne = +drag·½·dt² · [I₂; 0] (3×2, z-row zero)
+/// ```
+///
+/// `drag_over_mass <= 0` or non-finite makes this degrade to the ordinary
+/// `build_transition_jacobian`, matching [`State::predict_with_drag`].
+#[must_use]
+pub fn build_transition_jacobian_with_drag(
+    state: &State,
+    imu: &ImuMeasurement,
+    dt_s: f32,
+    drag_over_mass: f32,
+) -> Covariance {
+    let mut f = build_transition_jacobian(state, imu, dt_s);
+
+    if !dt_s.is_finite()
+        || dt_s <= 0.0
+        || !drag_over_mass.is_finite()
+        || drag_over_mass <= 0.0
+    {
+        return f;
+    }
+
+    let dd = drag_over_mass * dt_s; // dimensionless
+    let dd_half_dt = dd * 0.5 * dt_s; // s
+
+    // ∂v/∂v correction: subtract drag·dt·I₃.
+    {
+        let mut v_v = f.fixed_view_mut::<{ idx::V_NED_LEN }, { idx::V_NED_LEN }>(
+            idx::V_NED_START,
+            idx::V_NED_START,
+        );
+        let correction = -dd * Matrix3::identity();
+        v_v += correction;
+    }
+
+    // ∂v/∂wind_ne: new 3×2 block, +drag·dt on diag (x,y rows), z row zero.
+    {
+        let mut v_w = f.fixed_view_mut::<{ idx::V_NED_LEN }, { idx::WIND_NE_LEN }>(
+            idx::V_NED_START,
+            idx::WIND_NE_START,
+        );
+        v_w.fill(0.0);
+        let mut top2 = v_w.fixed_view_mut::<2, 2>(0, 0);
+        top2.fill_with_identity();
+        top2.scale_mut(dd);
+    }
+
+    // ∂p/∂v correction: subtract drag·½·dt²·I₃ on top of the I·dt already there.
+    {
+        let mut p_v = f.fixed_view_mut::<{ idx::P_NED_LEN }, { idx::V_NED_LEN }>(
+            idx::P_NED_START,
+            idx::V_NED_START,
+        );
+        let correction = -dd_half_dt * Matrix3::identity();
+        p_v += correction;
+    }
+
+    // ∂p/∂wind_ne: new 3×2 block, +drag·½·dt² on diag.
+    {
+        let mut p_w = f.fixed_view_mut::<{ idx::P_NED_LEN }, { idx::WIND_NE_LEN }>(
+            idx::P_NED_START,
+            idx::WIND_NE_START,
+        );
+        p_w.fill(0.0);
+        let mut top2 = p_w.fixed_view_mut::<2, 2>(0, 0);
+        top2.fill_with_identity();
+        top2.scale_mut(dd_half_dt);
+    }
 
     f
 }
@@ -2270,6 +2350,78 @@ mod tests {
             // Round-tripping the vector also gives the same vector.
             let v2 = s2.to_vector();
             prop_assert_eq!(v, v2);
+        }
+
+        /// Finite-diff: ∂v/∂wind_ne block of the drag-aware F matrix
+        /// matches the numerical derivative of predict_with_drag.
+        #[test]
+        fn dv_dwind_block_matches_finite_difference(
+            drag in 0.1f32..1.0,
+            wx in -0.05f32..0.05,
+            wy in -0.05f32..0.05,
+            dt_s in 1.0e-4f32..0.02,
+        ) {
+            let state = State::default();
+            let imu = ImuMeasurement {
+                gyro_rad_s: Vector3::zeros(),
+                accel_m_s2: Vector3::new(0.0, 0.0, -GRAVITY_M_S2),
+            };
+            let dw = nalgebra::Vector2::new(wx, wy);
+
+            let v_nominal = state.predict_with_drag(imu, dt_s, drag).velocity_ned;
+            let state_plus = State { wind_ne: dw, ..state };
+            let v_perturbed = state_plus.predict_with_drag(imu, dt_s, drag).velocity_ned;
+            let dv_measured = v_perturbed - v_nominal;
+
+            let fmat = build_transition_jacobian_with_drag(&state, &imu, dt_s, drag);
+            let block = fmat
+                .fixed_view::<{ idx::V_NED_LEN }, { idx::WIND_NE_LEN }>(
+                    idx::V_NED_START, idx::WIND_NE_START,
+                )
+                .into_owned();
+            let dv_predicted = block * dw;
+
+            prop_assert!(
+                (dv_measured - dv_predicted).norm() < 1.0e-5,
+                "measured {dv_measured} predicted {dv_predicted}"
+            );
+        }
+
+        /// Finite-diff: ∂v/∂v correction matches. Perturb velocity by δv
+        /// and check the v_new change contains the −drag·dt·δv term.
+        #[test]
+        fn dv_dv_drag_correction_matches_finite_difference(
+            drag in 0.1f32..1.0,
+            v0x in -1.0f32..1.0,
+            dv in -0.05f32..0.05,
+            dt_s in 1.0e-4f32..0.02,
+        ) {
+            let state_nominal = State { velocity_ned: Vector3::new(v0x, 0.0, 0.0), ..State::default() };
+            let state_perturbed = State {
+                velocity_ned: Vector3::new(v0x + dv, 0.0, 0.0),
+                ..State::default()
+            };
+            let imu = ImuMeasurement {
+                gyro_rad_s: Vector3::zeros(),
+                accel_m_s2: Vector3::new(0.0, 0.0, -GRAVITY_M_S2),
+            };
+            let v_nominal = state_nominal.predict_with_drag(imu, dt_s, drag).velocity_ned;
+            let v_perturbed = state_perturbed.predict_with_drag(imu, dt_s, drag).velocity_ned;
+            let dv_measured = v_perturbed - v_nominal;
+
+            let fmat = build_transition_jacobian_with_drag(&state_nominal, &imu, dt_s, drag);
+            let block = fmat
+                .fixed_view::<{ idx::V_NED_LEN }, { idx::V_NED_LEN }>(
+                    idx::V_NED_START, idx::V_NED_START,
+                )
+                .into_owned();
+            let dv_input = Vector3::new(dv, 0.0, 0.0);
+            let dv_predicted = block * dv_input;
+
+            prop_assert!(
+                (dv_measured - dv_predicted).norm() < 1.0e-5,
+                "measured {dv_measured} predicted {dv_predicted}"
+            );
         }
 
         /// Drag-aware predict: at zero wind, a moving vehicle decelerates
