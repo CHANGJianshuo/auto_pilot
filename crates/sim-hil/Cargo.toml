@@ -26,3 +26,7 @@ comms-mavlink = { path = "../comms-mavlink" }
 app-copter = { path = "../app-copter" }
 algo-nmpc = { path = "../algo-nmpc" }
 algo-fdir = { path = "../algo-fdir" }
+
+[[example]]
+name = "sitl_mavlink"
+path = "examples/sitl_mavlink.rs"
