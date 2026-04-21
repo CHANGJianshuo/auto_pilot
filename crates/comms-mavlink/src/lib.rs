@@ -172,10 +172,41 @@ pub fn encode_global_position_int(
     encode(&header, &msg)
 }
 
-// TODO(M5.2): expose a streaming parser. The `mavlink` crate's parse
-// paths assume an `io::Read`; for the transport-agnostic slice API we
-// want here we need a small adapter. Keeping this commit focused on
-// *encoding* since that's what the telemetry tests drive.
+/// A parse-side error wrapping the upstream crate's reason.
+#[derive(Debug)]
+pub enum ParseError {
+    /// Not enough bytes in the buffer to read a complete frame.
+    Incomplete,
+    /// CRC mismatch or framing bytes wrong.
+    Corrupt,
+    /// Message ID not in the `common` dialect or payload malformed.
+    Unknown,
+}
+
+/// Parse one MAVLink 2 frame from the front of `bytes`.
+///
+/// Returns `Some((header, msg))` on success; `None` if the buffer is
+/// too short or the frame is malformed. Does not return how many bytes
+/// were consumed — callers that stream should use `parse_frame_at` once
+/// it lands (next step).
+///
+/// Intended entry point for UDP / UART receivers: after `recv_from`,
+/// pass the datagram payload straight in.
+///
+/// `no_std`-safe: `&[u8]` already implements the `embedded_io::Read`
+/// trait the mavlink crate needs, so there is no std / alloc fallout.
+pub fn parse_frame(
+    bytes: &[u8],
+) -> Result<(MavHeader, MavMessage), ParseError> {
+    use mavlink::peek_reader::PeekReader;
+    // `&[u8]` implements mavlink's embedded_io::Read, no cursor needed.
+    let mut reader = PeekReader::<&[u8], 280>::new(bytes);
+    match mavlink::read_v2_msg::<MavMessage, _>(&mut reader) {
+        Ok((header, msg)) => Ok((header, msg)),
+        Err(mavlink::error::MessageReadError::Io) => Err(ParseError::Incomplete),
+        Err(mavlink::error::MessageReadError::Parse(_)) => Err(ParseError::Corrupt),
+    }
+}
 
 // --- Internal conversions ---------------------------------------------------
 
@@ -282,5 +313,58 @@ mod tests {
         assert_eq!(clamp_f64_to_i32(f64::NAN), 0);
         assert_eq!(clamp_f32_to_i32(f32::INFINITY), 0);
         assert_eq!(clamp_f32_to_i16(f32::NEG_INFINITY), 0);
+    }
+
+    #[test]
+    fn heartbeat_round_trip_through_parser() {
+        let encoded = encode_heartbeat(9, 2, 17);
+        let (header, msg) = parse_frame(encoded.as_slice()).expect("parse succeeds");
+        assert_eq!(header.system_id, 9);
+        assert_eq!(header.component_id, 2);
+        assert_eq!(header.sequence, 17);
+        match msg {
+            MavMessage::HEARTBEAT(_) => (),
+            other => panic!("expected HEARTBEAT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attitude_round_trip_preserves_euler() {
+        let half = core::f32::consts::FRAC_PI_4;
+        let q = Quaternion::new(libm::cosf(half), 0.0, 0.0, libm::sinf(half));
+        let omega = Vector3::new(0.1, -0.2, 0.05);
+        let encoded = encode_attitude(1, 1, 0, 42, q, omega);
+        let (_h, msg) = parse_frame(encoded.as_slice()).expect("parse succeeds");
+        match msg {
+            MavMessage::ATTITUDE(data) => {
+                assert!((data.yaw - core::f32::consts::FRAC_PI_2).abs() < 1.0e-4);
+                assert!((data.rollspeed - 0.1).abs() < 1.0e-6);
+                assert!((data.pitchspeed - (-0.2)).abs() < 1.0e-6);
+                assert!((data.yawspeed - 0.05).abs() < 1.0e-6);
+                assert_eq!(data.time_boot_ms, 42);
+            }
+            other => panic!("expected ATTITUDE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_short_buffer() {
+        let short = [0xFD, 0x00];
+        assert!(matches!(
+            parse_frame(&short),
+            Err(ParseError::Incomplete)
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_corrupted_frame() {
+        // Emit a heartbeat, flip a CRC byte — should be rejected.
+        let mut frame = encode_heartbeat(1, 1, 0);
+        let idx = frame.len() - 1;
+        if let Some(byte) = frame.get_mut(idx) {
+            *byte ^= 0xFF;
+        }
+        let res = parse_frame(frame.as_slice());
+        assert!(res.is_err(), "expected error on CRC flip, got {res:?}");
     }
 }
