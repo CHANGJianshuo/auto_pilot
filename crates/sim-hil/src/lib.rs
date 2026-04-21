@@ -30,6 +30,8 @@ use nalgebra::{Matrix3, Quaternion, SVector, UnitQuaternion, Vector3};
 mod rng;
 pub use rng::SimRng;
 
+pub mod mavlink_udp;
+
 pub mod gazebo;
 
 /// Static simulator parameters (mass, inertia, geometry, noise).

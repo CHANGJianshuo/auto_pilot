@@ -20,6 +20,7 @@ libm = { workspace = true }
 algo-ekf = { path = "../algo-ekf" }
 algo-indi = { path = "../algo-indi" }
 core-hal = { path = "../core-hal" }
+comms-mavlink = { path = "../comms-mavlink" }
 
 [dev-dependencies]
 app-copter = { path = "../app-copter" }
