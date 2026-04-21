@@ -47,6 +47,7 @@
 | [0041](./0041-gps-fault-injection.md) | 2026-04-21 | M5.0 GPS 故障注入 + FDIR 端到端 | `c53099e` | `GpsFault::{None, Offset, Stuck}` 故障模式；SITL 注入 500m 偏移 4 s → gps_health ≥ Degraded；vehicle 靠 baro+mag 存活。**FDIR 全链路首次系统级验证**。 |
 | [0042](./0042-mavlink-basic-encoding.md) | 2026-04-21 | M5.1 MAVLink 基础编码 | `fbcbbe5` | `mavlink` v0.14 接入 workspace；`encode_heartbeat / encode_attitude / encode_global_position_int`；no_std；clamp_f32_to_i* 防 panic；5 测试。 |
 | [0043](./0043-mavlink-udp-transport.md) | 2026-04-21 | M5.2 MAVLink UDP 传输 | `4acaba7` | `MavlinkUdpSink` tokio `UdpSocket` 封装；AtomicU8 序号；2 集成测试（bind+send 和 seq 递增）；QGC 可直接监听 14550。 |
+| [0044](./0044-sitl-mavlink-demo.md) | 2026-04-21 | M5.3 `sitl_mavlink` demo | `849c9f3` | `cargo run -p sim-hil --example sitl_mavlink` 一键启动实时 SITL + MAVLink telemetry；spawn_blocking sim + tokio fan-out + wall-clock pacing；HEARTBEAT/ATTITUDE/GLOBAL_POSITION_INT 分速率。 |
 
 ## 写新文档时遵守的模板
 
