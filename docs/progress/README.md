@@ -41,6 +41,7 @@
 | [0035](./0035-pi-cascade.md) | 2026-04-21 | M3.2 PI cascade（积分项）| `0004831` | velocity-loop 加 I + conditional anti-windup + integrator clamp；realistic SITL 稳态误差 **2m → 0.6m**；向后兼容旧函数。 |
 | [0036](./0036-wind-feedforward.md) | 2026-04-21 | M3.3 风扰前馈 | `9eeaaa9` | `outer_step` 用 EKF.wind_ne 做 accel FF；`wind_ff_gain = k_drag/mass`；I 项处理慢变，FF 处理已知风；未来加 EKF 风观测时零改动。 |
 | [0037](./0037-drag-aware-predict.md) | 2026-04-21 | M3.4 drag-aware predict | `a39e2ad` | `State::predict_with_drag` + `predict_step_with_drag`；outer loop 的 wind FF (M3.3) 现在有了估计器配对 —— predict 出的速度会反映风拖动。Jacobian 更新（wind observability）queue 到 M4。 |
+| [0038](./0038-app-drag-wiring.md) | 2026-04-21 | M3.5 app 接 drag predict（opt-in）| `51708f9` | `RateLoopConfig::drag_over_mass_hz` 默认 0；`rate_loop_step` 调 `predict_step_with_drag`；机械件就位，M4 加 Jacobian 后再默认开启。 |
 
 ## 写新文档时遵守的模板
 
