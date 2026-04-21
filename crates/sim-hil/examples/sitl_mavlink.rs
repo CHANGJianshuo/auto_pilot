@@ -18,13 +18,16 @@
 use algo_ekf::GRAVITY_M_S2;
 use algo_nmpc::Setpoint;
 use app_copter::{
-    ArmState, FlightState, apply_baro_measurement, apply_gps_measurement, apply_mag_measurement,
-    default_config_250g, outer_step,
+    ArmState, FlightState, LandingState, apply_baro_measurement, apply_gps_measurement,
+    apply_mag_measurement, default_config_250g, outer_step,
 };
 use nalgebra::Vector3;
 use sim_hil::{
     SimConfig, SimRng, SimState, accel_world,
-    mavlink_udp::{MavlinkUdpSink, arm_change_from_mav_message, setpoint_from_mav_message},
+    mavlink_udp::{
+        MavlinkUdpSink, arm_change_from_mav_message, land_request_from_mav_message,
+        setpoint_from_mav_message,
+    },
     sense_baro, sense_gps, sense_imu, sense_mag, step,
 };
 use std::sync::{Arc, Mutex};
@@ -61,7 +64,14 @@ async fn main() -> anyhow::Result<()> {
     let arm_state = Arc::new(Mutex::new(ArmState::Disarmed));
     let arm_state_sim = Arc::clone(&arm_state);
 
-    let sim_task = tokio::task::spawn_blocking(move || run_sim(tx, setpoint_sim, arm_state_sim));
+    // Shared landing state. LAND command from GCS flips it to Landing;
+    // touchdown detector inside outer_step flips it back and auto-disarms.
+    let landing_state = Arc::new(Mutex::new(LandingState::Idle));
+    let landing_state_sim = Arc::clone(&landing_state);
+
+    let sim_task = tokio::task::spawn_blocking(move || {
+        run_sim(tx, setpoint_sim, arm_state_sim, landing_state_sim)
+    });
 
     let start = Instant::now();
     let mut last_hb = Instant::now() - Duration::from_secs(1);
@@ -97,6 +107,14 @@ async fn main() -> anyhow::Result<()> {
                     if *a != new {
                         *a = new;
                         tracing::info!(?new, "arm state changed by GCS");
+                    }
+                }
+            }
+            if land_request_from_mav_message(&msg) {
+                if let Ok(mut l) = landing_state.lock() {
+                    if *l != LandingState::Landing {
+                        *l = LandingState::Landing;
+                        tracing::info!("LAND command received — starting autoland");
                     }
                 }
             }
@@ -150,6 +168,7 @@ fn run_sim(
     tx: mpsc::UnboundedSender<Snapshot>,
     setpoint: Arc<Mutex<Setpoint>>,
     arm_state: Arc<Mutex<ArmState>>,
+    landing_state: Arc<Mutex<LandingState>>,
 ) {
     let sim_cfg = SimConfig::realistic_dynamics(Vector3::zeros());
     let mut sim_state = SimState {
@@ -173,8 +192,23 @@ fn run_sim(
             position_ned: Vector3::new(0.0, 0.0, -1.0),
             ..Setpoint::default()
         });
+        // Pull externally-driven state into the flight struct.
         flight.arm_state = arm_state.lock().map(|a| *a).unwrap_or(ArmState::Disarmed);
+        flight.landing_state = landing_state
+            .lock()
+            .map(|l| *l)
+            .unwrap_or(LandingState::Idle);
+
         let out = outer_step(&mut app_cfg, &mut flight, imu, dt, &current_sp);
+
+        // outer_step may auto-disarm + clear landing on touchdown — push
+        // both back so the telemetry task sees the change.
+        if let Ok(mut shared) = arm_state.lock() {
+            *shared = flight.arm_state;
+        }
+        if let Ok(mut shared) = landing_state.lock() {
+            *shared = flight.landing_state;
+        }
         step(&sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
 
         if i % 200 == 0 {

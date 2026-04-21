@@ -64,6 +64,9 @@ pub struct RateLoopConfig {
     /// own velocity propagation accounts for aerodynamic drag. Same
     /// physical parameter as `wind_ff_gain`; typically they're equal.
     pub drag_over_mass_hz: f32,
+    /// Commanded descent rate (m/s, positive = downward in NED) while
+    /// [`LandingState::Landing`] is active.
+    pub landing_descent_mps: f32,
 }
 
 /// Whether the vehicle is allowed to drive its motors.
@@ -76,6 +79,64 @@ pub enum ArmState {
     #[default]
     Disarmed,
     Armed,
+}
+
+/// Automatic-landing state machine.
+///
+/// `Idle`: vehicle follows whatever position setpoint the caller passes.
+/// `Landing`: `outer_step` overrides the setpoint to descend in place at
+/// `landing_descent_mps`, monitors [`TouchdownDetector`], and auto-disarms
+/// when touchdown is detected.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LandingState {
+    #[default]
+    Idle,
+    Landing,
+}
+
+/// Detects that the vehicle has come to rest on the ground.
+///
+/// Requires simultaneously:
+///   * `|v_z| < VZ_THRESHOLD_MPS` (not descending any more)
+///   * `‖v_xy‖ < VXY_THRESHOLD_MPS` (not sliding)
+///   * `p_z_ned > Z_THRESHOLD_M` (near the ground; NED z=0 is ground, z<0 airborne)
+///
+/// All three held continuously for `SETTLE_TIME_S` ⇒ `observe` returns
+/// `true`. Any miss resets the accumulator to zero.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TouchdownDetector {
+    settled_s: f32,
+}
+
+impl TouchdownDetector {
+    pub const VZ_THRESHOLD_MPS: f32 = 0.15;
+    pub const VXY_THRESHOLD_MPS: f32 = 0.5;
+    pub const Z_THRESHOLD_M: f32 = -0.30;
+    pub const SETTLE_TIME_S: f32 = 1.0;
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { settled_s: 0.0 }
+    }
+
+    pub fn reset(&mut self) {
+        self.settled_s = 0.0;
+    }
+
+    pub fn observe(&mut self, velocity_ned: Vector3<f32>, position_z_ned: f32, dt_s: f32) -> bool {
+        let vertical_quiet = velocity_ned.z.abs() < Self::VZ_THRESHOLD_MPS;
+        let horizontal = (velocity_ned.x * velocity_ned.x
+            + velocity_ned.y * velocity_ned.y)
+            .sqrt();
+        let horizontal_quiet = horizontal < Self::VXY_THRESHOLD_MPS;
+        let near_ground = position_z_ned > Self::Z_THRESHOLD_M;
+        if vertical_quiet && horizontal_quiet && near_ground {
+            self.settled_s += dt_s;
+        } else {
+            self.settled_s = 0.0;
+        }
+        self.settled_s >= Self::SETTLE_TIME_S
+    }
 }
 
 /// Dynamic flight state held across iterations.
@@ -94,6 +155,11 @@ pub struct FlightState {
     /// Arm state; `Disarmed` forces motor output to zero regardless of
     /// controller output.
     pub arm_state: ArmState,
+    /// Automatic-landing mode. `Landing` overrides the caller's setpoint
+    /// with a descending ramp and auto-disarms on touchdown.
+    pub landing_state: LandingState,
+    /// Touchdown detector; advanced by `outer_step` while landing.
+    pub touchdown_detector: TouchdownDetector,
 }
 
 impl Default for FlightState {
@@ -107,6 +173,8 @@ impl Default for FlightState {
             baro_health: SensorRejectionCounter::new(),
             vel_integrator: Vector3::zeros(),
             arm_state: ArmState::default(),
+            landing_state: LandingState::default(),
+            touchdown_detector: TouchdownDetector::new(),
         }
     }
 }
@@ -238,6 +306,10 @@ pub fn default_config_250g() -> RateLoopConfig {
         // drag-free SITL hover. End-to-end wind-identification tests
         // set this explicitly.
         drag_over_mass_hz: 0.0,
+        // 0.5 m/s descent while landing — conservative, gives the EKF
+        // time to notice touchdown before the controller cranks up
+        // thrust to chase the ground.
+        landing_descent_mps: 0.5,
     }
 }
 
@@ -295,6 +367,29 @@ pub fn outer_step(
     dt_s: f32,
     setpoint: &Setpoint,
 ) -> RateLoopOutput {
+    // Landing override: while `Landing`, hold current horizontal position
+    // and ramp z toward ground at `landing_descent_mps`. Everything else
+    // (wind FF, PI, allocation) stays identical.
+    let landing_sp;
+    let active_sp: &Setpoint = match flight.landing_state {
+        LandingState::Idle => setpoint,
+        LandingState::Landing => {
+            let current_z = flight.state.position_ned.z;
+            let target_z = (current_z + cfg.landing_descent_mps * dt_s).min(0.0);
+            landing_sp = Setpoint {
+                position_ned: Vector3::new(
+                    flight.state.position_ned.x,
+                    flight.state.position_ned.y,
+                    target_z,
+                ),
+                velocity_ned: Vector3::new(0.0, 0.0, cfg.landing_descent_mps),
+                accel_ned: Vector3::zeros(),
+                yaw_rad: setpoint.yaw_rad,
+            };
+            &landing_sp
+        }
+    };
+
     // Wind feed-forward: add k·wind_estimate to the setpoint's accel
     // feedforward channel. Zero-latency disturbance compensation that
     // complements the velocity-loop integrator.
@@ -304,8 +399,8 @@ pub fn outer_step(
         0.0,
     );
     let adjusted_setpoint = Setpoint {
-        accel_ned: setpoint.accel_ned + wind_ff,
-        ..*setpoint
+        accel_ned: active_sp.accel_ned + wind_ff,
+        ..*active_sp
     };
 
     // Outer loop: position → (q_desired, thrust). PI cascade, so we
@@ -329,6 +424,23 @@ pub fn outer_step(
     cfg.hover_thrust_n = att.thrust_n;
     let out = rate_loop_step(cfg, flight, imu, dt_s, rate_cmd);
     cfg.hover_thrust_n = saved_hover;
+
+    // Auto-disarm on touchdown — only while landing, so a vehicle that
+    // happens to be sitting on the ground with motors spun up for a
+    // rolling launch isn't instantly disarmed.
+    if flight.landing_state == LandingState::Landing {
+        let touchdown = flight.touchdown_detector.observe(
+            flight.state.velocity_ned,
+            flight.state.position_ned.z,
+            dt_s,
+        );
+        if touchdown {
+            flight.arm_state = ArmState::Disarmed;
+            flight.landing_state = LandingState::Idle;
+            flight.touchdown_detector.reset();
+        }
+    }
+
     out
 }
 
@@ -599,6 +711,77 @@ mod tests {
             .map(|i| out.motor_thrusts_n.fixed_view::<1, 1>(i, 0).to_scalar())
             .sum();
         assert!(total > 0.0);
+    }
+
+    #[test]
+    fn touchdown_detector_fires_after_settle_time() {
+        let mut td = TouchdownDetector::new();
+        // Below thresholds, near ground — should accumulate.
+        let v = Vector3::new(0.05, 0.05, 0.05);
+        let z = -0.1_f32;
+        let mut fired = false;
+        // 1000 × 1 ms = 1 s; SETTLE_TIME_S is 1.0 s, so it fires by then.
+        for _ in 0..1100 {
+            if td.observe(v, z, 0.001) {
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired);
+    }
+
+    #[test]
+    fn touchdown_detector_resets_on_disturbance() {
+        let mut td = TouchdownDetector::new();
+        let quiet = Vector3::new(0.05, 0.05, 0.05);
+        let airborne = Vector3::new(0.0, 0.0, 2.0); // fast descent
+        let z = -0.1_f32;
+        // Accumulate half the settle time.
+        for _ in 0..500 {
+            let _ = td.observe(quiet, z, 0.001);
+        }
+        // One sample of large velocity — should reset.
+        let _ = td.observe(airborne, z, 0.001);
+        // Another half second shouldn't fire yet.
+        for _ in 0..400 {
+            assert!(!td.observe(quiet, z, 0.001));
+        }
+    }
+
+    #[test]
+    fn touchdown_detector_does_not_fire_while_airborne() {
+        let mut td = TouchdownDetector::new();
+        let v = Vector3::new(0.01, 0.01, 0.01);
+        let z_airborne = -5.0_f32;
+        for _ in 0..5000 {
+            assert!(!td.observe(v, z_airborne, 0.001));
+        }
+    }
+
+    #[test]
+    fn landing_mode_overrides_setpoint_and_auto_disarms() {
+        let mut cfg = default_config_250g();
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            landing_state: LandingState::Landing,
+            ..FlightState::default()
+        };
+        // Vehicle already on the ground, stationary.
+        flight.state.position_ned = Vector3::new(0.0, 0.0, -0.05);
+        flight.state.velocity_ned = Vector3::zeros();
+        let imu = stationary_imu(0);
+        // Caller passes a setpoint of (0, 0, -5) — but landing override
+        // should ignore it and ramp down in place.
+        let sp = Setpoint {
+            position_ned: Vector3::new(0.0, 0.0, -5.0),
+            ..Setpoint::default()
+        };
+        // Run > SETTLE_TIME_S worth of ticks.
+        for _ in 0..1200 {
+            let _ = outer_step(&mut cfg, &mut flight, imu, 0.001, &sp);
+        }
+        assert_eq!(flight.arm_state, ArmState::Disarmed);
+        assert_eq!(flight.landing_state, LandingState::Idle);
     }
 
     #[test]

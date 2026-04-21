@@ -49,6 +49,20 @@ pub fn setpoint_from_mav_message(msg: &MavMessage) -> Option<Setpoint> {
     }
 }
 
+/// Returns `true` if `msg` is a COMMAND_LONG requesting automatic
+/// landing (`MAV_CMD_NAV_LAND`, id 21). False for everything else.
+///
+/// We ignore the lat/lon/alt parameters — callers land in place using
+/// the EKF's current horizontal estimate. Production firmware should
+/// honour the target location when it's non-NaN.
+#[must_use]
+pub fn land_request_from_mav_message(msg: &MavMessage) -> bool {
+    if let MavMessage::COMMAND_LONG(data) = msg {
+        return data.command == mavlink::common::MavCmd::MAV_CMD_NAV_LAND;
+    }
+    false
+}
+
 /// Extract an ARM/DISARM request from a MAVLink message.
 ///
 /// MAV_CMD_COMPONENT_ARM_DISARM (id 400) is carried in COMMAND_LONG with
@@ -338,6 +352,39 @@ mod tests {
         };
         assert_eq!(arm_change_from_mav_message(&make(1.0)), Some(true));
         assert_eq!(arm_change_from_mav_message(&make(0.0)), Some(false));
+    }
+
+    #[test]
+    fn land_request_matches_only_nav_land_command_long() {
+        use mavlink::common::COMMAND_LONG_DATA;
+        let land = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+            param1: 0.0,
+            param2: 0.0,
+            param3: 0.0,
+            param4: 0.0,
+            param5: 0.0,
+            param6: 0.0,
+            param7: 0.0,
+            command: mavlink::common::MavCmd::MAV_CMD_NAV_LAND,
+            target_system: 1,
+            target_component: 1,
+            confirmation: 0,
+        });
+        assert!(land_request_from_mav_message(&land));
+        let takeoff = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+            param1: 0.0,
+            param2: 0.0,
+            param3: 0.0,
+            param4: 0.0,
+            param5: 0.0,
+            param6: 0.0,
+            param7: 0.0,
+            command: mavlink::common::MavCmd::MAV_CMD_NAV_TAKEOFF,
+            target_system: 1,
+            target_component: 1,
+            confirmation: 0,
+        });
+        assert!(!land_request_from_mav_message(&takeoff));
     }
 
     #[tokio::test]
