@@ -184,6 +184,171 @@ pub fn position_to_attitude_thrust_pi(
     )
 }
 
+// ----------------------------------------------------------------------------
+// M9.0 — LQR position loop (unconstrained-MPC stepping stone)
+// ----------------------------------------------------------------------------
+//
+// Replaces the hand-tuned PI cascade with optimal linear feedback derived
+// from a cost function over the double-integrator position model. This is
+// the "infinite-horizon, no-constraint" limit of MPC — the same
+// formulation plan.md's M4 asks for, minus the QP solver and the box
+// bounds on u. Those arrive in M9.1 (inequality constraints) and M9.2
+// (finite receding horizon).
+//
+// Model (per axis, decoupled):
+//   state x = [pos; vel] (2-vec)
+//   input u = accel      (scalar)
+//   x_{k+1} = A x_k + B u_k, with
+//     A = [[1, dt], [0, 1]]
+//     B = [[0.5 dt²], [dt]]
+//
+// Cost:
+//   J = Σ (x_k^T Q x_k + u_k^T R u_k),  Q = diag(q_pos, q_vel),  R = r
+//
+// Discrete algebraic Riccati (DARE):
+//   P = A^T P A − (A^T P B)(R + B^T P B)^{-1}(B^T P A) + Q
+// Converged to a fixed point, the optimal feedback gain is:
+//   K = (R + B^T P B)^{-1} B^T P A    (1×2)
+// and the control law is:
+//   u = −K (x − x_ref)
+
+/// Per-axis cost weights for the LQR design.
+///
+/// Higher `q_pos` / `q_vel` penalises state deviation more — the
+/// controller becomes more aggressive. Higher `r` penalises acceleration
+/// use — the controller becomes softer. Ratios matter, not absolutes:
+/// scaling all three by the same factor yields the same gains.
+#[derive(Clone, Copy, Debug)]
+pub struct LqrWeights {
+    /// Position-error weight.
+    pub q_pos: f32,
+    /// Velocity-error weight.
+    pub q_vel: f32,
+    /// Control-effort weight.
+    pub r: f32,
+}
+
+impl Default for LqrWeights {
+    fn default() -> Self {
+        // Hand-tuned to roughly match the PI cascade's defaults on the
+        // 250 g test airframe at dt = 0.05 s — aggressive position
+        // tracking, modest control effort.
+        Self {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            r: 0.5,
+        }
+    }
+}
+
+/// Solved LQR feedback gains for one axis.
+///
+/// The control law is `u = -(k_p * pos_err + k_v * vel_err) = K · (x_ref − x)`
+/// where `K = [k_p, k_v]`. Both gains are positive for stable systems.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LqrAxisGains {
+    pub k_p: f32,
+    pub k_v: f32,
+}
+
+/// Iteratively solve the 2×2 DARE for a single-axis double integrator.
+///
+/// The DARE is a fixed-point problem; for this 2-state system it
+/// converges in 20–50 iterations to machine precision. Return early on
+/// stagnation to cap worst-case cost — `Icm42688::read_sample` runs on
+/// the same CPU, and we can't blow a 1 kHz budget.
+///
+/// Returns `None` if the iteration diverges or produces non-finite
+/// values — caller should fall back to PI gains.
+#[must_use]
+pub fn compute_lqr_gains(weights: LqrWeights, dt_s: f32) -> Option<LqrAxisGains> {
+    // Guard against misuse.
+    if !dt_s.is_finite()
+        || dt_s <= 0.0
+        || weights.q_pos < 0.0
+        || weights.q_vel < 0.0
+        || weights.r <= 0.0
+    {
+        return None;
+    }
+
+    // State transition and input matrices (2×2 and 2×1).
+    let a = nalgebra::Matrix2::new(1.0_f32, dt_s, 0.0, 1.0);
+    let b = nalgebra::Vector2::new(0.5 * dt_s * dt_s, dt_s);
+    let q_mat = nalgebra::Matrix2::new(weights.q_pos, 0.0, 0.0, weights.q_vel);
+
+    // Start P = Q and iterate P_{k+1} = A'PA - A'PB(R + B'PB)^{-1}B'PA + Q.
+    let mut p = q_mat;
+    let mut prev_trace = p.m11 + p.m22;
+    for _ in 0..200 {
+        let atp = a.transpose() * p;
+        let btp = b.transpose() * p;
+        let bpb = (btp * b).x; // scalar: 1×2 · 2×1 → 1×1
+        let denom = weights.r + bpb;
+        if denom <= 0.0 || !denom.is_finite() {
+            return None;
+        }
+        let atpb = atp * b; // 2×1
+        let btpa = btp * a; // 1×2
+        // Outer product for the correction term.
+        let correction = (atpb * btpa) * (1.0 / denom);
+        let next = atp * a - correction + q_mat;
+
+        if !next.iter().all(|x| x.is_finite()) {
+            return None;
+        }
+        let trace = next.m11 + next.m22;
+        p = next;
+        // Relative-change stop.
+        if (trace - prev_trace).abs() < 1.0e-6 * (1.0 + trace.abs()) {
+            break;
+        }
+        prev_trace = trace;
+    }
+
+    // K = (R + B'PB)^{-1} B'P A — row vector, 1×2.
+    let btp = b.transpose() * p;
+    let bpb = (btp * b).x;
+    let denom = weights.r + bpb;
+    if denom <= 0.0 || !denom.is_finite() {
+        return None;
+    }
+    let k_row = btp * a * (1.0 / denom);
+    let k_p = k_row.x;
+    let k_v = k_row.y;
+    if !k_p.is_finite() || !k_v.is_finite() || k_p < 0.0 || k_v < 0.0 {
+        return None;
+    }
+    Some(LqrAxisGains { k_p, k_v })
+}
+
+/// Fill a `PositionGains` from LQR weights, using the LQR-derived K as
+/// the proportional gains on both position and velocity. Integrator is
+/// left at zero (LQR tracks bias through the model; bias *rejection*
+/// needs either a disturbance observer or an integrator — both are
+/// follow-ups).
+///
+/// Uses the same weights for all three axes. Horizontal / vertical can
+/// be tuned differently by calling [`compute_lqr_gains`] twice and
+/// merging; this convenience helper is for the common isotropic case.
+#[must_use]
+pub fn lqr_position_gains(
+    weights_xy: LqrWeights,
+    weights_z: LqrWeights,
+    dt_s: f32,
+    max_accel: f32,
+) -> Option<PositionGains> {
+    let xy = compute_lqr_gains(weights_xy, dt_s)?;
+    let z = compute_lqr_gains(weights_z, dt_s)?;
+    Some(PositionGains {
+        k_pos: Vector3::new(xy.k_p, xy.k_p, z.k_p),
+        k_vel: Vector3::new(xy.k_v, xy.k_v, z.k_v),
+        k_i_vel: Vector3::zeros(),
+        max_accel,
+        max_integrator: 0.0,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 mod tests {
@@ -419,5 +584,128 @@ mod tests {
             let n = out.q_desired.norm();
             prop_assert!((n - 1.0).abs() < 1.0e-3, "‖q‖ = {}", n);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // M9.0 LQR tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn lqr_default_weights_produce_positive_gains() {
+        let g = compute_lqr_gains(LqrWeights::default(), 0.05).expect("DARE converges");
+        assert!(g.k_p > 0.0 && g.k_v > 0.0);
+        assert!(g.k_p.is_finite() && g.k_v.is_finite());
+    }
+
+    #[test]
+    fn lqr_invalid_inputs_return_none() {
+        // Negative r must fail.
+        assert!(
+            compute_lqr_gains(
+                LqrWeights {
+                    q_pos: 1.0,
+                    q_vel: 1.0,
+                    r: -1.0
+                },
+                0.05,
+            )
+            .is_none()
+        );
+        // dt <= 0 must fail.
+        assert!(compute_lqr_gains(LqrWeights::default(), 0.0).is_none());
+        assert!(compute_lqr_gains(LqrWeights::default(), -0.01).is_none());
+        // NaN dt must fail.
+        assert!(compute_lqr_gains(LqrWeights::default(), f32::NAN).is_none());
+    }
+
+    #[test]
+    fn lqr_higher_q_pos_tightens_position_gain() {
+        // Doubling q_pos with fixed q_vel / r should raise k_p.
+        let soft = compute_lqr_gains(
+            LqrWeights {
+                q_pos: 1.0,
+                q_vel: 1.0,
+                r: 1.0,
+            },
+            0.05,
+        )
+        .unwrap();
+        let stiff = compute_lqr_gains(
+            LqrWeights {
+                q_pos: 10.0,
+                q_vel: 1.0,
+                r: 1.0,
+            },
+            0.05,
+        )
+        .unwrap();
+        assert!(
+            stiff.k_p > soft.k_p,
+            "expected k_p to grow with q_pos: soft {} stiff {}",
+            soft.k_p,
+            stiff.k_p
+        );
+    }
+
+    #[test]
+    fn lqr_closed_loop_is_stable() {
+        // Simulate a discrete double-integrator under u = -K·x and check
+        // the state converges to zero from an initial offset.
+        let dt = 0.05_f32;
+        let g = compute_lqr_gains(LqrWeights::default(), dt).unwrap();
+        let (mut pos, mut vel) = (1.0_f32, 0.0_f32);
+        for _ in 0..200 {
+            let u = -(g.k_p * pos + g.k_v * vel);
+            // Euler integrate the per-axis dynamics.
+            pos += vel * dt + 0.5 * u * dt * dt;
+            vel += u * dt;
+        }
+        assert!(
+            pos.abs() < 0.01 && vel.abs() < 0.01,
+            "converged pos={pos} vel={vel}"
+        );
+    }
+
+    #[test]
+    fn lqr_position_gains_helper_fills_all_three_axes() {
+        let weights_xy = LqrWeights {
+            q_pos: 2.0,
+            q_vel: 1.0,
+            r: 0.5,
+        };
+        let weights_z = LqrWeights {
+            q_pos: 6.0,
+            q_vel: 2.0,
+            r: 0.5,
+        };
+        let pg = lqr_position_gains(weights_xy, weights_z, 0.05, 8.0).unwrap();
+        assert!(pg.k_pos.x > 0.0 && pg.k_pos.y > 0.0 && pg.k_pos.z > 0.0);
+        // xy axes share their gains.
+        assert_eq!(pg.k_pos.x, pg.k_pos.y);
+        assert_eq!(pg.k_vel.x, pg.k_vel.y);
+        // z is independently tuned and should differ.
+        assert!(pg.k_pos.z != pg.k_pos.x);
+        // Integrator disabled in LQR baseline.
+        assert_eq!(pg.k_i_vel, Vector3::zeros());
+        assert_eq!(pg.max_accel, 8.0);
+    }
+
+    #[test]
+    fn lqr_zero_error_produces_zero_feedback() {
+        // Plug LQR gains into the existing position_to_attitude_thrust
+        // and verify that "at the setpoint" produces hover thrust + no
+        // tilt — i.e. the LQR feedback term is exactly zero.
+        let pg =
+            lqr_position_gains(LqrWeights::default(), LqrWeights::default(), 0.05, 8.0).unwrap();
+        let out = position_to_attitude_thrust(
+            &Setpoint::default(),
+            Vector3::zeros(),
+            Vector3::zeros(),
+            default_mass(),
+            &pg,
+        );
+        let hover = default_mass() * GRAVITY_M_S2;
+        assert!((out.thrust_n - hover).abs() < 1.0e-3);
+        assert!(out.q_desired.i.abs() < 1.0e-3 && out.q_desired.j.abs() < 1.0e-3);
     }
 }

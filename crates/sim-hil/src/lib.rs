@@ -472,6 +472,102 @@ mod tests {
         sim_state
     }
 
+    /// Runs the SITL against an `app-copter` whose position gains are
+    /// LQR-derived rather than hand-tuned PI. Used by the M9.0 smoke test
+    /// below. Parameterised over the weight tuning so the same harness
+    /// can exercise different operating points.
+    fn run_closed_loop_flight_with_lqr(
+        sim_cfg: &SimConfig,
+        seed: u64,
+        steps: usize,
+        weights_xy: algo_nmpc::LqrWeights,
+        weights_z: algo_nmpc::LqrWeights,
+    ) -> SimState {
+        use algo_nmpc::{Setpoint, lqr_position_gains};
+        use app_copter::{
+            ArmState, FlightState, apply_baro_measurement, apply_gps_measurement,
+            apply_mag_measurement, default_config_250g, outer_step,
+        };
+
+        let mut sim_state = SimState {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..SimState::default()
+        };
+        let mut rng = SimRng::new(seed);
+
+        let mut app_cfg = default_config_250g();
+        // Outer loop runs at 1 kHz in this test harness (matches
+        // run_closed_loop_flight above), so use dt = 0.001 for the LQR
+        // design as well.
+        let lqr_pg = lqr_position_gains(
+            weights_xy,
+            weights_z,
+            0.001_f32,
+            app_cfg.position_gains.max_accel,
+        )
+        .expect("LQR DARE converges for sane weights");
+        app_cfg.position_gains = lqr_pg;
+
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
+        let _ = apply_baro_measurement(&mut flight, &sense_baro(sim_cfg, &sim_state, &mut rng));
+        let _ = apply_gps_measurement(&mut flight, &sense_gps(sim_cfg, &sim_state, &mut rng));
+
+        let setpoint = Setpoint {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..Setpoint::default()
+        };
+
+        let dt = 0.001_f32;
+        for i in 0..steps {
+            let accel_w = accel_world(sim_cfg, &sim_state);
+            let imu = sense_imu(sim_cfg, &sim_state, accel_w, &mut rng);
+            let out = outer_step(&mut app_cfg, &mut flight, imu, dt, &setpoint);
+            step(sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
+            if i % 200 == 0 {
+                let _ =
+                    apply_gps_measurement(&mut flight, &sense_gps(sim_cfg, &sim_state, &mut rng));
+            }
+            if i % 40 == 0 {
+                let _ =
+                    apply_mag_measurement(&mut flight, &sense_mag(sim_cfg, &sim_state, &mut rng));
+            }
+            if i % 20 == 0 {
+                let _ =
+                    apply_baro_measurement(&mut flight, &sense_baro(sim_cfg, &sim_state, &mut rng));
+            }
+        }
+        sim_state
+    }
+
+    #[test]
+    fn lqr_closed_loop_sitl_hovers_to_setpoint() {
+        // M9.0 smoke test: with LQR-derived gains the vehicle should
+        // still hover at the 1 m setpoint. Uses the ideal sim to keep
+        // the assertion bound tight — M9.1 (constraints) and M9.2
+        // (receding horizon) will layer noise/drag tolerance on top.
+        let sim_cfg = SimConfig::default();
+        let weights = algo_nmpc::LqrWeights {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            r: 0.5,
+        };
+        let sim_state = run_closed_loop_flight_with_lqr(&sim_cfg, 1, 3000, weights, weights);
+        let altitude_err = (-sim_state.position_ned.z - 1.0).abs();
+        let horizontal_err =
+            (sim_state.position_ned.x.powi(2) + sim_state.position_ned.y.powi(2)).sqrt();
+        assert!(
+            altitude_err < 0.25,
+            "LQR altitude err {altitude_err} m ≥ 0.25 m"
+        );
+        assert!(
+            horizontal_err < 0.25,
+            "LQR horizontal err {horizontal_err} m ≥ 0.25 m"
+        );
+    }
+
     #[test]
     fn closed_loop_sitl_hovers_with_app_copter() {
         // Ideal sensors, no drag, no lag — fast convergence baseline.
