@@ -57,6 +57,7 @@
 | [0051](./0051-ci-workflow.md) | 2026-04-22 | M6.1 CI workflow pinned | `47b1283` | `.github/workflows/ci.yml` fmt/clippy/test/build-fw/geiger 五 job，toolchain 硬 pin 1.88.0 和 `rust-toolchain.toml` 对齐；防 "本地绿 CI 红" 漂移。 |
 | [0052](./0052-takeoff-home.md) | 2026-04-22 | M6.2 TAKEOFF + home | `d2d1469` | `TakeoffState { Idle, TakingOff { target_z_ned } }` + `AltitudeReachedDetector` + 首次 arm 记 home；`outer_step` 爬升到 target（1 m/s）再回 Idle；`takeoff_request_from_mav_message` 解 COMMAND_LONG(22)；demo auto-arm；4 新测试。 |
 | [0053](./0053-rtl.md) | 2026-04-22 | M6.3 RTL（返航） | `8a06910` | `RtlPhase { Idle, Climbing, Returning }` 3 阶段：爬到 `rtl_safe_alt_m`（默认 10m）→ 飞向 home xy → hand-off 给 LandingState::Landing 自动降落+disarm；`rtl_request_from_mav_message` 解 COMMAND_LONG(20)；4 新测试，起降完整闭合。 |
+| [0054](./0054-preflight.md) | 2026-04-22 | M6.4 Preflight check | `358592b` | `preflight_check(&FlightState) -> Result<(), PreflightReject>` 查 GPS/baro/mag 健康 + EKF 协方差；demo 的 ARM/TAKEOFF 被 gate，失败发 `MAV_RESULT_TEMPORARILY_REJECTED`；DISARM 永不 gate；4 新测试。 |
 
 ## 写新文档时遵守的模板
 
