@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), no_std)]
+
 //! Multirotor rate-loop assembly.
 //!
 //! Wires together the algorithm modules developed across M1 and M2 into a
@@ -278,7 +280,8 @@ impl TouchdownDetector {
 
     pub fn observe(&mut self, velocity_ned: Vector3<f32>, position_z_ned: f32, dt_s: f32) -> bool {
         let vertical_quiet = velocity_ned.z.abs() < Self::VZ_THRESHOLD_MPS;
-        let horizontal = (velocity_ned.x * velocity_ned.x + velocity_ned.y * velocity_ned.y).sqrt();
+        let horizontal =
+            libm::sqrtf(velocity_ned.x * velocity_ned.x + velocity_ned.y * velocity_ned.y);
         let horizontal_quiet = horizontal < Self::VXY_THRESHOLD_MPS;
         let near_ground = position_z_ned > Self::Z_THRESHOLD_M;
         if vertical_quiet && horizontal_quiet && near_ground {
@@ -562,7 +565,7 @@ pub fn outer_step(
                 RtlPhase::Returning => {
                     let dx = flight.state.position_ned.x - home.x;
                     let dy = flight.state.position_ned.y - home.y;
-                    let dist = (dx * dx + dy * dy).sqrt();
+                    let dist = libm::sqrtf(dx * dx + dy * dy);
                     if dist < cfg.rtl_xy_tolerance_m {
                         flight.rtl_phase = RtlPhase::Idle;
                         flight.landing_state = LandingState::Landing;

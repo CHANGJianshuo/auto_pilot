@@ -50,9 +50,18 @@ jobs:
         with:
           targets: thumbv7em-none-eabihf
       - uses: Swatinem/rust-cache@v2
-      # Firmware build is opt-in at M0; currently the app-copter binary
-      # targets the host. Flip this on once we have an embedded main.rs.
-      - run: echo "firmware build step placeholder — see M1"
+      # Verify every embeddable crate's *library* compiles for thumbv7em.
+      # Host-only targets (binaries / sim-hil / integration tests) are
+      # deliberately excluded — they depend on std.
+      - run: |
+          set -e
+          for crate in core-hal core-rtos core-bus \
+                       algo-ekf algo-nmpc algo-indi algo-alloc algo-fdir \
+                       nn-runtime comms-mavlink app-copter; do
+            echo "::group::$crate"
+            cargo build -p $crate --lib --target thumbv7em-none-eabihf
+            echo "::endgroup::"
+          done
 
   geiger:
     name: unsafe audit (cargo-geiger)
