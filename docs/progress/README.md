@@ -59,6 +59,7 @@
 | [0053](./0053-rtl.md) | 2026-04-22 | M6.3 RTL（返航） | `8a06910` | `RtlPhase { Idle, Climbing, Returning }` 3 阶段：爬到 `rtl_safe_alt_m`（默认 10m）→ 飞向 home xy → hand-off 给 LandingState::Landing 自动降落+disarm；`rtl_request_from_mav_message` 解 COMMAND_LONG(20)；4 新测试，起降完整闭合。 |
 | [0054](./0054-preflight.md) | 2026-04-22 | M6.4 Preflight check | `358592b` | `preflight_check(&FlightState) -> Result<(), PreflightReject>` 查 GPS/baro/mag 健康 + EKF 协方差；demo 的 ARM/TAKEOFF 被 gate，失败发 `MAV_RESULT_TEMPORARILY_REJECTED`；DISARM 永不 gate；4 新测试。 |
 | [0055](./0055-thumbv7em-build.md) | 2026-04-22 | M7.0 app-copter thumbv7em build | `7a708f8` | `#![cfg_attr(not(test), no_std)]` + 两处 `libm::sqrtf`；workspace 11 个可嵌入 crate 全部编译到 thumbv7em-none-eabihf；CI build-firmware job 从占位 echo 换成真实 per-crate 编译循环。 |
+| [0056](./0056-firmware-link.md) | 2026-04-22 | M7.1 firmware ELF 链出 | `336ca0a` | `crates/app-copter/memory.x`（STM32H753/Pixhawk 6X）+ `build.rs` + `src/bin/firmware.rs`（`#![no_main]`, cortex-m-rt entry, cfg-gated host stub）→ **132 KiB ELF**；CI 现在真链 firmware binary。 |
 
 ## 写新文档时遵守的模板
 
