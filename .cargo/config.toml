@@ -5,10 +5,19 @@
 # Leave default (host) — the firmware bin opts in explicitly.
 
 [target.thumbv7em-none-eabihf]
+# `cargo run -p app-copter --bin firmware --target thumbv7em-none-eabihf`
+# flashes the .elf onto a connected probe and tails the RTT log. Chip id
+# matches the Pixhawk 6X FMU (STM32H753IIK6).
+runner = "probe-rs run --chip STM32H753ZITx"
 rustflags = [
-    "-C", "link-arg=-Tlink.x",
+    # defmt-rtt ships its own linker script; cortex-m-rt's link.x doesn't
+    # know about the defmt section, so we include it here. link.x itself
+    # is emitted by cortex-m-rt's build.rs — no need to list it.
+    "-C", "link-arg=-Tdefmt.x",
     "-C", "target-cpu=cortex-m7",
-    "-C", "target-feature=+fp-armv8d16sp",
+    # `+fp-armv8d16sp` is an Armv8-M (M33/M55) feature; Cortex-M7's FPU
+    # is VFPv5-d16sp, which is already implied by `-none-eabihf`. Omit
+    # any explicit FPU feature flag to silence the rustc warning.
 ]
 
 [alias]

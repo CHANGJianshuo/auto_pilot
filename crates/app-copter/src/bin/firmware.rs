@@ -23,7 +23,11 @@ mod embedded {
     use embassy_executor::Spawner;
     use embassy_time::{Duration, Ticker};
     use nalgebra::Vector3;
-    use panic_halt as _;
+    // `defmt_rtt` provides the logger backend (`_defmt_acquire` etc.);
+    // `panic_probe` installs a panic handler that emits a defmt log and
+    // traps. Both are wired in via `use ... as _;` so the symbols stay
+    // linked even though nothing references them by name.
+    use {defmt_rtt as _, panic_probe as _};
 
     /// 1 kHz rate loop. Runs `rate_loop_step` against a zero-g-body-z
     /// stub IMU so the whole control stack is exercised every tick.
@@ -46,13 +50,15 @@ mod embedded {
         }
     }
 
-    /// 1 Hz heartbeat. Placeholder for a future `defmt::info!` / GPIO
-    /// toggle — currently does nothing visible but proves a second task
-    /// can co-schedule alongside the rate loop without starving it.
+    /// 1 Hz heartbeat. Emits a defmt log line every second so the
+    /// operator can see the firmware is alive over SWD/RTT.
     #[embassy_executor::task]
     async fn heartbeat_task() {
         let mut ticker = Ticker::every(Duration::from_hz(1));
+        let mut n: u32 = 0;
         loop {
+            defmt::info!("heartbeat {=u32}", n);
+            n = n.wrapping_add(1);
             ticker.next().await;
         }
     }
@@ -60,6 +66,7 @@ mod embedded {
     #[embassy_executor::main]
     async fn main(spawner: Spawner) {
         let _p = embassy_stm32::init(embassy_stm32::Config::default());
+        defmt::info!("auto_pilot firmware started (STM32H753, embassy)");
         spawner.must_spawn(rate_loop_task());
         spawner.must_spawn(heartbeat_task());
     }
