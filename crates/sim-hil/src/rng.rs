@@ -20,8 +20,15 @@ impl SimRng {
     /// point; otherwise any seed is fine.
     #[must_use]
     pub const fn new(seed: u64) -> Self {
-        let state = if seed == 0 { 0xDEAD_BEEF_CAFE_BABE } else { seed };
-        Self { state, cached_gaussian: None }
+        let state = if seed == 0 {
+            0xDEAD_BEEF_CAFE_BABE
+        } else {
+            seed
+        };
+        Self {
+            state,
+            cached_gaussian: None,
+        }
     }
 
     /// One step of xorshift64.

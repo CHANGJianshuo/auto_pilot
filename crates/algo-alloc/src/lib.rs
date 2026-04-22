@@ -73,9 +73,7 @@ impl VirtualCommand {
 
 /// Assemble the `4 × N` effectiveness matrix `E` for a motor array.
 #[must_use]
-pub fn build_effectiveness<const N: usize>(
-    motors: &[MotorGeometry; N],
-) -> SMatrix<f32, 4, N> {
+pub fn build_effectiveness<const N: usize>(motors: &[MotorGeometry; N]) -> SMatrix<f32, 4, N> {
     let mut e: SMatrix<f32, 4, N> = SMatrix::zeros();
     for (i, m) in motors.iter().enumerate() {
         // Column vector [-y, +x, yaw_coef, 1].

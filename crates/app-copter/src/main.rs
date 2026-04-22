@@ -5,20 +5,55 @@
 //! without hardware attached. M1.13 wires this to `embassy-stm32` on
 //! `thumbv7em-none-eabihf`.
 
-use app_copter::{default_config_250g, rate_loop_step, FlightState};
+use app_copter::{FlightState, default_config_250g, rate_loop_step};
 use core_hal::traits::ImuSample;
 use core_rtos::{Priority, TaskSpec};
 use nalgebra::Vector3;
 
 fn main() {
     let tasks: &[TaskSpec] = &[
-        TaskSpec { name: "imu_sample", priority: Priority::RateLoop, period_us: 1_000, wcet_budget_us: 150 },
-        TaskSpec { name: "rate_loop_indi", priority: Priority::RateLoop, period_us: 1_000, wcet_budget_us: 500 },
-        TaskSpec { name: "attitude_loop", priority: Priority::AttitudeLoop, period_us: 2_000, wcet_budget_us: 400 },
-        TaskSpec { name: "ekf_update", priority: Priority::Estimator, period_us: 4_000, wcet_budget_us: 1_500 },
-        TaskSpec { name: "nmpc_outer", priority: Priority::PositionLoop, period_us: 20_000, wcet_budget_us: 8_000 },
-        TaskSpec { name: "navigation", priority: Priority::Navigation, period_us: 20_000, wcet_budget_us: 1_000 },
-        TaskSpec { name: "mavlink_tx", priority: Priority::Telemetry, period_us: 100_000, wcet_budget_us: 2_000 },
+        TaskSpec {
+            name: "imu_sample",
+            priority: Priority::RateLoop,
+            period_us: 1_000,
+            wcet_budget_us: 150,
+        },
+        TaskSpec {
+            name: "rate_loop_indi",
+            priority: Priority::RateLoop,
+            period_us: 1_000,
+            wcet_budget_us: 500,
+        },
+        TaskSpec {
+            name: "attitude_loop",
+            priority: Priority::AttitudeLoop,
+            period_us: 2_000,
+            wcet_budget_us: 400,
+        },
+        TaskSpec {
+            name: "ekf_update",
+            priority: Priority::Estimator,
+            period_us: 4_000,
+            wcet_budget_us: 1_500,
+        },
+        TaskSpec {
+            name: "nmpc_outer",
+            priority: Priority::PositionLoop,
+            period_us: 20_000,
+            wcet_budget_us: 8_000,
+        },
+        TaskSpec {
+            name: "navigation",
+            priority: Priority::Navigation,
+            period_us: 20_000,
+            wcet_budget_us: 1_000,
+        },
+        TaskSpec {
+            name: "mavlink_tx",
+            priority: Priority::Telemetry,
+            period_us: 100_000,
+            wcet_budget_us: 2_000,
+        },
     ];
 
     println!("auto_pilot — task graph:");

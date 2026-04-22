@@ -22,7 +22,7 @@
 //! * Sensor noise — see Follow-ups.
 //! * Turbulence / wind (`State.wind_ne` in the EKF is fed zero here).
 
-use algo_ekf::{BaroMeasurement, GpsMeasurement, MagMeasurement, GRAVITY_M_S2};
+use algo_ekf::{BaroMeasurement, GRAVITY_M_S2, GpsMeasurement, MagMeasurement};
 use algo_indi::Inertia;
 use core_hal::traits::ImuSample;
 use nalgebra::{Matrix3, Quaternion, SVector, UnitQuaternion, Vector3};
@@ -74,11 +74,11 @@ impl NoiseConfig {
     #[must_use]
     pub const fn realistic() -> Self {
         Self {
-            gyro_sigma: 0.003,   // rad/s, ICM-42688 density × √BW
-            accel_sigma: 0.05,   // m/s²
-            gps_pos_sigma: 0.3,  // m
-            mag_sigma: 0.003,    // gauss
-            baro_sigma: 0.15,    // m
+            gyro_sigma: 0.003,  // rad/s, ICM-42688 density × √BW
+            accel_sigma: 0.05,  // m/s²
+            gps_pos_sigma: 0.3, // m
+            mag_sigma: 0.003,   // gauss
+            baro_sigma: 0.15,   // m
         }
     }
 }
@@ -159,11 +159,17 @@ impl Default for SimState {
 /// Euler integration (sufficient at 1 ms dt for our correctness tests;
 /// RK4 is a follow-up). Handles first-order motor lag, linear +
 /// quadratic drag, and a constant wind disturbance when configured.
-pub fn step(cfg: &SimConfig, state: &mut SimState, motor_thrusts_cmd_n: &SVector<f32, 4>, dt_s: f32) {
+pub fn step(
+    cfg: &SimConfig,
+    state: &mut SimState,
+    motor_thrusts_cmd_n: &SVector<f32, 4>,
+    dt_s: f32,
+) {
     // --- Motor lag: actual thrust trails the command with τ ------------
     if cfg.motor_tau_s > 0.0 && dt_s > 0.0 {
         let alpha = (dt_s / (cfg.motor_tau_s + dt_s)).clamp(0.0, 1.0);
-        state.motor_thrusts_actual_n += (motor_thrusts_cmd_n - state.motor_thrusts_actual_n) * alpha;
+        state.motor_thrusts_actual_n +=
+            (motor_thrusts_cmd_n - state.motor_thrusts_actual_n) * alpha;
     } else {
         state.motor_thrusts_actual_n = *motor_thrusts_cmd_n;
     }
@@ -172,8 +178,11 @@ pub fn step(cfg: &SimConfig, state: &mut SimState, motor_thrusts_cmd_n: &SVector
     // --- Forces & torques in body frame ---------------------------------
     let mut total_thrust = 0.0_f32;
     let mut total_torque_body = Vector3::zeros();
-    for (i, (pos, yaw_coef)) in
-        cfg.motor_positions.iter().zip(cfg.motor_yaw_coef.iter()).enumerate()
+    for (i, (pos, yaw_coef)) in cfg
+        .motor_positions
+        .iter()
+        .zip(cfg.motor_yaw_coef.iter())
+        .enumerate()
     {
         let t_i = motor_thrusts_n.fixed_view::<1, 1>(i, 0).to_scalar();
         total_thrust += t_i;
@@ -201,9 +210,8 @@ pub fn step(cfg: &SimConfig, state: &mut SimState, motor_thrusts_cmd_n: &SVector
 
     let accel_world = thrust_accel_world + drag_accel_world + Vector3::new(0.0, 0.0, GRAVITY_M_S2);
     let new_velocity = state.velocity_ned + accel_world * dt_s;
-    let new_position = state.position_ned
-        + state.velocity_ned * dt_s
-        + accel_world * (0.5 * dt_s * dt_s);
+    let new_position =
+        state.position_ned + state.velocity_ned * dt_s + accel_world * (0.5 * dt_s * dt_s);
 
     // --- Angular dynamics (body frame) ----------------------------------
     // τ = J·ω̇ + ω × (J·ω)   ⇒   ω̇ = J⁻¹·(τ − ω × (J·ω))
@@ -275,7 +283,12 @@ pub fn sense_imu(
 #[must_use]
 pub fn accel_world(cfg: &SimConfig, state: &SimState) -> Vector3<f32> {
     let total_thrust: f32 = (0..4)
-        .map(|i| state.motor_thrusts_actual_n.fixed_view::<1, 1>(i, 0).to_scalar())
+        .map(|i| {
+            state
+                .motor_thrusts_actual_n
+                .fixed_view::<1, 1>(i, 0)
+                .to_scalar()
+        })
         .sum();
     let force_body = Vector3::new(0.0, 0.0, -total_thrust);
     let rot = UnitQuaternion::new_unchecked(state.attitude);
@@ -369,8 +382,16 @@ mod tests {
         for _ in 0..1000 {
             step(&cfg, &mut state, &thrusts, 0.001);
         }
-        assert!(state.position_ned.norm() < 1.0e-3, "p = {}", state.position_ned);
-        assert!(state.velocity_ned.norm() < 1.0e-3, "v = {}", state.velocity_ned);
+        assert!(
+            state.position_ned.norm() < 1.0e-3,
+            "p = {}",
+            state.position_ned
+        );
+        assert!(
+            state.velocity_ned.norm() < 1.0e-3,
+            "v = {}",
+            state.velocity_ned
+        );
         assert!((state.attitude.norm() - 1.0).abs() < 1.0e-5);
     }
 
@@ -404,11 +425,11 @@ mod tests {
     }
 
     fn run_closed_loop_flight(sim_cfg: &SimConfig, seed: u64, steps: usize) -> SimState {
-        use app_copter::{
-            apply_baro_measurement, apply_gps_measurement, apply_mag_measurement,
-            default_config_250g, outer_step, ArmState, FlightState,
-        };
         use algo_nmpc::Setpoint;
+        use app_copter::{
+            ArmState, FlightState, apply_baro_measurement, apply_gps_measurement,
+            apply_mag_measurement, default_config_250g, outer_step,
+        };
 
         let mut sim_state = SimState {
             position_ned: Vector3::new(0.0, 0.0, -1.0),
@@ -436,22 +457,16 @@ mod tests {
             let out = outer_step(&mut app_cfg, &mut flight, imu, dt, &setpoint);
             step(sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
             if i % 200 == 0 {
-                let _ = apply_gps_measurement(
-                    &mut flight,
-                    &sense_gps(sim_cfg, &sim_state, &mut rng),
-                );
+                let _ =
+                    apply_gps_measurement(&mut flight, &sense_gps(sim_cfg, &sim_state, &mut rng));
             }
             if i % 40 == 0 {
-                let _ = apply_mag_measurement(
-                    &mut flight,
-                    &sense_mag(sim_cfg, &sim_state, &mut rng),
-                );
+                let _ =
+                    apply_mag_measurement(&mut flight, &sense_mag(sim_cfg, &sim_state, &mut rng));
             }
             if i % 20 == 0 {
-                let _ = apply_baro_measurement(
-                    &mut flight,
-                    &sense_baro(sim_cfg, &sim_state, &mut rng),
-                );
+                let _ =
+                    apply_baro_measurement(&mut flight, &sense_baro(sim_cfg, &sim_state, &mut rng));
             }
         }
         sim_state
@@ -483,11 +498,17 @@ mod tests {
         let altitude_err = (-sim_state.position_ned.z - 1.0).abs();
         // Integral action: tight tolerance even under full realism.
         assert!(altitude_err < 0.6, "altitude err = {altitude_err} m");
-        assert!(sim_state.position_ned.xy().norm() < 1.0,
-            "horiz = {} m", sim_state.position_ned.xy().norm());
+        assert!(
+            sim_state.position_ned.xy().norm() < 1.0,
+            "horiz = {} m",
+            sim_state.position_ned.xy().norm()
+        );
         assert!((sim_state.attitude.norm() - 1.0).abs() < 1.0e-3);
-        assert!(sim_state.velocity_ned.norm() < 1.0,
-            "velocity = {} m/s (not settled)", sim_state.velocity_ned.norm());
+        assert!(
+            sim_state.velocity_ned.norm() < 1.0,
+            "velocity = {} m/s (not settled)",
+            sim_state.velocity_ned.norm()
+        );
     }
 
     #[test]
@@ -499,10 +520,9 @@ mod tests {
         // Closed-loop testing is misleading here — a well-tuned
         // controller cancels the drift so fast that wind_ne residual
         // never grows.
-        use algo_ekf::{predict_step_with_drag, ProcessNoise};
+        use algo_ekf::{ProcessNoise, predict_step_with_drag};
         use app_copter::{
-            apply_baro_measurement, apply_gps_measurement, apply_mag_measurement,
-            FlightState,
+            FlightState, apply_baro_measurement, apply_gps_measurement, apply_mag_measurement,
         };
 
         let true_wind = Vector3::new(2.0, -1.0, 0.0);
@@ -512,14 +532,8 @@ mod tests {
 
         let mut flight = FlightState::default();
         // Prime with initial baro + gps so the filter knows position.
-        let _ = apply_baro_measurement(
-            &mut flight,
-            &sense_baro(&sim_cfg, &sim_state, &mut rng),
-        );
-        let _ = apply_gps_measurement(
-            &mut flight,
-            &sense_gps(&sim_cfg, &sim_state, &mut rng),
-        );
+        let _ = apply_baro_measurement(&mut flight, &sense_baro(&sim_cfg, &sim_state, &mut rng));
+        let _ = apply_gps_measurement(&mut flight, &sense_gps(&sim_cfg, &sim_state, &mut rng));
 
         // Bump wind process noise so the filter believes wind can change
         // fast enough to track within a few seconds.
@@ -529,8 +543,7 @@ mod tests {
         };
         let drag = 0.2_f32;
         // Fix motors at hover.
-        let hover_thrusts =
-            SVector::<f32, 4>::repeat(sim_cfg.mass_kg * GRAVITY_M_S2 / 4.0);
+        let hover_thrusts = SVector::<f32, 4>::repeat(sim_cfg.mass_kg * GRAVITY_M_S2 / 4.0);
 
         let dt = 0.001_f32;
         for i in 0..15_000 {
@@ -555,16 +568,12 @@ mod tests {
             step(&sim_cfg, &mut sim_state, &hover_thrusts, dt);
             if i % 100 == 0 {
                 // More frequent GPS than normal to accelerate convergence.
-                let _ = apply_gps_measurement(
-                    &mut flight,
-                    &sense_gps(&sim_cfg, &sim_state, &mut rng),
-                );
+                let _ =
+                    apply_gps_measurement(&mut flight, &sense_gps(&sim_cfg, &sim_state, &mut rng));
             }
             if i % 40 == 0 {
-                let _ = apply_mag_measurement(
-                    &mut flight,
-                    &sense_mag(&sim_cfg, &sim_state, &mut rng),
-                );
+                let _ =
+                    apply_mag_measurement(&mut flight, &sense_mag(&sim_cfg, &sim_state, &mut rng));
             }
         }
 
@@ -576,7 +585,10 @@ mod tests {
         let true_ne = nalgebra::Vector2::new(true_wind.x, true_wind.y);
         let dot = est.dot(&true_ne) / (est.norm() * true_ne.norm() + 1.0e-6);
         assert!(est.norm() > 0.3, "wind estimate too small: {est:?}");
-        assert!(dot > 0.5, "wind direction mismatch: est={est:?} truth={true_ne:?} cos={dot}");
+        assert!(
+            dot > 0.5,
+            "wind direction mismatch: est={est:?} truth={true_ne:?} cos={dot}"
+        );
     }
 
     #[test]
@@ -584,8 +596,8 @@ mod tests {
         use algo_fdir::HealthLevel;
         use algo_nmpc::Setpoint;
         use app_copter::{
-            apply_baro_measurement, apply_gps_measurement, apply_mag_measurement,
-            default_config_250g, outer_step, ArmState, FlightState,
+            ArmState, FlightState, apply_baro_measurement, apply_gps_measurement,
+            apply_mag_measurement, default_config_250g, outer_step,
         };
 
         let sim_cfg = SimConfig::default();
@@ -599,14 +611,8 @@ mod tests {
             arm_state: ArmState::Armed,
             ..FlightState::default()
         };
-        let _ = apply_baro_measurement(
-            &mut flight,
-            &sense_baro(&sim_cfg, &sim_state, &mut rng),
-        );
-        let _ = apply_gps_measurement(
-            &mut flight,
-            &sense_gps(&sim_cfg, &sim_state, &mut rng),
-        );
+        let _ = apply_baro_measurement(&mut flight, &sense_baro(&sim_cfg, &sim_state, &mut rng));
+        let _ = apply_gps_measurement(&mut flight, &sense_gps(&sim_cfg, &sim_state, &mut rng));
 
         let setpoint = Setpoint {
             position_ned: Vector3::new(0.0, 0.0, -1.0),
@@ -631,10 +637,8 @@ mod tests {
                 let _ = apply_gps_measurement(&mut flight, &gps);
             }
             if i % 40 == 0 {
-                let _ = apply_mag_measurement(
-                    &mut flight,
-                    &sense_mag(&sim_cfg, &sim_state, &mut rng),
-                );
+                let _ =
+                    apply_mag_measurement(&mut flight, &sense_mag(&sim_cfg, &sim_state, &mut rng));
             }
             if i % 20 == 0 {
                 let _ = apply_baro_measurement(
@@ -659,8 +663,11 @@ mod tests {
         );
         // Vehicle didn't fall out of the sky — mag + baro still anchor
         // attitude and altitude.
-        assert!(sim_state.position_ned.norm() < 50.0,
-            "vehicle lost control: pos = {}", sim_state.position_ned);
+        assert!(
+            sim_state.position_ned.norm() < 50.0,
+            "vehicle lost control: pos = {}",
+            sim_state.position_ned
+        );
         assert!((sim_state.attitude.norm() - 1.0).abs() < 1.0e-3);
     }
 
@@ -671,7 +678,11 @@ mod tests {
         let sim_state = run_closed_loop_flight(&sim_cfg, 7, 5000);
         // With 3 m/s wind + linear drag k=0.05 N·s/m, cascade-P steady
         // state has a bias. Just assert vehicle hasn't flown away.
-        assert!(sim_state.position_ned.norm() < 5.0, "drift = {}", sim_state.position_ned);
+        assert!(
+            sim_state.position_ned.norm() < 5.0,
+            "drift = {}",
+            sim_state.position_ned
+        );
         assert!((sim_state.attitude.norm() - 1.0).abs() < 1.0e-3);
     }
 }

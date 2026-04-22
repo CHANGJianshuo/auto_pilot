@@ -110,18 +110,15 @@ pub fn attitude_to_rate(
     q_desired: Quaternion<f32>,
     k_att: &AttitudeGain,
 ) -> RateCommand {
-    let q_current_norm_sq =
-        q_current.w * q_current.w + q_current.i * q_current.i + q_current.j * q_current.j + q_current.k * q_current.k;
+    let q_current_norm_sq = q_current.w * q_current.w
+        + q_current.i * q_current.i
+        + q_current.j * q_current.j
+        + q_current.k * q_current.k;
     if !q_current_norm_sq.is_finite() || q_current_norm_sq < 1.0e-12 {
         return RateCommand::default();
     }
     // Conjugate of a unit quaternion q = (w, x, y, z) is (w, -x, -y, -z).
-    let q_current_conj = Quaternion::new(
-        q_current.w,
-        -q_current.i,
-        -q_current.j,
-        -q_current.k,
-    );
+    let q_current_conj = Quaternion::new(q_current.w, -q_current.i, -q_current.j, -q_current.k);
     let q_err = q_desired * q_current_conj;
     // Shortest-rotation: flip so q_err.w ≥ 0.
     let (ex, ey, ez) = if q_err.w >= 0.0 {
@@ -245,7 +242,9 @@ mod tests {
         let j = default_inertia();
         let k = default_gain();
         let input = IndiInput {
-            cmd: RateCommand { body_rate_rad_s: Vector3::new(1.0, 0.0, 0.0) },
+            cmd: RateCommand {
+                body_rate_rad_s: Vector3::new(1.0, 0.0, 0.0),
+            },
             omega_filtered: Vector3::zeros(),
             omega_dot_filtered: Vector3::zeros(),
             k_rate: &k,
@@ -267,7 +266,9 @@ mod tests {
         let rate_err = Vector3::new(1.0, 0.0, 0.0);
         let desired_accel = Vector3::new(k.x * rate_err.x, 0.0, 0.0);
         let input = IndiInput {
-            cmd: RateCommand { body_rate_rad_s: rate_err },
+            cmd: RateCommand {
+                body_rate_rad_s: rate_err,
+            },
             omega_filtered: Vector3::zeros(),
             omega_dot_filtered: desired_accel,
             k_rate: &k,
@@ -332,7 +333,11 @@ mod tests {
         let qd = Quaternion::new((theta / 2.0).cos(), 0.0, 0.0, (theta / 2.0).sin());
         let qc = Quaternion::new(1.0, 0.0, 0.0, 0.0);
         let cmd = attitude_to_rate(qc, qd, &default_att_gain());
-        assert!(cmd.body_rate_rad_s.z > 0.0, "expected +yaw, got {}", cmd.body_rate_rad_s);
+        assert!(
+            cmd.body_rate_rad_s.z > 0.0,
+            "expected +yaw, got {}",
+            cmd.body_rate_rad_s
+        );
         assert!(cmd.body_rate_rad_s.x.abs() < 1.0e-5);
         assert!(cmd.body_rate_rad_s.y.abs() < 1.0e-5);
     }
@@ -346,7 +351,11 @@ mod tests {
         let qc = Quaternion::new(1.0, 0.0, 0.0, 0.0);
         let cmd = attitude_to_rate(qc, qd, &default_att_gain());
         // Expect *negative* yaw rate (shortest path = -10°).
-        assert!(cmd.body_rate_rad_s.z < 0.0, "expected -yaw, got {}", cmd.body_rate_rad_s);
+        assert!(
+            cmd.body_rate_rad_s.z < 0.0,
+            "expected -yaw, got {}",
+            cmd.body_rate_rad_s
+        );
     }
 
     #[test]
@@ -418,7 +427,10 @@ mod tests {
         for _ in 0..5 {
             let out = f.update(target);
             let err = (target.x - out.x).abs();
-            assert!(err < err_prev, "monotonic decay violated: {err_prev} → {err}");
+            assert!(
+                err < err_prev,
+                "monotonic decay violated: {err_prev} → {err}"
+            );
             err_prev = err;
         }
     }

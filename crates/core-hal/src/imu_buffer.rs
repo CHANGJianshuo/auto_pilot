@@ -74,7 +74,10 @@ impl<const CAPACITY: usize> MockImuSource<CAPACITY> {
     /// Construct an empty source. Use [`Self::push`] to append samples.
     #[must_use]
     pub const fn new() -> Self {
-        Self { samples: heapless::Vec::new(), cursor: 0 }
+        Self {
+            samples: heapless::Vec::new(),
+            cursor: 0,
+        }
     }
 
     /// Append a sample to the replay script. Returns the sample back as

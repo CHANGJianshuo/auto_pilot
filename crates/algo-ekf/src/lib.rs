@@ -97,13 +97,48 @@ pub mod initial_sigma {
 pub fn initial_covariance() -> Covariance {
     let mut p = Covariance::zeros();
     fill_block(&mut p, idx::Q_START, idx::Q_LEN, initial_sigma::ATTITUDE);
-    fill_block(&mut p, idx::V_NED_START, idx::V_NED_LEN, initial_sigma::VELOCITY_NED);
-    fill_block(&mut p, idx::P_NED_START, idx::P_NED_LEN, initial_sigma::POSITION_NED);
-    fill_block(&mut p, idx::GYRO_BIAS_START, idx::GYRO_BIAS_LEN, initial_sigma::GYRO_BIAS);
-    fill_block(&mut p, idx::ACCEL_BIAS_START, idx::ACCEL_BIAS_LEN, initial_sigma::ACCEL_BIAS);
-    fill_block(&mut p, idx::MAG_NED_START, idx::MAG_NED_LEN, initial_sigma::MAG_NED);
-    fill_block(&mut p, idx::MAG_BIAS_START, idx::MAG_BIAS_LEN, initial_sigma::MAG_BIAS);
-    fill_block(&mut p, idx::WIND_NE_START, idx::WIND_NE_LEN, initial_sigma::WIND_NE);
+    fill_block(
+        &mut p,
+        idx::V_NED_START,
+        idx::V_NED_LEN,
+        initial_sigma::VELOCITY_NED,
+    );
+    fill_block(
+        &mut p,
+        idx::P_NED_START,
+        idx::P_NED_LEN,
+        initial_sigma::POSITION_NED,
+    );
+    fill_block(
+        &mut p,
+        idx::GYRO_BIAS_START,
+        idx::GYRO_BIAS_LEN,
+        initial_sigma::GYRO_BIAS,
+    );
+    fill_block(
+        &mut p,
+        idx::ACCEL_BIAS_START,
+        idx::ACCEL_BIAS_LEN,
+        initial_sigma::ACCEL_BIAS,
+    );
+    fill_block(
+        &mut p,
+        idx::MAG_NED_START,
+        idx::MAG_NED_LEN,
+        initial_sigma::MAG_NED,
+    );
+    fill_block(
+        &mut p,
+        idx::MAG_BIAS_START,
+        idx::MAG_BIAS_LEN,
+        initial_sigma::MAG_BIAS,
+    );
+    fill_block(
+        &mut p,
+        idx::WIND_NE_START,
+        idx::WIND_NE_LEN,
+        initial_sigma::WIND_NE,
+    );
     p
 }
 
@@ -180,14 +215,54 @@ pub fn build_process_noise(noise: ProcessNoise, dt_s: f32) -> Covariance {
         return Covariance::zeros();
     }
     let mut q = Covariance::zeros();
-    fill_block(&mut q, idx::Q_START, idx::Q_LEN, noise.attitude_per_s * libm::sqrtf(dt_s));
-    fill_block(&mut q, idx::V_NED_START, idx::V_NED_LEN, noise.velocity_per_s * libm::sqrtf(dt_s));
-    fill_block(&mut q, idx::P_NED_START, idx::P_NED_LEN, noise.position_per_s * libm::sqrtf(dt_s));
-    fill_block(&mut q, idx::GYRO_BIAS_START, idx::GYRO_BIAS_LEN, noise.gyro_bias_per_s * libm::sqrtf(dt_s));
-    fill_block(&mut q, idx::ACCEL_BIAS_START, idx::ACCEL_BIAS_LEN, noise.accel_bias_per_s * libm::sqrtf(dt_s));
-    fill_block(&mut q, idx::MAG_NED_START, idx::MAG_NED_LEN, noise.mag_ned_per_s * libm::sqrtf(dt_s));
-    fill_block(&mut q, idx::MAG_BIAS_START, idx::MAG_BIAS_LEN, noise.mag_bias_per_s * libm::sqrtf(dt_s));
-    fill_block(&mut q, idx::WIND_NE_START, idx::WIND_NE_LEN, noise.wind_per_s * libm::sqrtf(dt_s));
+    fill_block(
+        &mut q,
+        idx::Q_START,
+        idx::Q_LEN,
+        noise.attitude_per_s * libm::sqrtf(dt_s),
+    );
+    fill_block(
+        &mut q,
+        idx::V_NED_START,
+        idx::V_NED_LEN,
+        noise.velocity_per_s * libm::sqrtf(dt_s),
+    );
+    fill_block(
+        &mut q,
+        idx::P_NED_START,
+        idx::P_NED_LEN,
+        noise.position_per_s * libm::sqrtf(dt_s),
+    );
+    fill_block(
+        &mut q,
+        idx::GYRO_BIAS_START,
+        idx::GYRO_BIAS_LEN,
+        noise.gyro_bias_per_s * libm::sqrtf(dt_s),
+    );
+    fill_block(
+        &mut q,
+        idx::ACCEL_BIAS_START,
+        idx::ACCEL_BIAS_LEN,
+        noise.accel_bias_per_s * libm::sqrtf(dt_s),
+    );
+    fill_block(
+        &mut q,
+        idx::MAG_NED_START,
+        idx::MAG_NED_LEN,
+        noise.mag_ned_per_s * libm::sqrtf(dt_s),
+    );
+    fill_block(
+        &mut q,
+        idx::MAG_BIAS_START,
+        idx::MAG_BIAS_LEN,
+        noise.mag_bias_per_s * libm::sqrtf(dt_s),
+    );
+    fill_block(
+        &mut q,
+        idx::WIND_NE_START,
+        idx::WIND_NE_LEN,
+        noise.wind_per_s * libm::sqrtf(dt_s),
+    );
     q
 }
 
@@ -381,9 +456,7 @@ impl State {
     pub fn normalize_attitude(&mut self) -> Option<UnitQuaternion<f32>> {
         let q = self.attitude;
         let norm_sq = q.w * q.w + q.i * q.i + q.j * q.j + q.k * q.k;
-        if !norm_sq.is_finite()
-            || norm_sq < QUATERNION_NORM_FLOOR * QUATERNION_NORM_FLOOR
-        {
+        if !norm_sq.is_finite() || norm_sq < QUATERNION_NORM_FLOOR * QUATERNION_NORM_FLOOR {
             return None;
         }
         let norm = libm::sqrtf(norm_sq);
@@ -401,15 +474,28 @@ impl State {
     pub fn to_vector(&self) -> StateVector {
         let mut v = StateVector::zeros();
         // Quaternion stored as [w, i, j, k] to match EKF convention.
-        let q_block = Vector4::new(self.attitude.w, self.attitude.i, self.attitude.j, self.attitude.k);
-        v.fixed_rows_mut::<{ idx::Q_LEN }>(idx::Q_START).copy_from(&q_block);
-        v.fixed_rows_mut::<{ idx::V_NED_LEN }>(idx::V_NED_START).copy_from(&self.velocity_ned);
-        v.fixed_rows_mut::<{ idx::P_NED_LEN }>(idx::P_NED_START).copy_from(&self.position_ned);
-        v.fixed_rows_mut::<{ idx::GYRO_BIAS_LEN }>(idx::GYRO_BIAS_START).copy_from(&self.gyro_bias);
-        v.fixed_rows_mut::<{ idx::ACCEL_BIAS_LEN }>(idx::ACCEL_BIAS_START).copy_from(&self.accel_bias);
-        v.fixed_rows_mut::<{ idx::MAG_NED_LEN }>(idx::MAG_NED_START).copy_from(&self.mag_ned);
-        v.fixed_rows_mut::<{ idx::MAG_BIAS_LEN }>(idx::MAG_BIAS_START).copy_from(&self.mag_bias);
-        v.fixed_rows_mut::<{ idx::WIND_NE_LEN }>(idx::WIND_NE_START).copy_from(&self.wind_ne);
+        let q_block = Vector4::new(
+            self.attitude.w,
+            self.attitude.i,
+            self.attitude.j,
+            self.attitude.k,
+        );
+        v.fixed_rows_mut::<{ idx::Q_LEN }>(idx::Q_START)
+            .copy_from(&q_block);
+        v.fixed_rows_mut::<{ idx::V_NED_LEN }>(idx::V_NED_START)
+            .copy_from(&self.velocity_ned);
+        v.fixed_rows_mut::<{ idx::P_NED_LEN }>(idx::P_NED_START)
+            .copy_from(&self.position_ned);
+        v.fixed_rows_mut::<{ idx::GYRO_BIAS_LEN }>(idx::GYRO_BIAS_START)
+            .copy_from(&self.gyro_bias);
+        v.fixed_rows_mut::<{ idx::ACCEL_BIAS_LEN }>(idx::ACCEL_BIAS_START)
+            .copy_from(&self.accel_bias);
+        v.fixed_rows_mut::<{ idx::MAG_NED_LEN }>(idx::MAG_NED_START)
+            .copy_from(&self.mag_ned);
+        v.fixed_rows_mut::<{ idx::MAG_BIAS_LEN }>(idx::MAG_BIAS_START)
+            .copy_from(&self.mag_bias);
+        v.fixed_rows_mut::<{ idx::WIND_NE_LEN }>(idx::WIND_NE_START)
+            .copy_from(&self.wind_ne);
         v
     }
 
@@ -448,12 +534,7 @@ impl State {
     /// airspeed indicator, or a future predict-time wind observer),
     /// predict will "feel" the drag on-the-fly.
     #[must_use]
-    pub fn predict_with_drag(
-        &self,
-        imu: ImuMeasurement,
-        dt_s: f32,
-        drag_over_mass: f32,
-    ) -> State {
+    pub fn predict_with_drag(&self, imu: ImuMeasurement, dt_s: f32, drag_over_mass: f32) -> State {
         if !dt_s.is_finite() || dt_s < 0.0 {
             return *self;
         }
@@ -464,13 +545,9 @@ impl State {
         // --- Attitude propagation ----------------------------------------
         let delta_q = quaternion_exp(omega, dt_s);
         let mut new_q = self.attitude * delta_q;
-        let q_norm_sq = new_q.w * new_q.w
-            + new_q.i * new_q.i
-            + new_q.j * new_q.j
-            + new_q.k * new_q.k;
-        if q_norm_sq.is_finite()
-            && q_norm_sq >= QUATERNION_NORM_FLOOR * QUATERNION_NORM_FLOOR
-        {
+        let q_norm_sq =
+            new_q.w * new_q.w + new_q.i * new_q.i + new_q.j * new_q.j + new_q.k * new_q.k;
+        if q_norm_sq.is_finite() && q_norm_sq >= QUATERNION_NORM_FLOOR * QUATERNION_NORM_FLOOR {
             new_q /= libm::sqrtf(q_norm_sq);
         } else {
             new_q = self.attitude;
@@ -478,12 +555,10 @@ impl State {
 
         // --- Translation propagation -------------------------------------
         let rot = UnitQuaternion::new_unchecked(new_q);
-        let thrust_gravity_accel =
-            rot * specific_force + Vector3::new(0.0, 0.0, GRAVITY_M_S2);
+        let thrust_gravity_accel = rot * specific_force + Vector3::new(0.0, 0.0, GRAVITY_M_S2);
 
         let drag_accel = if drag_over_mass.is_finite() && drag_over_mass > 0.0 {
-            let wind_world =
-                Vector3::new(self.wind_ne.x, self.wind_ne.y, 0.0);
+            let wind_world = Vector3::new(self.wind_ne.x, self.wind_ne.y, 0.0);
             let v_rel = self.velocity_ned - wind_world;
             -drag_over_mass * v_rel
         } else {
@@ -492,9 +567,7 @@ impl State {
 
         let accel_ned = thrust_gravity_accel + drag_accel;
         let new_v = self.velocity_ned + accel_ned * dt_s;
-        let new_p = self.position_ned
-            + self.velocity_ned * dt_s
-            + accel_ned * (0.5 * dt_s * dt_s);
+        let new_p = self.position_ned + self.velocity_ned * dt_s + accel_ned * (0.5 * dt_s * dt_s);
 
         State {
             attitude: new_q,
@@ -550,12 +623,7 @@ impl State {
 #[must_use]
 pub fn right_multiplication_matrix(q: Quaternion<f32>) -> Matrix4<f32> {
     let (w, x, y, z) = (q.w, q.i, q.j, q.k);
-    Matrix4::new(
-        w, -x, -y, -z,
-        x,  w,  z, -y,
-        y, -z,  w,  x,
-        z,  y, -x,  w,
-    )
+    Matrix4::new(w, -x, -y, -z, x, w, z, -y, y, -z, w, x, z, y, -x, w)
 }
 
 /// Rotation matrix `R(q)` from body frame to world (NED) frame for a unit
@@ -564,9 +632,15 @@ pub fn right_multiplication_matrix(q: Quaternion<f32>) -> Matrix4<f32> {
 pub fn rotation_matrix(q: Quaternion<f32>) -> Matrix3<f32> {
     let (w, x, y, z) = (q.w, q.i, q.j, q.k);
     Matrix3::new(
-        1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z),       2.0 * (x * z + w * y),
-        2.0 * (x * y + w * z),       1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x),
-        2.0 * (x * z - w * y),       2.0 * (y * z + w * x),       1.0 - 2.0 * (x * x + y * y),
+        1.0 - 2.0 * (y * y + z * z),
+        2.0 * (x * y - w * z),
+        2.0 * (x * z + w * y),
+        2.0 * (x * y + w * z),
+        1.0 - 2.0 * (x * x + z * z),
+        2.0 * (y * z - w * x),
+        2.0 * (x * z - w * y),
+        2.0 * (y * z + w * x),
+        1.0 - 2.0 * (x * x + y * y),
     )
 }
 
@@ -603,23 +677,26 @@ pub fn rotation_jacobian_wrt_q(q: Quaternion<f32>, v: Vector3<f32>) -> Matrix3x4
     // ∂R/∂w · v
     let col_w = two * Vector3::new(-z * vy + y * vz, z * vx - x * vz, -y * vx + x * vy);
     // ∂R/∂x · v
-    let col_x = two * Vector3::new(
-        y * vy + z * vz,
-        y * vx - 2.0 * x * vy - w * vz,
-        z * vx + w * vy - 2.0 * x * vz,
-    );
+    let col_x = two
+        * Vector3::new(
+            y * vy + z * vz,
+            y * vx - 2.0 * x * vy - w * vz,
+            z * vx + w * vy - 2.0 * x * vz,
+        );
     // ∂R/∂y · v
-    let col_y = two * Vector3::new(
-        -2.0 * y * vx + x * vy + w * vz,
-        x * vx + z * vz,
-        -w * vx + z * vy - 2.0 * y * vz,
-    );
+    let col_y = two
+        * Vector3::new(
+            -2.0 * y * vx + x * vy + w * vz,
+            x * vx + z * vz,
+            -w * vx + z * vy - 2.0 * y * vz,
+        );
     // ∂R/∂z · v
-    let col_z = two * Vector3::new(
-        -2.0 * z * vx - w * vy + x * vz,
-        w * vx - 2.0 * z * vy + y * vz,
-        x * vx + y * vy,
-    );
+    let col_z = two
+        * Vector3::new(
+            -2.0 * z * vx - w * vy + x * vz,
+            w * vx - 2.0 * z * vy + y * vz,
+            x * vx + y * vy,
+        );
     Matrix3x4::from_columns(&[col_w, col_x, col_y, col_z])
 }
 
@@ -630,12 +707,7 @@ pub fn rotation_jacobian_wrt_q(q: Quaternion<f32>, v: Vector3<f32>) -> Matrix3x4
 #[must_use]
 pub fn left_multiplication_matrix(q: Quaternion<f32>) -> Matrix4<f32> {
     let (w, x, y, z) = (q.w, q.i, q.j, q.k);
-    Matrix4::new(
-        w, -x, -y, -z,
-        x,  w, -z,  y,
-        y,  z,  w, -x,
-        z, -y,  x,  w,
-    )
+    Matrix4::new(w, -x, -y, -z, x, w, -z, y, y, z, w, -x, z, -y, x, w)
 }
 
 /// Build the full 24×24 state-transition Jacobian `F = ∂f/∂x` for the
@@ -659,11 +731,7 @@ pub fn left_multiplication_matrix(q: Quaternion<f32>) -> Matrix4<f32> {
 /// Still identity (M1.9b-1b/c/d):
 /// * `∂q/∂b_g`, `∂v/∂q`, `∂v/∂b_a`, `∂p/∂q`
 #[must_use]
-pub fn build_transition_jacobian(
-    state: &State,
-    imu: &ImuMeasurement,
-    dt_s: f32,
-) -> Covariance {
+pub fn build_transition_jacobian(state: &State, imu: &ImuMeasurement, dt_s: f32) -> Covariance {
     let mut f = kinematic_transition(dt_s);
     if !dt_s.is_finite() || dt_s < 0.0 {
         return f;
@@ -681,8 +749,10 @@ pub fn build_transition_jacobian(
     //   ⇒ ∂q_new/∂b_g = L(q) · ∂δq/∂b_g  =  -(dt/2) · L(q)[:, 1:4]
     let lq = left_multiplication_matrix(state.attitude);
     let dq_dbg = -(dt_s / 2.0) * lq.fixed_columns::<{ idx::GYRO_BIAS_LEN }>(1).into_owned();
-    let mut dq_dbg_block =
-        f.fixed_view_mut::<{ idx::Q_LEN }, { idx::GYRO_BIAS_LEN }>(idx::Q_START, idx::GYRO_BIAS_START);
+    let mut dq_dbg_block = f.fixed_view_mut::<{ idx::Q_LEN }, { idx::GYRO_BIAS_LEN }>(
+        idx::Q_START,
+        idx::GYRO_BIAS_START,
+    );
     dq_dbg_block.copy_from(&dq_dbg);
 
     // ∂v/∂q and ∂v/∂b_a blocks (M1.9b-1c). Evaluated at current q:
@@ -747,11 +817,7 @@ pub fn build_transition_jacobian_with_drag(
 ) -> Covariance {
     let mut f = build_transition_jacobian(state, imu, dt_s);
 
-    if !dt_s.is_finite()
-        || dt_s <= 0.0
-        || !drag_over_mass.is_finite()
-        || drag_over_mass <= 0.0
-    {
+    if !dt_s.is_finite() || dt_s <= 0.0 || !drag_over_mass.is_finite() || drag_over_mass <= 0.0 {
         return f;
     }
 
@@ -936,11 +1002,17 @@ pub fn baro_update(
     //   H·P·Hᵀ = P[down_idx, down_idx]
     //   S      = P[down_idx, down_idx] + σ²
     //   P·Hᵀ   = -P[:, down_idx]
-    let p_down_z: f32 = covariance.fixed_view::<1, 1>(down_idx, down_idx).to_scalar();
+    let p_down_z: f32 = covariance
+        .fixed_view::<1, 1>(down_idx, down_idx)
+        .to_scalar();
     let r = measurement.sigma_m * measurement.sigma_m;
     let s_scalar = p_down_z + r;
 
-    let nis = if s_scalar > 0.0 { residual * residual / s_scalar } else { f32::INFINITY };
+    let nis = if s_scalar > 0.0 {
+        residual * residual / s_scalar
+    } else {
+        f32::INFINITY
+    };
     if !nis.is_finite() || nis > BARO_CHI2_GATE {
         return BaroUpdateResult {
             state: *state,
@@ -951,8 +1023,7 @@ pub fn baro_update(
     }
 
     // K = P·Hᵀ / S  (24-vector)
-    let p_col: StateVector =
-        -covariance.fixed_columns::<1>(down_idx).into_owned() / s_scalar;
+    let p_col: StateVector = -covariance.fixed_columns::<1>(down_idx).into_owned() / s_scalar;
     let k = p_col;
 
     // State correction.
@@ -1027,8 +1098,7 @@ fn build_mag_observation_matrix(state: &State) -> nalgebra::SMatrix<f32, 3, STAT
     h.fixed_view_mut::<3, { idx::MAG_NED_LEN }>(0, idx::MAG_NED_START)
         .copy_from(&r_transpose);
 
-    let mut bias_block =
-        h.fixed_view_mut::<3, { idx::MAG_BIAS_LEN }>(0, idx::MAG_BIAS_START);
+    let mut bias_block = h.fixed_view_mut::<3, { idx::MAG_BIAS_LEN }>(0, idx::MAG_BIAS_START);
     bias_block.fill_with_identity();
 
     h
@@ -1191,7 +1261,12 @@ pub fn quaternion_exp(omega: Vector3<f32>, dt_s: f32) -> Quaternion<f32> {
     let sin_h = libm::sinf(half_norm);
     let cos_h = libm::cosf(half_norm);
     let scale = sin_h / half_norm;
-    Quaternion::new(cos_h, half_vec.x * scale, half_vec.y * scale, half_vec.z * scale)
+    Quaternion::new(
+        cos_h,
+        half_vec.x * scale,
+        half_vec.y * scale,
+        half_vec.z * scale,
+    )
 }
 
 #[cfg(test)]
@@ -1244,7 +1319,10 @@ mod tests {
 
     #[test]
     fn zero_quaternion_returns_none() {
-        let mut s = State { attitude: Quaternion::new(0.0, 0.0, 0.0, 0.0), ..State::default() };
+        let mut s = State {
+            attitude: Quaternion::new(0.0, 0.0, 0.0, 0.0),
+            ..State::default()
+        };
         assert!(s.normalize_attitude().is_none());
     }
 
@@ -1308,7 +1386,10 @@ mod tests {
             for j in 0..STATE_DIM {
                 let v = p.fixed_view::<1, 1>(i, j).to_scalar();
                 if i == j {
-                    assert!(v > 0.0, "diagonal entry ({i}, {i}) must be positive, got {v}");
+                    assert!(
+                        v > 0.0,
+                        "diagonal entry ({i}, {i}) must be positive, got {v}"
+                    );
                 } else {
                     assert_eq!(v, 0.0, "off-diagonal ({i}, {j}) must be 0, got {v}");
                 }
@@ -1359,15 +1440,20 @@ mod tests {
     fn kinematic_transition_sets_dp_dv_block_to_dt_identity() {
         let dt = 0.01_f32;
         let f = kinematic_transition(dt);
-        let block =
-            f.fixed_view::<{ idx::P_NED_LEN }, { idx::V_NED_LEN }>(idx::P_NED_START, idx::V_NED_START);
+        let block = f.fixed_view::<{ idx::P_NED_LEN }, { idx::V_NED_LEN }>(
+            idx::P_NED_START,
+            idx::V_NED_START,
+        );
         // ∂p/∂v = dt * I_3  (Nalgebra's identity matrices are square, so
         // the 3x3 identity times dt is the expected block.)
         for i in 0..idx::P_NED_LEN {
             for j in 0..idx::V_NED_LEN {
                 let v = block.fixed_view::<1, 1>(i, j).to_scalar();
                 let expected = if i == j { dt } else { 0.0 };
-                assert!((v - expected).abs() < 1.0e-9, "({i},{j}): got {v} want {expected}");
+                assert!(
+                    (v - expected).abs() < 1.0e-9,
+                    "({i},{j}): got {v} want {expected}"
+                );
             }
         }
     }
@@ -1413,8 +1499,10 @@ mod tests {
         let state = State::default();
         let imu = ImuMeasurement::default();
         let f = build_transition_jacobian(&state, &imu, 0.0);
-        let block =
-            f.fixed_view::<{ idx::Q_LEN }, { idx::GYRO_BIAS_LEN }>(idx::Q_START, idx::GYRO_BIAS_START);
+        let block = f.fixed_view::<{ idx::Q_LEN }, { idx::GYRO_BIAS_LEN }>(
+            idx::Q_START,
+            idx::GYRO_BIAS_START,
+        );
         assert!(block.norm() < 1.0e-9);
     }
 
@@ -1426,8 +1514,10 @@ mod tests {
         let imu = ImuMeasurement::default();
         let dt = 0.01_f32;
         let f = build_transition_jacobian(&state, &imu, dt);
-        let block =
-            f.fixed_view::<{ idx::Q_LEN }, { idx::GYRO_BIAS_LEN }>(idx::Q_START, idx::GYRO_BIAS_START);
+        let block = f.fixed_view::<{ idx::Q_LEN }, { idx::GYRO_BIAS_LEN }>(
+            idx::Q_START,
+            idx::GYRO_BIAS_START,
+        );
         // Row 0 (scalar part) should be all zero.
         for j in 0..idx::GYRO_BIAS_LEN {
             let v = block.fixed_view::<1, 1>(0, j).to_scalar();
@@ -1474,7 +1564,10 @@ mod tests {
         let state = State::default();
         let p = initial_covariance();
         let sigma = Vector3::new(1.0, 1.5, 2.0);
-        let m = GpsMeasurement { position_ned: Vector3::zeros(), sigma };
+        let m = GpsMeasurement {
+            position_ned: Vector3::zeros(),
+            sigma,
+        };
         let innov = gps_innovation(&state, &p, &m);
         // P_NED_NED block of P is diag(σ_pos²).
         let expected_p = initial_sigma::POSITION_NED.powi(2);
@@ -1516,12 +1609,18 @@ mod tests {
             accel_m_s2: Vector3::new(0.0, 0.0, -GRAVITY_M_S2),
         };
         let gps_target = Vector3::new(1.0, -2.0, -3.0);
-        let gps = GpsMeasurement { position_ned: gps_target, sigma: Vector3::new(0.3, 0.3, 0.4) };
+        let gps = GpsMeasurement {
+            position_ned: gps_target,
+            sigma: Vector3::new(0.3, 0.3, 0.4),
+        };
         let mag = MagMeasurement {
             body_field: state.mag_ned, // body == world at q = identity
             sigma: Vector3::new(0.005, 0.005, 0.005),
         };
-        let baro = BaroMeasurement { altitude_m: 3.0, sigma_m: 0.1 };
+        let baro = BaroMeasurement {
+            altitude_m: 3.0,
+            sigma_m: 0.1,
+        };
 
         // 2 seconds of 1 kHz predict, with measurement updates at their own rates.
         for i in 0..2000 {
@@ -1575,7 +1674,10 @@ mod tests {
     fn baro_update_zero_altitude_no_change() {
         let state = State::default(); // position_ned = 0 → altitude 0
         let p = initial_covariance();
-        let m = BaroMeasurement { altitude_m: 0.0, sigma_m: 0.5 };
+        let m = BaroMeasurement {
+            altitude_m: 0.0,
+            sigma_m: 0.5,
+        };
         let r = baro_update(&state, &p, &m);
         assert!(r.applied);
         assert!(r.state.position_ned.norm() < 1.0e-6);
@@ -1585,7 +1687,10 @@ mod tests {
     fn baro_update_pulls_altitude_toward_measurement() {
         let state = State::default();
         let p = initial_covariance();
-        let m = BaroMeasurement { altitude_m: 5.0, sigma_m: 0.3 };
+        let m = BaroMeasurement {
+            altitude_m: 5.0,
+            sigma_m: 0.3,
+        };
         let r = baro_update(&state, &p, &m);
         assert!(r.applied);
         // After update the state's altitude (-position_ned.z) is closer to 5.
@@ -1597,7 +1702,10 @@ mod tests {
     fn baro_update_rejects_massive_outlier() {
         let state = State::default();
         let p = initial_covariance();
-        let m = BaroMeasurement { altitude_m: 10_000.0, sigma_m: 0.1 };
+        let m = BaroMeasurement {
+            altitude_m: 10_000.0,
+            sigma_m: 0.1,
+        };
         let r = baro_update(&state, &p, &m);
         assert!(!r.applied);
     }
@@ -1606,13 +1714,22 @@ mod tests {
     fn baro_update_shrinks_altitude_variance() {
         let state = State::default();
         let p = initial_covariance();
-        let m = BaroMeasurement { altitude_m: 1.0, sigma_m: 0.1 };
+        let m = BaroMeasurement {
+            altitude_m: 1.0,
+            sigma_m: 0.1,
+        };
         let r = baro_update(&state, &p, &m);
         assert!(r.applied);
         let down_idx = idx::P_NED_START + 2;
         let before = p.fixed_view::<1, 1>(down_idx, down_idx).to_scalar();
-        let after = r.covariance.fixed_view::<1, 1>(down_idx, down_idx).to_scalar();
-        assert!(after < before, "down variance didn't shrink: {before} → {after}");
+        let after = r
+            .covariance
+            .fixed_view::<1, 1>(down_idx, down_idx)
+            .to_scalar();
+        assert!(
+            after < before,
+            "down variance didn't shrink: {before} → {after}"
+        );
     }
 
     proptest! {
@@ -1765,7 +1882,10 @@ mod tests {
         // Updated state is closer to measurement than original.
         let before_err = (state.position_ned - m.position_ned).norm();
         let after_err = (result.state.position_ned - m.position_ned).norm();
-        assert!(after_err < before_err, "before={before_err}, after={after_err}");
+        assert!(
+            after_err < before_err,
+            "before={before_err}, after={after_err}"
+        );
     }
 
     #[test]
@@ -1780,7 +1900,9 @@ mod tests {
         assert!(result.applied);
         // Each position diagonal should shrink.
         for i in 0..idx::P_NED_LEN {
-            let before = p.fixed_view::<1, 1>(idx::P_NED_START + i, idx::P_NED_START + i).to_scalar();
+            let before = p
+                .fixed_view::<1, 1>(idx::P_NED_START + i, idx::P_NED_START + i)
+                .to_scalar();
             let after = result
                 .covariance
                 .fixed_view::<1, 1>(idx::P_NED_START + i, idx::P_NED_START + i)
@@ -1899,7 +2021,10 @@ mod tests {
             for j in (i + 1)..STATE_DIM {
                 let a = p.fixed_view::<1, 1>(i, j).to_scalar();
                 let b = p.fixed_view::<1, 1>(j, i).to_scalar();
-                assert!((a - b).abs() < 1.0e-4, "P asymmetric at ({i},{j}): {a} vs {b}");
+                assert!(
+                    (a - b).abs() < 1.0e-4,
+                    "P asymmetric at ({i},{j}): {a} vs {b}"
+                );
             }
         }
     }
@@ -2325,8 +2450,14 @@ mod tests {
         assert_eq!(idx::Q_START + idx::Q_LEN, idx::V_NED_START);
         assert_eq!(idx::V_NED_START + idx::V_NED_LEN, idx::P_NED_START);
         assert_eq!(idx::P_NED_START + idx::P_NED_LEN, idx::GYRO_BIAS_START);
-        assert_eq!(idx::GYRO_BIAS_START + idx::GYRO_BIAS_LEN, idx::ACCEL_BIAS_START);
-        assert_eq!(idx::ACCEL_BIAS_START + idx::ACCEL_BIAS_LEN, idx::MAG_NED_START);
+        assert_eq!(
+            idx::GYRO_BIAS_START + idx::GYRO_BIAS_LEN,
+            idx::ACCEL_BIAS_START
+        );
+        assert_eq!(
+            idx::ACCEL_BIAS_START + idx::ACCEL_BIAS_LEN,
+            idx::MAG_NED_START
+        );
         assert_eq!(idx::MAG_NED_START + idx::MAG_NED_LEN, idx::MAG_BIAS_START);
         assert_eq!(idx::MAG_BIAS_START + idx::MAG_BIAS_LEN, idx::WIND_NE_START);
         assert_eq!(idx::WIND_NE_START + idx::WIND_NE_LEN, idx::TOTAL);

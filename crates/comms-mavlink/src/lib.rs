@@ -48,7 +48,11 @@ pub fn encode_heartbeat(system_id: u8, component_id: u8, sequence: u8) -> FrameB
         system_status: MavState::MAV_STATE_STANDBY,
         mavlink_version: 3,
     });
-    let header = MavHeader { system_id, component_id, sequence };
+    let header = MavHeader {
+        system_id,
+        component_id,
+        sequence,
+    };
     encode(&header, &msg)
 }
 
@@ -121,7 +125,11 @@ pub fn encode_attitude(
         pitchspeed: body_rate_rad_s.y,
         yawspeed: body_rate_rad_s.z,
     });
-    let header = MavHeader { system_id, component_id, sequence };
+    let header = MavHeader {
+        system_id,
+        component_id,
+        sequence,
+    };
     encode(&header, &msg)
 }
 
@@ -194,7 +202,11 @@ pub fn encode_global_position_int(
         vz: vz_cms,
         hdg: hdg_cdeg,
     });
-    let header = MavHeader { system_id, component_id, sequence };
+    let header = MavHeader {
+        system_id,
+        component_id,
+        sequence,
+    };
     encode(&header, &msg)
 }
 
@@ -221,9 +233,7 @@ pub enum ParseError {
 ///
 /// `no_std`-safe: `&[u8]` already implements the `embedded_io::Read`
 /// trait the mavlink crate needs, so there is no std / alloc fallout.
-pub fn parse_frame(
-    bytes: &[u8],
-) -> Result<(MavHeader, MavMessage), ParseError> {
+pub fn parse_frame(bytes: &[u8]) -> Result<(MavHeader, MavMessage), ParseError> {
     use mavlink::peek_reader::PeekReader;
     // `&[u8]` implements mavlink's embedded_io::Read, no cursor needed.
     let mut reader = PeekReader::<&[u8], 280>::new(bytes);
@@ -313,11 +323,7 @@ mod tests {
         let pos = Vector3::new(100.0, 0.0, -5.0); // 100 m north, 5 m up
         let vel = Vector3::new(1.0, 0.0, 0.0);
 
-        let frame = encode_global_position_int(
-            1, 1, 0, 1000,
-            40.0, -105.0, 1655.0,
-            pos, vel, 0.0,
-        );
+        let frame = encode_global_position_int(1, 1, 0, 1000, 40.0, -105.0, 1655.0, pos, vel, 0.0);
         assert_eq!(byte_at(&frame, 0), 0xFD);
         // MAVLink 2 truncates trailing zeros, so payload length is variable.
         // Just require the frame fits the 28-byte upper bound plus overhead.
@@ -327,9 +333,16 @@ mod tests {
     #[test]
     fn global_position_int_handles_negative_heading() {
         let frame = encode_global_position_int(
-            1, 1, 0, 0,
-            0.0, 0.0, 0.0,
-            Vector3::zeros(), Vector3::zeros(), -1.0, // -1 rad heading
+            1,
+            1,
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            Vector3::zeros(),
+            Vector3::zeros(),
+            -1.0, // -1 rad heading
         );
         assert_eq!(byte_at(&frame, 0), 0xFD);
     }
@@ -376,10 +389,7 @@ mod tests {
     #[test]
     fn parse_rejects_short_buffer() {
         let short = [0xFD, 0x00];
-        assert!(matches!(
-            parse_frame(&short),
-            Err(ParseError::Incomplete)
-        ));
+        assert!(matches!(parse_frame(&short), Err(ParseError::Incomplete)));
     }
 
     #[test]

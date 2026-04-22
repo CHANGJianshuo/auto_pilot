@@ -132,9 +132,15 @@ pub fn position_to_attitude_thrust_pi(
     if !saturated && dt_s > 0.0 && dt_s.is_finite() {
         new_integrator += gains.k_i_vel.component_mul(&vel_err) * dt_s;
         // Per-axis clamp.
-        new_integrator.x = new_integrator.x.clamp(-gains.max_integrator, gains.max_integrator);
-        new_integrator.y = new_integrator.y.clamp(-gains.max_integrator, gains.max_integrator);
-        new_integrator.z = new_integrator.z.clamp(-gains.max_integrator, gains.max_integrator);
+        new_integrator.x = new_integrator
+            .x
+            .clamp(-gains.max_integrator, gains.max_integrator);
+        new_integrator.y = new_integrator
+            .y
+            .clamp(-gains.max_integrator, gains.max_integrator);
+        new_integrator.z = new_integrator
+            .z
+            .clamp(-gains.max_integrator, gains.max_integrator);
     }
 
     // 4. Force balance: the vehicle must generate thrust `F = m·(a - g)`.
@@ -202,13 +208,16 @@ mod tests {
         let expected_thrust = default_mass() * GRAVITY_M_S2;
         assert!(
             (out.thrust_n - expected_thrust).abs() < 1.0e-3,
-            "thrust {} expected {}", out.thrust_n, expected_thrust
+            "thrust {} expected {}",
+            out.thrust_n,
+            expected_thrust
         );
         // q should be approximately identity: (1, 0, 0, 0) or (-1, 0, 0, 0).
         let q = out.q_desired;
         assert!(
             (q.w.abs() - 1.0).abs() < 1.0e-3,
-            "q.w = {} (expected ±1)", q.w
+            "q.w = {} (expected ±1)",
+            q.w
         );
         assert!(q.i.abs() < 1.0e-3);
         assert!(q.j.abs() < 1.0e-3);
@@ -253,7 +262,12 @@ mod tests {
         );
         // Need to climb → more thrust than hover.
         let hover = default_mass() * GRAVITY_M_S2;
-        assert!(out.thrust_n > hover, "thrust {} should > hover {}", out.thrust_n, hover);
+        assert!(
+            out.thrust_n > hover,
+            "thrust {} should > hover {}",
+            out.thrust_n,
+            hover
+        );
     }
 
     #[test]
@@ -276,11 +290,12 @@ mod tests {
         );
         // Effective accel should obey max_accel; thrust magnitude should be
         // bounded by m * sqrt(max_accel² + g²).
-        let max_thrust = default_mass()
-            * (gains.max_accel.powi(2) + GRAVITY_M_S2.powi(2)).sqrt();
+        let max_thrust = default_mass() * (gains.max_accel.powi(2) + GRAVITY_M_S2.powi(2)).sqrt();
         assert!(
             out.thrust_n <= max_thrust + 1.0e-3,
-            "thrust {} > saturation bound {}", out.thrust_n, max_thrust
+            "thrust {} > saturation bound {}",
+            out.thrust_n,
+            max_thrust
         );
     }
 
