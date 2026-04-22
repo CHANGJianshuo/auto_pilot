@@ -788,6 +788,149 @@ impl<const H: usize> Mpc3dPositionController<H> {
 }
 
 // ----------------------------------------------------------------------------
+// M9.4 — Position controller enum: PI / LQR / MPC / LQI behind one API
+// ----------------------------------------------------------------------------
+
+/// Unified dispatch for every position controller the crate exposes.
+///
+/// Each variant owns whatever state its algorithm needs (PI's integrator,
+/// MPC's warm-start buffers, LQI's integrator); LQR is stateless. Use
+/// the constructors (`::pi`, `::lqr`, `::mpc`, `::lqi`) rather than
+/// building variants directly so the shape of each arm stays intact.
+///
+/// `H` is the MPC horizon length — a compile-time const because the
+/// dense QP's working set is a `SVector<f32, H>`. Non-MPC variants
+/// ignore `H`, so a typical application can pick a small value (10 at
+/// 1 kHz ≈ 10 ms lookahead) and use the same enum everywhere.
+#[derive(Clone, Debug)]
+pub enum PositionController<const H: usize> {
+    /// Cascade PI — the M2.5 / M3.2 baseline. Stateful: `integrator`
+    /// accumulates velocity error with anti-windup inside the step call.
+    Pi {
+        gains: PositionGains,
+        integrator: Vector3<f32>,
+    },
+    /// Infinite-horizon LQR — optimal feedback for the nominal model.
+    /// No integrator; no state between ticks. `gains` should be the
+    /// output of [`lqr_position_gains`].
+    Lqr { gains: PositionGains },
+    /// Finite-horizon MPC with box constraints (M9.1 / M9.2). Owns
+    /// the three warm-start buffers internally.
+    Mpc(Mpc3dPositionController<H>),
+    /// LQR augmented with an integrator state (M9.3). Cheap + cancels
+    /// steady-state bias under constant disturbance.
+    Lqi(Lqi3dPositionController),
+}
+
+impl<const H: usize> PositionController<H> {
+    /// Build the cascade-PI variant.
+    #[must_use]
+    pub fn pi(gains: PositionGains) -> Self {
+        Self::Pi {
+            gains,
+            integrator: Vector3::zeros(),
+        }
+    }
+
+    /// Pre-compute LQR gains from weights and wrap in an `Lqr` variant.
+    /// Returns `None` if the 2×2 DARE fails to converge.
+    #[must_use]
+    pub fn lqr(
+        weights_xy: LqrWeights,
+        weights_z: LqrWeights,
+        dt_s: f32,
+        max_accel: f32,
+    ) -> Option<Self> {
+        Some(Self::Lqr {
+            gains: lqr_position_gains(weights_xy, weights_z, dt_s, max_accel)?,
+        })
+    }
+
+    /// Build an `Mpc` variant. Same failure modes as
+    /// [`Mpc3dPositionController::new`].
+    #[must_use]
+    pub fn mpc(
+        cfg_xy: Mpc1dConfig,
+        cfg_z: Mpc1dConfig,
+        max_iter: usize,
+        max_accel: f32,
+    ) -> Option<Self> {
+        Mpc3dPositionController::new(cfg_xy, cfg_z, max_iter, max_accel).map(Self::Mpc)
+    }
+
+    /// Build an `Lqi` variant.
+    #[must_use]
+    pub fn lqi(
+        weights_xy: LqiWeights,
+        weights_z: LqiWeights,
+        dt_s: f32,
+        max_accel: f32,
+        integrator_max: f32,
+    ) -> Option<Self> {
+        Lqi3dPositionController::new(weights_xy, weights_z, dt_s, max_accel, integrator_max)
+            .map(Self::Lqi)
+    }
+
+    /// Single-tick dispatch. `dt_s` is consumed by the PI integrator
+    /// update and ignored by variants that baked `dt_s` in at
+    /// construction (MPC / LQI).
+    pub fn step(
+        &mut self,
+        setpoint: &Setpoint,
+        current_position: Vector3<f32>,
+        current_velocity: Vector3<f32>,
+        mass_kg: f32,
+        dt_s: f32,
+    ) -> AttitudeAndThrust {
+        match self {
+            Self::Pi { gains, integrator } => {
+                let (att, new_integ) = position_to_attitude_thrust_pi(
+                    setpoint,
+                    current_position,
+                    current_velocity,
+                    mass_kg,
+                    gains,
+                    *integrator,
+                    dt_s,
+                );
+                *integrator = new_integ;
+                att
+            }
+            Self::Lqr { gains } => position_to_attitude_thrust(
+                setpoint,
+                current_position,
+                current_velocity,
+                mass_kg,
+                gains,
+            ),
+            Self::Mpc(c) => c.step(setpoint, current_position, current_velocity, mass_kg),
+            Self::Lqi(c) => c.step(setpoint, current_position, current_velocity, mass_kg),
+        }
+    }
+
+    /// Reset per-controller state on mode switches / big setpoint jumps.
+    pub fn reset(&mut self) {
+        match self {
+            Self::Pi { integrator, .. } => *integrator = Vector3::zeros(),
+            Self::Lqr { .. } => {}
+            Self::Mpc(c) => c.reset_warm_start(),
+            Self::Lqi(c) => c.reset_integrator(),
+        }
+    }
+
+    /// Short name of the active variant, for logging / telemetry.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Pi { .. } => "PI",
+            Self::Lqr { .. } => "LQR",
+            Self::Mpc(_) => "MPC",
+            Self::Lqi(_) => "LQI",
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
 // M9.3 — LQI (LQR + integrator): kills steady-state bias
 // ----------------------------------------------------------------------------
 //
@@ -1490,6 +1633,192 @@ mod tests {
             pos.abs() < 0.05 && vel.abs() < 0.05,
             "converged pos={pos} vel={vel}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // M9.4 PositionController enum dispatch tests
+    // ------------------------------------------------------------------
+
+    const SHOOT_H: usize = 10;
+
+    #[test]
+    fn controller_enum_constructs_every_variant() {
+        let pi: PositionController<SHOOT_H> = PositionController::pi(PositionGains::default());
+        assert_eq!(pi.kind(), "PI");
+
+        let lqr = PositionController::<SHOOT_H>::lqr(
+            LqrWeights::default(),
+            LqrWeights::default(),
+            0.001,
+            8.0,
+        )
+        .unwrap();
+        assert_eq!(lqr.kind(), "LQR");
+
+        let mpc = PositionController::<SHOOT_H>::mpc(
+            Mpc1dConfig {
+                weights: LqrWeights::default(),
+                dt_s: 0.001,
+                u_min: -20.0,
+                u_max: 20.0,
+            },
+            Mpc1dConfig {
+                weights: LqrWeights::default(),
+                dt_s: 0.001,
+                u_min: -20.0,
+                u_max: 20.0,
+            },
+            25,
+            8.0,
+        )
+        .unwrap();
+        assert_eq!(mpc.kind(), "MPC");
+
+        let lqi = PositionController::<SHOOT_H>::lqi(
+            LqiWeights::default(),
+            LqiWeights::default(),
+            0.001,
+            8.0,
+            5.0,
+        )
+        .unwrap();
+        assert_eq!(lqi.kind(), "LQI");
+    }
+
+    #[test]
+    fn controller_enum_each_variant_holds_hover_at_origin() {
+        // At the setpoint with zero velocity, every controller should
+        // command exactly hover thrust and level attitude — the cheap
+        // cross-variant "do nothing when nothing is needed" check.
+        let hover = default_mass() * GRAVITY_M_S2;
+        let cases: [PositionController<SHOOT_H>; 4] = [
+            PositionController::pi(PositionGains::default()),
+            PositionController::lqr(LqrWeights::default(), LqrWeights::default(), 0.001, 8.0)
+                .unwrap(),
+            PositionController::mpc(
+                Mpc1dConfig {
+                    weights: LqrWeights::default(),
+                    dt_s: 0.001,
+                    u_min: -20.0,
+                    u_max: 20.0,
+                },
+                Mpc1dConfig {
+                    weights: LqrWeights::default(),
+                    dt_s: 0.001,
+                    u_min: -20.0,
+                    u_max: 20.0,
+                },
+                20,
+                8.0,
+            )
+            .unwrap(),
+            PositionController::lqi(
+                LqiWeights::default(),
+                LqiWeights::default(),
+                0.001,
+                8.0,
+                5.0,
+            )
+            .unwrap(),
+        ];
+        for mut c in cases {
+            let kind = c.kind();
+            let out = c.step(
+                &Setpoint::default(),
+                Vector3::zeros(),
+                Vector3::zeros(),
+                default_mass(),
+                0.001,
+            );
+            assert!(
+                (out.thrust_n - hover).abs() < 1.0e-3,
+                "{kind} hover err {}",
+                (out.thrust_n - hover).abs()
+            );
+            assert!(
+                out.q_desired.i.abs() < 1.0e-3 && out.q_desired.j.abs() < 1.0e-3,
+                "{kind} attitude not level"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_enum_reset_clears_state() {
+        // Drive each stateful variant with a non-zero error so internal
+        // buffers populate, then `reset` — verify state is zero by
+        // stepping again from the origin and seeing a pure-gain
+        // response (which, here, is just hover again).
+        let hover = default_mass() * GRAVITY_M_S2;
+        let disturbing_sp = Setpoint {
+            position_ned: Vector3::new(0.0, 0.0, -5.0),
+            ..Setpoint::default()
+        };
+        let variants: [fn() -> PositionController<SHOOT_H>; 3] = [
+            || {
+                PositionController::pi(PositionGains {
+                    k_i_vel: Vector3::new(0.5, 0.5, 0.5),
+                    ..PositionGains::default()
+                })
+            },
+            || {
+                PositionController::mpc(
+                    Mpc1dConfig {
+                        weights: LqrWeights::default(),
+                        dt_s: 0.001,
+                        u_min: -20.0,
+                        u_max: 20.0,
+                    },
+                    Mpc1dConfig {
+                        weights: LqrWeights::default(),
+                        dt_s: 0.001,
+                        u_min: -20.0,
+                        u_max: 20.0,
+                    },
+                    20,
+                    8.0,
+                )
+                .unwrap()
+            },
+            || {
+                PositionController::lqi(
+                    LqiWeights::default(),
+                    LqiWeights::default(),
+                    0.001,
+                    8.0,
+                    5.0,
+                )
+                .unwrap()
+            },
+        ];
+        for make in variants {
+            let mut c = make();
+            let kind = c.kind();
+            // Drive a few steps far from setpoint.
+            for _ in 0..50 {
+                c.step(
+                    &disturbing_sp,
+                    Vector3::zeros(),
+                    Vector3::zeros(),
+                    default_mass(),
+                    0.001,
+                );
+            }
+            c.reset();
+            // With state cleared and zero error, output should be hover.
+            let out = c.step(
+                &Setpoint::default(),
+                Vector3::zeros(),
+                Vector3::zeros(),
+                default_mass(),
+                0.001,
+            );
+            assert!(
+                (out.thrust_n - hover).abs() < 1.0e-3,
+                "{kind} after reset thrust {}, expected {}",
+                out.thrust_n,
+                hover
+            );
+        }
     }
 
     // ------------------------------------------------------------------

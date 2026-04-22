@@ -737,6 +737,195 @@ mod tests {
         );
     }
 
+    /// Drive the SITL with any `PositionController` variant. Shared
+    /// harness for the M9.4 shootout — one function, four controllers.
+    fn run_closed_loop_with_controller<const H: usize>(
+        sim_cfg: &SimConfig,
+        seed: u64,
+        steps: usize,
+        mut controller: algo_nmpc::PositionController<H>,
+    ) -> SimState {
+        use algo_indi::attitude_to_rate;
+        use algo_nmpc::Setpoint;
+        use app_copter::{
+            ArmState, FlightState, apply_baro_measurement, apply_gps_measurement,
+            apply_mag_measurement, default_config_250g, rate_loop_step,
+        };
+
+        let mut sim_state = SimState {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..SimState::default()
+        };
+        let mut rng = SimRng::new(seed);
+        let dt = 0.001_f32;
+        let mut app_cfg = default_config_250g();
+
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
+        let _ = apply_baro_measurement(&mut flight, &sense_baro(sim_cfg, &sim_state, &mut rng));
+        let _ = apply_gps_measurement(&mut flight, &sense_gps(sim_cfg, &sim_state, &mut rng));
+        let setpoint = Setpoint {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..Setpoint::default()
+        };
+
+        for i in 0..steps {
+            let accel_w = accel_world(sim_cfg, &sim_state);
+            let imu = sense_imu(sim_cfg, &sim_state, accel_w, &mut rng);
+
+            let att = controller.step(
+                &setpoint,
+                flight.state.position_ned,
+                flight.state.velocity_ned,
+                app_cfg.mass_kg,
+                dt,
+            );
+            let rate_cmd =
+                attitude_to_rate(flight.state.attitude, att.q_desired, &app_cfg.k_attitude);
+            let saved_hover = app_cfg.hover_thrust_n;
+            app_cfg.hover_thrust_n = att.thrust_n;
+            let out = rate_loop_step(&mut app_cfg, &mut flight, imu, dt, rate_cmd);
+            app_cfg.hover_thrust_n = saved_hover;
+            step(sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
+
+            if i % 200 == 0 {
+                let _ =
+                    apply_gps_measurement(&mut flight, &sense_gps(sim_cfg, &sim_state, &mut rng));
+            }
+            if i % 40 == 0 {
+                let _ =
+                    apply_mag_measurement(&mut flight, &sense_mag(sim_cfg, &sim_state, &mut rng));
+            }
+            if i % 20 == 0 {
+                let _ =
+                    apply_baro_measurement(&mut flight, &sense_baro(sim_cfg, &sim_state, &mut rng));
+            }
+        }
+        sim_state
+    }
+
+    #[test]
+    fn controller_shootout_ideal_sim_all_variants_hover() {
+        // Ideal sim: every controller should keep the vehicle within
+        // 25 cm of the 1 m altitude setpoint in 3 s.
+        use algo_nmpc::{LqiWeights, LqrWeights, Mpc1dConfig, PositionController, PositionGains};
+        let sim_cfg = SimConfig::default();
+        let dt = 0.001_f32;
+
+        let controllers: [PositionController<10>; 4] = [
+            PositionController::pi(PositionGains::default()),
+            PositionController::lqr(
+                LqrWeights::default(),
+                LqrWeights::default(),
+                dt,
+                PositionGains::default().max_accel,
+            )
+            .unwrap(),
+            PositionController::mpc(
+                Mpc1dConfig {
+                    weights: LqrWeights::default(),
+                    dt_s: dt,
+                    u_min: -20.0,
+                    u_max: 20.0,
+                },
+                Mpc1dConfig {
+                    weights: LqrWeights::default(),
+                    dt_s: dt,
+                    u_min: -20.0,
+                    u_max: 20.0,
+                },
+                25,
+                PositionGains::default().max_accel,
+            )
+            .unwrap(),
+            PositionController::lqi(
+                LqiWeights::default(),
+                LqiWeights::default(),
+                dt,
+                PositionGains::default().max_accel,
+                5.0,
+            )
+            .unwrap(),
+        ];
+        for ctrl in controllers {
+            let kind = ctrl.kind();
+            let sim = run_closed_loop_with_controller(&sim_cfg, 1, 3000, ctrl);
+            let alt_err = (-sim.position_ned.z - 1.0).abs();
+            let horiz_err = (sim.position_ned.x.powi(2) + sim.position_ned.y.powi(2)).sqrt();
+            assert!(
+                alt_err < 0.25 && horiz_err < 0.25,
+                "{kind} alt {alt_err} horiz {horiz_err}"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_shootout_realistic_sim_bias_tolerant_variants_win() {
+        // Realistic sim with drag + wind: only controllers with
+        // integral action (PI with k_i>0 and LQI) can eliminate the
+        // steady-state bias. We assert the integrating variants land
+        // inside 0.6 m altitude error, while LQR (bias-blind) is given
+        // the looser 1 m bound — the point of this test is to document
+        // the regime separation, not to fail on LQR.
+        use algo_nmpc::{LqiWeights, LqrWeights, PositionController, PositionGains};
+        let sim_cfg = SimConfig::realistic_dynamics(Vector3::new(2.0, -1.0, 0.0));
+        let dt = 0.001_f32;
+
+        // Integrating controllers — should hold tight.
+        let tight_cases: [(PositionController<10>, &str); 2] = [
+            (
+                PositionController::pi(PositionGains {
+                    k_i_vel: Vector3::new(0.5, 0.5, 0.8),
+                    ..PositionGains::default()
+                }),
+                "PI+I",
+            ),
+            (
+                PositionController::lqi(
+                    LqiWeights {
+                        q_pos: 4.0,
+                        q_vel: 1.0,
+                        q_i: 1.5,
+                        r: 0.5,
+                    },
+                    LqiWeights {
+                        q_pos: 4.0,
+                        q_vel: 1.0,
+                        q_i: 1.5,
+                        r: 0.5,
+                    },
+                    dt,
+                    PositionGains::default().max_accel,
+                    5.0,
+                )
+                .unwrap(),
+                "LQI",
+            ),
+        ];
+        for (ctrl, name) in tight_cases {
+            let sim = run_closed_loop_with_controller(&sim_cfg, 7, 15_000, ctrl);
+            let alt_err = (-sim.position_ned.z - 1.0).abs();
+            assert!(alt_err < 0.6, "{name} alt_err {alt_err}m ≥ 0.6m");
+        }
+
+        // Bias-blind LQR — loose bound, this is the regime limitation.
+        let lqr = PositionController::<10>::lqr(
+            LqrWeights::default(),
+            LqrWeights::default(),
+            dt,
+            PositionGains::default().max_accel,
+        )
+        .unwrap();
+        let sim = run_closed_loop_with_controller(&sim_cfg, 7, 15_000, lqr);
+        let alt_err = (-sim.position_ned.z - 1.0).abs();
+        assert!(
+            alt_err < 2.0,
+            "LQR alt_err {alt_err}m ≥ 2.0m (stability lower bound)"
+        );
+    }
+
     #[test]
     fn mpc_closed_loop_sitl_hovers_to_setpoint() {
         // M9.2 smoke test: three-axis MPC controller hovers the vehicle
