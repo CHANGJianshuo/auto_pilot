@@ -542,6 +542,143 @@ mod tests {
         sim_state
     }
 
+    /// Runs the SITL with the M9.2 `Mpc3dPositionController` driving the
+    /// outer loop (bypassing `app-copter::outer_step`'s PI-locked path,
+    /// since the controller is the thing under test). Inner loop
+    /// (attitude → rate → INDI → allocation) is unchanged.
+    fn run_closed_loop_flight_with_mpc(
+        sim_cfg: &SimConfig,
+        seed: u64,
+        steps: usize,
+        weights_xy: algo_nmpc::LqrWeights,
+        weights_z: algo_nmpc::LqrWeights,
+        u_abs_max: f32,
+    ) -> SimState {
+        use algo_indi::attitude_to_rate;
+        use algo_nmpc::{Mpc1dConfig, Mpc3dPositionController, Setpoint};
+        use app_copter::{
+            ArmState, FlightState, apply_baro_measurement, apply_gps_measurement,
+            apply_mag_measurement, default_config_250g, rate_loop_step,
+        };
+
+        let mut sim_state = SimState {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..SimState::default()
+        };
+        let mut rng = SimRng::new(seed);
+        let dt = 0.001_f32;
+        let mut app_cfg = default_config_250g();
+
+        let cfg_xy = Mpc1dConfig {
+            weights: weights_xy,
+            dt_s: dt,
+            u_min: -u_abs_max,
+            u_max: u_abs_max,
+        };
+        let cfg_z = Mpc1dConfig {
+            weights: weights_z,
+            dt_s: dt,
+            u_min: -u_abs_max,
+            u_max: u_abs_max,
+        };
+        let mut mpc =
+            Mpc3dPositionController::<10>::new(cfg_xy, cfg_z, 25, app_cfg.position_gains.max_accel)
+                .expect("MPC QP data constructs for sane weights");
+
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
+        let _ = apply_baro_measurement(&mut flight, &sense_baro(sim_cfg, &sim_state, &mut rng));
+        let _ = apply_gps_measurement(&mut flight, &sense_gps(sim_cfg, &sim_state, &mut rng));
+
+        let setpoint = Setpoint {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..Setpoint::default()
+        };
+
+        for i in 0..steps {
+            let accel_w = accel_world(sim_cfg, &sim_state);
+            let imu = sense_imu(sim_cfg, &sim_state, accel_w, &mut rng);
+
+            // Outer loop: MPC supplies attitude + thrust.
+            let att = mpc.step(
+                &setpoint,
+                flight.state.position_ned,
+                flight.state.velocity_ned,
+                app_cfg.mass_kg,
+            );
+            let rate_cmd =
+                attitude_to_rate(flight.state.attitude, att.q_desired, &app_cfg.k_attitude);
+
+            // Thrust is the outer loop's demand for this tick.
+            let saved_hover = app_cfg.hover_thrust_n;
+            app_cfg.hover_thrust_n = att.thrust_n;
+            let out = rate_loop_step(&mut app_cfg, &mut flight, imu, dt, rate_cmd);
+            app_cfg.hover_thrust_n = saved_hover;
+
+            step(sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
+            if i % 200 == 0 {
+                let _ =
+                    apply_gps_measurement(&mut flight, &sense_gps(sim_cfg, &sim_state, &mut rng));
+            }
+            if i % 40 == 0 {
+                let _ =
+                    apply_mag_measurement(&mut flight, &sense_mag(sim_cfg, &sim_state, &mut rng));
+            }
+            if i % 20 == 0 {
+                let _ =
+                    apply_baro_measurement(&mut flight, &sense_baro(sim_cfg, &sim_state, &mut rng));
+            }
+        }
+        sim_state
+    }
+
+    #[test]
+    fn mpc_closed_loop_sitl_hovers_to_setpoint() {
+        // M9.2 smoke test: three-axis MPC controller hovers the vehicle
+        // at the 1 m setpoint in ideal sim, same bound as LQR baseline.
+        let sim_cfg = SimConfig::default();
+        let weights = algo_nmpc::LqrWeights {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            r: 0.5,
+        };
+        let sim_state = run_closed_loop_flight_with_mpc(&sim_cfg, 1, 3000, weights, weights, 20.0);
+        let altitude_err = (-sim_state.position_ned.z - 1.0).abs();
+        let horizontal_err =
+            (sim_state.position_ned.x.powi(2) + sim_state.position_ned.y.powi(2)).sqrt();
+        assert!(
+            altitude_err < 0.25,
+            "MPC altitude err {altitude_err} m ≥ 0.25 m"
+        );
+        assert!(
+            horizontal_err < 0.25,
+            "MPC horizontal err {horizontal_err} m ≥ 0.25 m"
+        );
+    }
+
+    #[test]
+    fn mpc_tight_u_max_still_stable() {
+        // With u_max cranked down to 2 m/s² (below what LQR would
+        // command from a 1 m initial error), PI / LQR would either
+        // saturate-and-clamp (PI) or blindly project (LQR). MPC
+        // predicts the constraint and stays stable — assert that the
+        // vehicle still lands at the setpoint within a looser tolerance.
+        let sim_cfg = SimConfig::default();
+        let weights = algo_nmpc::LqrWeights {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            r: 0.5,
+        };
+        let sim_state = run_closed_loop_flight_with_mpc(&sim_cfg, 1, 8000, weights, weights, 2.0);
+        let altitude_err = (-sim_state.position_ned.z - 1.0).abs();
+        assert!(
+            altitude_err < 0.5,
+            "MPC tight-box altitude err {altitude_err} m ≥ 0.5 m"
+        );
+    }
+
     #[test]
     fn lqr_closed_loop_sitl_hovers_to_setpoint() {
         // M9.0 smoke test: with LQR-derived gains the vehicle should

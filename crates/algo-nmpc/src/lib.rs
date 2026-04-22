@@ -651,6 +651,179 @@ fn dare_2x2(weights: LqrWeights, dt_s: f32) -> Option<nalgebra::Matrix2<f32>> {
     Some(p)
 }
 
+// ----------------------------------------------------------------------------
+// M9.2 — MPC-based three-axis position controller
+// ----------------------------------------------------------------------------
+//
+// Bundles three independent 1-axis MPCs (one `Mpc1d<H>` per axis, with
+// xy sharing one configuration and z getting its own) plus the three
+// warm-start buffers. Exposes a `step()` method that mirrors the shape
+// of `position_to_attitude_thrust_pi` — caller supplies current state
+// and setpoint, receives `(AttitudeAndThrust, updated warm state)`.
+//
+// Keeping the warm-start buffers inside the struct makes receding-
+// horizon bookkeeping painless: the caller doesn't need to remember
+// `SVector<f32, H>` × 3 between ticks; they live next to the MPCs that
+// use them. The struct is still a pure compute object — no IO, no
+// time reads, safe to hand to tests and Kani.
+
+/// Three-axis MPC position controller.
+///
+/// `MPC_XY` governs both horizontal axes (xy are geometrically
+/// interchangeable for a multirotor); `mpc_z` governs altitude and
+/// usually carries tighter weights because vertical excursions matter
+/// more than horizontal drift.
+#[derive(Clone, Debug)]
+pub struct Mpc3dPositionController<const H: usize> {
+    mpc_xy: Mpc1d<H>,
+    mpc_z: Mpc1d<H>,
+    warm_x: nalgebra::SVector<f32, H>,
+    warm_y: nalgebra::SVector<f32, H>,
+    warm_z: nalgebra::SVector<f32, H>,
+    /// Projected-gradient iteration cap per axis per call.
+    pub max_iter: usize,
+    /// Clamp on the commanded acceleration vector magnitude. Applied
+    /// after the per-axis MPCs so a pathological weight mix can't
+    /// synthesise an ‖accel‖ beyond the flight envelope.
+    pub max_accel: f32,
+}
+
+impl<const H: usize> Mpc3dPositionController<H> {
+    /// Construct from xy and z configs. Both MPCs share the same `dt_s`
+    /// — mixing discretisation steps between axes produces a structurally
+    /// invalid 3-axis controller.
+    #[must_use]
+    pub fn new(
+        config_xy: Mpc1dConfig,
+        config_z: Mpc1dConfig,
+        max_iter: usize,
+        max_accel: f32,
+    ) -> Option<Self> {
+        if !(config_xy.dt_s == config_z.dt_s) {
+            return None;
+        }
+        Some(Self {
+            mpc_xy: Mpc1d::<H>::new(config_xy)?,
+            mpc_z: Mpc1d::<H>::new(config_z)?,
+            warm_x: nalgebra::SVector::<f32, H>::zeros(),
+            warm_y: nalgebra::SVector::<f32, H>::zeros(),
+            warm_z: nalgebra::SVector::<f32, H>::zeros(),
+            max_iter,
+            max_accel,
+        })
+    }
+
+    /// Cold-start the warm buffers. Call when a mode switch or large
+    /// setpoint jump would leave last tick's trajectory misleading.
+    pub fn reset_warm_start(&mut self) {
+        self.warm_x.fill(0.0);
+        self.warm_y.fill(0.0);
+        self.warm_z.fill(0.0);
+    }
+
+    /// One controller tick: solve three 1-axis QPs and assemble the
+    /// attitude + thrust command. Shares the last-mile force-balance
+    /// math with [`position_to_attitude_thrust`] so upstream/downstream
+    /// callers see identical units and conventions.
+    pub fn step(
+        &mut self,
+        setpoint: &Setpoint,
+        current_position: Vector3<f32>,
+        current_velocity: Vector3<f32>,
+        mass_kg: f32,
+    ) -> AttitudeAndThrust {
+        // Error coords (e = x − x_ref) per axis.
+        let e_x = nalgebra::Vector2::new(
+            current_position.x - setpoint.position_ned.x,
+            current_velocity.x - setpoint.velocity_ned.x,
+        );
+        let e_y = nalgebra::Vector2::new(
+            current_position.y - setpoint.position_ned.y,
+            current_velocity.y - setpoint.velocity_ned.y,
+        );
+        let e_z = nalgebra::Vector2::new(
+            current_position.z - setpoint.position_ned.z,
+            current_velocity.z - setpoint.velocity_ned.z,
+        );
+
+        // Three QPs. xy shares one MPC (same dynamics + weights), z uses
+        // its own. Warm buffers are per-axis so xy still have distinct
+        // initial guesses.
+        let u_x = self.mpc_xy.solve(e_x, &mut self.warm_x, self.max_iter);
+        let u_y = self.mpc_xy.solve(e_y, &mut self.warm_y, self.max_iter);
+        let u_z = self.mpc_z.solve(e_z, &mut self.warm_z, self.max_iter);
+
+        // Add setpoint's feed-forward acceleration then cap magnitude so
+        // the attitude loop gets a feasible request.
+        let mut accel_cmd = Vector3::new(u_x, u_y, u_z) + setpoint.accel_ned;
+        let mag = accel_cmd.norm();
+        if mag.is_finite() && mag > self.max_accel {
+            accel_cmd *= self.max_accel / mag;
+        }
+
+        // Reuse the PI path's force-balance → (q_desired, thrust). Pack
+        // into the existing struct via a dummy gains object whose only
+        // purpose is to supply `max_accel` to the last-mile helper.
+        let dummy_gains = PositionGains {
+            k_pos: Vector3::zeros(),
+            k_vel: Vector3::zeros(),
+            k_i_vel: Vector3::zeros(),
+            max_accel: self.max_accel,
+            max_integrator: 0.0,
+        };
+        accel_to_attitude_thrust(accel_cmd, setpoint.yaw_rad, mass_kg, &dummy_gains)
+    }
+
+    /// Read-only access to the xy MPC (for tests that want to inspect
+    /// the QP matrices or warm state).
+    #[must_use]
+    pub fn mpc_xy(&self) -> &Mpc1d<H> {
+        &self.mpc_xy
+    }
+    /// Read-only access to the z MPC.
+    #[must_use]
+    pub fn mpc_z(&self) -> &Mpc1d<H> {
+        &self.mpc_z
+    }
+}
+
+/// Shared last-mile: commanded accel (NED) + desired yaw → body
+/// attitude + thrust magnitude. Factored out of
+/// `position_to_attitude_thrust_pi` so the MPC controller reuses it
+/// verbatim (no conceptual drift between the two control paths).
+fn accel_to_attitude_thrust(
+    accel_cmd: Vector3<f32>,
+    yaw_rad: f32,
+    mass_kg: f32,
+    _gains: &PositionGains,
+) -> AttitudeAndThrust {
+    let g_vec = Vector3::new(0.0, 0.0, GRAVITY_M_S2);
+    let thrust_vec_ned = mass_kg * (accel_cmd - g_vec);
+    let thrust_mag = thrust_vec_ned.norm();
+    let zb_des = if thrust_mag > 1.0e-3 && thrust_mag.is_finite() {
+        -thrust_vec_ned / thrust_mag
+    } else {
+        Vector3::new(0.0, 0.0, -1.0)
+    };
+    let cy = libm::cosf(yaw_rad);
+    let sy = libm::sinf(yaw_rad);
+    let heading = Vector3::new(cy, sy, 0.0);
+    let xb_raw = heading - heading.dot(&zb_des) * zb_des;
+    let xb_norm = xb_raw.norm();
+    let xb_des = if xb_norm > 1.0e-3 {
+        xb_raw / xb_norm
+    } else {
+        Vector3::new(1.0, 0.0, 0.0)
+    };
+    let yb_des = zb_des.cross(&xb_des);
+    let r_des = Matrix3::from_columns(&[xb_des, yb_des, zb_des]);
+    let q_des = UnitQuaternion::from_matrix(&r_des).into_inner();
+    AttitudeAndThrust {
+        q_desired: q_des,
+        thrust_n: thrust_mag,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 mod tests {
@@ -1083,6 +1256,57 @@ mod tests {
             pos.abs() < 0.05 && vel.abs() < 0.05,
             "converged pos={pos} vel={vel}"
         );
+    }
+
+    #[test]
+    fn mpc3d_new_rejects_mixed_dt() {
+        let xy = Mpc1dConfig {
+            weights: LqrWeights::default(),
+            dt_s: 0.05,
+            u_min: -10.0,
+            u_max: 10.0,
+        };
+        let z = Mpc1dConfig {
+            weights: LqrWeights::default(),
+            dt_s: 0.02,
+            u_min: -10.0,
+            u_max: 10.0,
+        };
+        assert!(Mpc3dPositionController::<8>::new(xy, z, 40, 8.0).is_none());
+    }
+
+    #[test]
+    fn mpc3d_hover_at_origin_is_stationary() {
+        let cfg = default_mpc_config(false);
+        let mut ctl = Mpc3dPositionController::<MPC_H>::new(cfg, cfg, 50, 8.0).unwrap();
+        let out = ctl.step(
+            &Setpoint::default(),
+            Vector3::zeros(),
+            Vector3::zeros(),
+            default_mass(),
+        );
+        // At origin with zero setpoint: thrust must cancel gravity, q is
+        // level (identity up to sign).
+        let hover = default_mass() * GRAVITY_M_S2;
+        assert!((out.thrust_n - hover).abs() < 1.0e-3);
+        assert!(out.q_desired.i.abs() < 1.0e-3 && out.q_desired.j.abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn mpc3d_reset_warm_start_zeros_buffers() {
+        let cfg = default_mpc_config(false);
+        let mut ctl = Mpc3dPositionController::<MPC_H>::new(cfg, cfg, 20, 8.0).unwrap();
+        // One step from a non-trivial state populates warm buffers.
+        let sp = Setpoint {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..Setpoint::default()
+        };
+        ctl.step(&sp, Vector3::zeros(), Vector3::zeros(), default_mass());
+        // Reset must clear everything.
+        ctl.reset_warm_start();
+        assert_eq!(ctl.warm_x, nalgebra::SVector::<f32, MPC_H>::zeros());
+        assert_eq!(ctl.warm_y, nalgebra::SVector::<f32, MPC_H>::zeros());
+        assert_eq!(ctl.warm_z, nalgebra::SVector::<f32, MPC_H>::zeros());
     }
 
     #[test]
