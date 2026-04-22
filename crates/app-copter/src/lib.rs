@@ -67,6 +67,9 @@ pub struct RateLoopConfig {
     /// Commanded descent rate (m/s, positive = downward in NED) while
     /// [`LandingState::Landing`] is active.
     pub landing_descent_mps: f32,
+    /// Commanded climb rate (m/s, magnitude — NED conversion handled
+    /// internally) while [`TakeoffState::TakingOff`] is active.
+    pub takeoff_climb_mps: f32,
 }
 
 /// Whether the vehicle is allowed to drive its motors.
@@ -92,6 +95,62 @@ pub enum LandingState {
     #[default]
     Idle,
     Landing,
+}
+
+/// Automatic climb-to-altitude state machine.
+///
+/// `Idle`: vehicle follows the caller's setpoint as usual.
+/// `TakingOff { target_z_ned }`: `outer_step` holds home x/y and pushes
+/// the z setpoint toward `target_z_ned`. Completes when the vehicle
+/// sits within 0.3 m of target for 1 s, at which point state returns
+/// to `Idle` — the caller then resumes providing setpoints.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum TakeoffState {
+    #[default]
+    Idle,
+    TakingOff {
+        target_z_ned: f32,
+    },
+}
+
+/// Detects that the vehicle has reached and settled at its takeoff
+/// altitude. Parallels [`TouchdownDetector`] but checks "close to
+/// commanded z" rather than "close to ground".
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AltitudeReachedDetector {
+    settled_s: f32,
+}
+
+impl AltitudeReachedDetector {
+    pub const Z_TOLERANCE_M: f32 = 0.3;
+    pub const VZ_TOLERANCE_MPS: f32 = 0.3;
+    pub const SETTLE_TIME_S: f32 = 1.0;
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { settled_s: 0.0 }
+    }
+
+    pub fn reset(&mut self) {
+        self.settled_s = 0.0;
+    }
+
+    pub fn observe(
+        &mut self,
+        position_z_ned: f32,
+        velocity_z_ned: f32,
+        target_z_ned: f32,
+        dt_s: f32,
+    ) -> bool {
+        let alt_ok = (position_z_ned - target_z_ned).abs() < Self::Z_TOLERANCE_M;
+        let vz_ok = velocity_z_ned.abs() < Self::VZ_TOLERANCE_MPS;
+        if alt_ok && vz_ok {
+            self.settled_s += dt_s;
+        } else {
+            self.settled_s = 0.0;
+        }
+        self.settled_s >= Self::SETTLE_TIME_S
+    }
 }
 
 /// Detects that the vehicle has come to rest on the ground.
@@ -158,6 +217,15 @@ pub struct FlightState {
     pub landing_state: LandingState,
     /// Touchdown detector; advanced by `outer_step` while landing.
     pub touchdown_detector: TouchdownDetector,
+    /// Automatic-takeoff mode.
+    pub takeoff_state: TakeoffState,
+    /// Altitude-reached detector, advanced by `outer_step` while in
+    /// `TakingOff`.
+    pub altitude_reached_detector: AltitudeReachedDetector,
+    /// Position latched at first arm. Used as the reference for TAKEOFF
+    /// (climb target = home + (0,0,-alt)) and future RTL (return target
+    /// = home xy). `None` until the vehicle has been armed once.
+    pub home_position_ned: Option<Vector3<f32>>,
 }
 
 impl Default for FlightState {
@@ -173,6 +241,9 @@ impl Default for FlightState {
             arm_state: ArmState::default(),
             landing_state: LandingState::default(),
             touchdown_detector: TouchdownDetector::new(),
+            takeoff_state: TakeoffState::default(),
+            altitude_reached_detector: AltitudeReachedDetector::new(),
+            home_position_ned: None,
         }
     }
 }
@@ -308,6 +379,10 @@ pub fn default_config_250g() -> RateLoopConfig {
         // time to notice touchdown before the controller cranks up
         // thrust to chase the ground.
         landing_descent_mps: 0.5,
+        // 1.0 m/s climb during automatic takeoff — quick enough to feel
+        // responsive, slow enough to stay well within the vehicle's
+        // thrust envelope at any payload.
+        takeoff_climb_mps: 1.0,
     }
 }
 
@@ -365,27 +440,45 @@ pub fn outer_step(
     dt_s: f32,
     setpoint: &Setpoint,
 ) -> RateLoopOutput {
-    // Landing override: while `Landing`, hold current horizontal position
-    // and ramp z toward ground at `landing_descent_mps`. Everything else
-    // (wind FF, PI, allocation) stays identical.
-    let landing_sp;
-    let active_sp: &Setpoint = match flight.landing_state {
-        LandingState::Idle => setpoint,
-        LandingState::Landing => {
-            let current_z = flight.state.position_ned.z;
-            let target_z = (current_z + cfg.landing_descent_mps * dt_s).min(0.0);
-            landing_sp = Setpoint {
-                position_ned: Vector3::new(
-                    flight.state.position_ned.x,
-                    flight.state.position_ned.y,
-                    target_z,
-                ),
-                velocity_ned: Vector3::new(0.0, 0.0, cfg.landing_descent_mps),
-                accel_ned: Vector3::zeros(),
-                yaw_rad: setpoint.yaw_rad,
-            };
-            &landing_sp
-        }
+    // Home-latch: record the EKF position on first Armed state.
+    if flight.arm_state == ArmState::Armed && flight.home_position_ned.is_none() {
+        flight.home_position_ned = Some(flight.state.position_ned);
+    }
+
+    // Landing and Takeoff are mutually exclusive mode overrides on the
+    // setpoint. Landing dominates (safer — "descend and disarm" should
+    // always win over "climb"). Otherwise takeoff drives to target_z.
+    let override_sp;
+    let active_sp: &Setpoint = if flight.landing_state == LandingState::Landing {
+        let current_z = flight.state.position_ned.z;
+        let target_z = (current_z + cfg.landing_descent_mps * dt_s).min(0.0);
+        override_sp = Setpoint {
+            position_ned: Vector3::new(
+                flight.state.position_ned.x,
+                flight.state.position_ned.y,
+                target_z,
+            ),
+            velocity_ned: Vector3::new(0.0, 0.0, cfg.landing_descent_mps),
+            accel_ned: Vector3::zeros(),
+            yaw_rad: setpoint.yaw_rad,
+        };
+        &override_sp
+    } else if let TakeoffState::TakingOff { target_z_ned } = flight.takeoff_state {
+        // Hold home xy (or current xy if home not set); drive z toward
+        // target_z_ned. Velocity FF at commanded climb rate.
+        let home_xy = flight
+            .home_position_ned
+            .map_or_else(|| flight.state.position_ned, |h| h);
+        let climb_v = -cfg.takeoff_climb_mps; // NED: climbing = negative z
+        override_sp = Setpoint {
+            position_ned: Vector3::new(home_xy.x, home_xy.y, target_z_ned),
+            velocity_ned: Vector3::new(0.0, 0.0, climb_v),
+            accel_ned: Vector3::zeros(),
+            yaw_rad: setpoint.yaw_rad,
+        };
+        &override_sp
+    } else {
+        setpoint
     };
 
     // Wind feed-forward: add k·wind_estimate to the setpoint's accel
@@ -436,6 +529,21 @@ pub fn outer_step(
             flight.arm_state = ArmState::Disarmed;
             flight.landing_state = LandingState::Idle;
             flight.touchdown_detector.reset();
+        }
+    }
+
+    // Takeoff completion: if we've reached target altitude, flip back
+    // to Idle so the caller's subsequent setpoints take over.
+    if let TakeoffState::TakingOff { target_z_ned } = flight.takeoff_state {
+        let reached = flight.altitude_reached_detector.observe(
+            flight.state.position_ned.z,
+            flight.state.velocity_ned.z,
+            target_z_ned,
+            dt_s,
+        );
+        if reached {
+            flight.takeoff_state = TakeoffState::Idle;
+            flight.altitude_reached_detector.reset();
         }
     }
 
@@ -753,6 +861,77 @@ mod tests {
         let z_airborne = -5.0_f32;
         for _ in 0..5000 {
             assert!(!td.observe(v, z_airborne, 0.001));
+        }
+    }
+
+    #[test]
+    fn home_position_latches_on_first_arm() {
+        let mut cfg = default_config_250g();
+        let mut flight = FlightState::default();
+        assert!(flight.home_position_ned.is_none());
+        // First call with Disarmed — no latch.
+        let _ = outer_step(
+            &mut cfg,
+            &mut flight,
+            stationary_imu(0),
+            0.001,
+            &Setpoint::default(),
+        );
+        assert!(flight.home_position_ned.is_none());
+        // Arm and move "vehicle" — latch should happen on next outer_step
+        // and capture current estimate.
+        flight.arm_state = ArmState::Armed;
+        flight.state.position_ned = Vector3::new(1.0, 2.0, -3.0);
+        let _ = outer_step(
+            &mut cfg,
+            &mut flight,
+            stationary_imu(0),
+            0.001,
+            &Setpoint::default(),
+        );
+        assert_eq!(flight.home_position_ned, Some(Vector3::new(1.0, 2.0, -3.0)));
+        // Moving afterwards must not overwrite.
+        flight.state.position_ned = Vector3::new(5.0, 5.0, -5.0);
+        let _ = outer_step(
+            &mut cfg,
+            &mut flight,
+            stationary_imu(0),
+            0.001,
+            &Setpoint::default(),
+        );
+        assert_eq!(flight.home_position_ned, Some(Vector3::new(1.0, 2.0, -3.0)));
+    }
+
+    #[test]
+    fn takeoff_mode_drives_z_toward_target_and_completes() {
+        let mut cfg = default_config_250g();
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            takeoff_state: TakeoffState::TakingOff { target_z_ned: -5.0 },
+            ..FlightState::default()
+        };
+        // Vehicle already hovering at target.
+        flight.state.position_ned = Vector3::new(0.0, 0.0, -5.0);
+        flight.state.velocity_ned = Vector3::zeros();
+        let imu = stationary_imu(0);
+        for _ in 0..1200 {
+            let _ = outer_step(&mut cfg, &mut flight, imu, 0.001, &Setpoint::default());
+        }
+        assert_eq!(flight.takeoff_state, TakeoffState::Idle);
+    }
+
+    #[test]
+    fn altitude_reached_detector_fires_and_resets() {
+        let mut d = AltitudeReachedDetector::new();
+        // Within tolerance + quiet velocity — accumulates.
+        for _ in 0..1100 {
+            let _ = d.observe(-5.0, 0.0, -5.0, 0.001);
+        }
+        assert!(d.observe(-5.0, 0.0, -5.0, 0.001));
+        d.reset();
+        // Too fast → never settles.
+        for _ in 0..2000 {
+            assert!(!d.observe(-5.0, 1.0, -5.0, 0.001));
         }
     }
 

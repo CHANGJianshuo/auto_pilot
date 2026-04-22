@@ -18,8 +18,8 @@
 use algo_ekf::GRAVITY_M_S2;
 use algo_nmpc::Setpoint;
 use app_copter::{
-    ArmState, FlightState, LandingState, apply_baro_measurement, apply_gps_measurement,
-    apply_mag_measurement, default_config_250g, outer_step,
+    ArmState, FlightState, LandingState, TakeoffState, apply_baro_measurement,
+    apply_gps_measurement, apply_mag_measurement, default_config_250g, outer_step,
 };
 use mavlink::common::{MavCmd, MavMessage, MavResult};
 use nalgebra::Vector3;
@@ -27,7 +27,7 @@ use sim_hil::{
     SimConfig, SimRng, SimState, accel_world,
     mavlink_udp::{
         MavlinkUdpSink, arm_change_from_mav_message, land_request_from_mav_message,
-        setpoint_from_mav_message,
+        setpoint_from_mav_message, takeoff_request_from_mav_message,
     },
     sense_baro, sense_gps, sense_imu, sense_mag, step,
 };
@@ -70,8 +70,19 @@ async fn main() -> anyhow::Result<()> {
     let landing_state = Arc::new(Mutex::new(LandingState::Idle));
     let landing_state_sim = Arc::clone(&landing_state);
 
+    // Shared takeoff state. TAKEOFF command flips it to TakingOff with
+    // a target z; altitude-reached detector in outer_step flips back.
+    let takeoff_state = Arc::new(Mutex::new(TakeoffState::Idle));
+    let takeoff_state_sim = Arc::clone(&takeoff_state);
+
     let sim_task = tokio::task::spawn_blocking(move || {
-        run_sim(tx, setpoint_sim, arm_state_sim, landing_state_sim)
+        run_sim(
+            tx,
+            setpoint_sim,
+            arm_state_sim,
+            landing_state_sim,
+            takeoff_state_sim,
+        )
     });
 
     let start = Instant::now();
@@ -121,14 +132,30 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            if let Some(altitude_m) = takeoff_request_from_mav_message(&msg) {
+                // TAKEOFF implies ARM: if the GCS sends TAKEOFF, the
+                // operator wants to fly — auto-arm so the demo does the
+                // intuitive thing (the real vehicle should do preflight
+                // first — M6.3 follow-up).
+                if let Ok(mut a) = arm_state.lock() {
+                    *a = ArmState::Armed;
+                }
+                if let Ok(mut t) = takeoff_state.lock() {
+                    // NED: positive altitude → negative z.
+                    *t = TakeoffState::TakingOff {
+                        target_z_ned: -altitude_m,
+                    };
+                    tracing::info!(altitude_m, "TAKEOFF command received — climbing to target");
+                }
+            }
             // Ack any COMMAND_LONG so the GCS doesn't sit waiting. We
-            // accept both commands we understand (ARM_DISARM, NAV_LAND)
-            // and reply UNSUPPORTED for anything else.
+            // accept commands we understand and reply UNSUPPORTED for
+            // anything else.
             if let MavMessage::COMMAND_LONG(data) = &msg {
                 let result = match data.command {
-                    MavCmd::MAV_CMD_COMPONENT_ARM_DISARM | MavCmd::MAV_CMD_NAV_LAND => {
-                        MavResult::MAV_RESULT_ACCEPTED
-                    }
+                    MavCmd::MAV_CMD_COMPONENT_ARM_DISARM
+                    | MavCmd::MAV_CMD_NAV_LAND
+                    | MavCmd::MAV_CMD_NAV_TAKEOFF => MavResult::MAV_RESULT_ACCEPTED,
                     _ => MavResult::MAV_RESULT_UNSUPPORTED,
                 };
                 sink.send_command_ack(data.command, result).await.ok();
@@ -184,6 +211,7 @@ fn run_sim(
     setpoint: Arc<Mutex<Setpoint>>,
     arm_state: Arc<Mutex<ArmState>>,
     landing_state: Arc<Mutex<LandingState>>,
+    takeoff_state: Arc<Mutex<TakeoffState>>,
 ) {
     let sim_cfg = SimConfig::realistic_dynamics(Vector3::zeros());
     let mut sim_state = SimState {
@@ -213,16 +241,24 @@ fn run_sim(
             .lock()
             .map(|l| *l)
             .unwrap_or(LandingState::Idle);
+        flight.takeoff_state = takeoff_state
+            .lock()
+            .map(|t| *t)
+            .unwrap_or(TakeoffState::Idle);
 
         let out = outer_step(&mut app_cfg, &mut flight, imu, dt, &current_sp);
 
-        // outer_step may auto-disarm + clear landing on touchdown — push
-        // both back so the telemetry task sees the change.
+        // outer_step may auto-disarm, clear landing, or finish takeoff
+        // — push all three back so the telemetry task and the GCS-
+        // facing shared state reflect the latest reality.
         if let Ok(mut shared) = arm_state.lock() {
             *shared = flight.arm_state;
         }
         if let Ok(mut shared) = landing_state.lock() {
             *shared = flight.landing_state;
+        }
+        if let Ok(mut shared) = takeoff_state.lock() {
+            *shared = flight.takeoff_state;
         }
         step(&sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
 

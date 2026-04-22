@@ -49,6 +49,24 @@ pub fn setpoint_from_mav_message(msg: &MavMessage) -> Option<Setpoint> {
     }
 }
 
+/// Returns `Some(altitude_m)` if `msg` is a COMMAND_LONG requesting
+/// automatic takeoff (`MAV_CMD_NAV_TAKEOFF`, id 22). `altitude_m` is
+/// `param7` — the target altitude in metres above the home position
+/// (positive = up). `None` for every other message.
+///
+/// The other COMMAND_LONG params (pitch, yaw, lat/lon) are ignored:
+/// demo always climbs from the home xy. Production firmware with a
+/// navigator would honour them.
+#[must_use]
+pub fn takeoff_request_from_mav_message(msg: &MavMessage) -> Option<f32> {
+    if let MavMessage::COMMAND_LONG(data) = msg {
+        if data.command == mavlink::common::MavCmd::MAV_CMD_NAV_TAKEOFF {
+            return Some(data.param7);
+        }
+    }
+    None
+}
+
 /// Returns `true` if `msg` is a COMMAND_LONG requesting automatic
 /// landing (`MAV_CMD_NAV_LAND`, id 21). False for everything else.
 ///
@@ -398,6 +416,40 @@ mod tests {
             }
             _ => panic!("expected COMMAND_ACK, got {msg:?}"),
         }
+    }
+
+    #[test]
+    fn takeoff_request_parses_target_altitude() {
+        use mavlink::common::COMMAND_LONG_DATA;
+        let takeoff = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+            param1: 0.0,
+            param2: 0.0,
+            param3: 0.0,
+            param4: 0.0,
+            param5: 0.0,
+            param6: 0.0,
+            param7: 5.0, // 5 m target altitude
+            command: mavlink::common::MavCmd::MAV_CMD_NAV_TAKEOFF,
+            target_system: 1,
+            target_component: 1,
+            confirmation: 0,
+        });
+        assert_eq!(takeoff_request_from_mav_message(&takeoff), Some(5.0));
+
+        let land = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+            param1: 0.0,
+            param2: 0.0,
+            param3: 0.0,
+            param4: 0.0,
+            param5: 0.0,
+            param6: 0.0,
+            param7: 5.0,
+            command: mavlink::common::MavCmd::MAV_CMD_NAV_LAND,
+            target_system: 1,
+            target_component: 1,
+            confirmation: 0,
+        });
+        assert!(takeoff_request_from_mav_message(&land).is_none());
     }
 
     #[test]
