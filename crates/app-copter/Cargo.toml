@@ -17,6 +17,12 @@ path = "src/lib.rs"
 name = "app-copter"
 path = "src/main.rs"
 
+# Bare-metal firmware entry. Links a .elf for thumbv7em-none-eabihf
+# using the memory.x layout in this crate.
+[[bin]]
+name = "firmware"
+path = "src/bin/firmware.rs"
+
 [dependencies]
 core-hal    = { path = "../core-hal" }
 core-rtos   = { path = "../core-rtos" }
@@ -30,6 +36,14 @@ nn-runtime  = { path = "../nn-runtime" }
 comms-mavlink = { path = "../comms-mavlink" }
 nalgebra = { workspace = true }
 libm = { workspace = true }
+
+# Embedded entry-point deps: only pulled when cross-compiling for a
+# bare-metal Arm target. Host builds (tests, `app-copter` host binary,
+# sim-hil) never see these.
+[target.'cfg(all(target_arch = "arm", target_os = "none"))'.dependencies]
+cortex-m = { workspace = true }
+cortex-m-rt = { workspace = true }
+panic-halt = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

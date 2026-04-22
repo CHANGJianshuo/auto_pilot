@@ -62,6 +62,10 @@ jobs:
             cargo build -p $crate --lib --target thumbv7em-none-eabihf
             echo "::endgroup::"
           done
+      # And link the firmware .elf end-to-end (cortex-m-rt + memory.x +
+      # app-copter lib). Catches linker regressions (missing symbols,
+      # region overflow) that a --lib build would miss.
+      - run: cargo build -p app-copter --bin firmware --target thumbv7em-none-eabihf --release
 
   geiger:
     name: unsafe audit (cargo-geiger)
