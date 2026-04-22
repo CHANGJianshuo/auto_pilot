@@ -634,6 +634,109 @@ mod tests {
         sim_state
     }
 
+    /// Drive the SITL with an `Lqi3dPositionController` instead of the
+    /// app-copter PI cascade. Similar shape to the MPC harness above;
+    /// used by the M9.3 tests below.
+    fn run_closed_loop_flight_with_lqi(
+        sim_cfg: &SimConfig,
+        seed: u64,
+        steps: usize,
+        weights_xy: algo_nmpc::LqiWeights,
+        weights_z: algo_nmpc::LqiWeights,
+    ) -> SimState {
+        use algo_indi::attitude_to_rate;
+        use algo_nmpc::{Lqi3dPositionController, Setpoint};
+        use app_copter::{
+            ArmState, FlightState, apply_baro_measurement, apply_gps_measurement,
+            apply_mag_measurement, default_config_250g, rate_loop_step,
+        };
+
+        let mut sim_state = SimState {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..SimState::default()
+        };
+        let mut rng = SimRng::new(seed);
+        let dt = 0.001_f32;
+        let mut app_cfg = default_config_250g();
+
+        let mut lqi = Lqi3dPositionController::new(
+            weights_xy,
+            weights_z,
+            dt,
+            app_cfg.position_gains.max_accel,
+            5.0,
+        )
+        .expect("LQI DAREs converge for sane weights");
+
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
+        let _ = apply_baro_measurement(&mut flight, &sense_baro(sim_cfg, &sim_state, &mut rng));
+        let _ = apply_gps_measurement(&mut flight, &sense_gps(sim_cfg, &sim_state, &mut rng));
+        let setpoint = Setpoint {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..Setpoint::default()
+        };
+
+        for i in 0..steps {
+            let accel_w = accel_world(sim_cfg, &sim_state);
+            let imu = sense_imu(sim_cfg, &sim_state, accel_w, &mut rng);
+            let att = lqi.step(
+                &setpoint,
+                flight.state.position_ned,
+                flight.state.velocity_ned,
+                app_cfg.mass_kg,
+            );
+            let rate_cmd =
+                attitude_to_rate(flight.state.attitude, att.q_desired, &app_cfg.k_attitude);
+            let saved_hover = app_cfg.hover_thrust_n;
+            app_cfg.hover_thrust_n = att.thrust_n;
+            let out = rate_loop_step(&mut app_cfg, &mut flight, imu, dt, rate_cmd);
+            app_cfg.hover_thrust_n = saved_hover;
+            step(sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
+            if i % 200 == 0 {
+                let _ =
+                    apply_gps_measurement(&mut flight, &sense_gps(sim_cfg, &sim_state, &mut rng));
+            }
+            if i % 40 == 0 {
+                let _ =
+                    apply_mag_measurement(&mut flight, &sense_mag(sim_cfg, &sim_state, &mut rng));
+            }
+            if i % 20 == 0 {
+                let _ =
+                    apply_baro_measurement(&mut flight, &sense_baro(sim_cfg, &sim_state, &mut rng));
+            }
+        }
+        sim_state
+    }
+
+    #[test]
+    fn lqi_hover_under_drag_and_wind() {
+        // Realistic sim: 2 m/s wind + linear + quadratic drag. LQR (no
+        // integrator) would show a sustained steady-state bias; LQI's
+        // integrator drives it to near-zero over 15 s.
+        let sim_cfg = SimConfig::realistic_dynamics(Vector3::new(2.0, -1.0, 0.0));
+        let weights = algo_nmpc::LqiWeights {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            q_i: 1.5,
+            r: 0.5,
+        };
+        let sim_state = run_closed_loop_flight_with_lqi(&sim_cfg, 1, 15_000, weights, weights);
+        let altitude_err = (-sim_state.position_ned.z - 1.0).abs();
+        let horizontal_err =
+            (sim_state.position_ned.x.powi(2) + sim_state.position_ned.y.powi(2)).sqrt();
+        assert!(
+            altitude_err < 0.3,
+            "LQI altitude err {altitude_err} m ≥ 0.30 m under drag+wind"
+        );
+        assert!(
+            horizontal_err < 1.0,
+            "LQI horizontal err {horizontal_err} m ≥ 1.0 m under drag+wind"
+        );
+    }
+
     #[test]
     fn mpc_closed_loop_sitl_hovers_to_setpoint() {
         // M9.2 smoke test: three-axis MPC controller hovers the vehicle

@@ -787,6 +787,240 @@ impl<const H: usize> Mpc3dPositionController<H> {
     }
 }
 
+// ----------------------------------------------------------------------------
+// M9.3 — LQI (LQR + integrator): kills steady-state bias
+// ----------------------------------------------------------------------------
+//
+// Plain LQR is optimal for the exact model we designed against. Any
+// constant disturbance (aerodynamic drag, wind, mass change after
+// takeoff, trim offset) makes the nominal model wrong and LQR shows a
+// steady-state tracking error. Classical fix: add an integrator state,
+// solve the augmented 3-state Riccati, the resulting `k_i` gain cancels
+// constant disturbances exactly.
+//
+// Augmented model (per axis, error coords e = x − x_ref):
+//   z = [e_p; e_v; i],   i_{k+1} = i_k + e_p · dt
+//   A_z = [[1, dt, 0], [0, 1, 0], [dt, 0, 1]]
+//   B_z = [dt²/2, dt, 0]
+//   Q_z = diag(q_pos, q_vel, q_i),  R = r
+//
+// Control law: u = −K · z = −(k_p · e_p + k_v · e_v + k_i · i).
+
+/// Per-axis cost weights for LQI.
+#[derive(Clone, Copy, Debug)]
+pub struct LqiWeights {
+    pub q_pos: f32,
+    pub q_vel: f32,
+    /// Integrator weight. Higher → more aggressive bias cancellation +
+    /// faster integrator wind-up. `q_i = 0` reduces LQI to LQR exactly
+    /// (i will be a nullspace dimension).
+    pub q_i: f32,
+    pub r: f32,
+}
+
+impl Default for LqiWeights {
+    fn default() -> Self {
+        Self {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            q_i: 0.5,
+            r: 0.5,
+        }
+    }
+}
+
+/// Solved LQI gains for one axis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LqiAxisGains {
+    pub k_p: f32,
+    pub k_v: f32,
+    pub k_i: f32,
+}
+
+/// Iteratively solve the 3×3 DARE for the LQI problem. Same structure
+/// as [`compute_lqr_gains`] but with an augmented state.
+#[must_use]
+pub fn compute_lqi_gains(weights: LqiWeights, dt_s: f32) -> Option<LqiAxisGains> {
+    if !dt_s.is_finite()
+        || dt_s <= 0.0
+        || weights.q_pos < 0.0
+        || weights.q_vel < 0.0
+        || weights.q_i < 0.0
+        || weights.r <= 0.0
+    {
+        return None;
+    }
+    let a = nalgebra::Matrix3::new(1.0_f32, dt_s, 0.0, 0.0, 1.0, 0.0, dt_s, 0.0, 1.0);
+    let b = nalgebra::Vector3::new(0.5 * dt_s * dt_s, dt_s, 0.0);
+    let q_mat = nalgebra::Matrix3::from_diagonal(&nalgebra::Vector3::new(
+        weights.q_pos,
+        weights.q_vel,
+        weights.q_i,
+    ));
+    let mut p = q_mat;
+    let mut prev_trace = p.m11 + p.m22 + p.m33;
+    for _ in 0..500 {
+        let atp = a.transpose() * p;
+        let btp = b.transpose() * p;
+        let bpb = (btp * b).x;
+        let denom = weights.r + bpb;
+        if denom <= 0.0 || !denom.is_finite() {
+            return None;
+        }
+        let atpb = atp * b;
+        let btpa = btp * a;
+        let correction = (atpb * btpa) * (1.0 / denom);
+        let next = atp * a - correction + q_mat;
+        if !next.iter().all(|x| x.is_finite()) {
+            return None;
+        }
+        let trace = next.m11 + next.m22 + next.m33;
+        p = next;
+        if (trace - prev_trace).abs() < 1.0e-6 * (1.0 + trace.abs()) {
+            break;
+        }
+        prev_trace = trace;
+    }
+    let btp = b.transpose() * p;
+    let bpb = (btp * b).x;
+    let denom = weights.r + bpb;
+    if denom <= 0.0 || !denom.is_finite() {
+        return None;
+    }
+    let k_row = btp * a * (1.0 / denom);
+    let k_p = k_row.get(0).copied().unwrap_or(0.0);
+    let k_v = k_row.get(1).copied().unwrap_or(0.0);
+    let k_i = k_row.get(2).copied().unwrap_or(0.0);
+    if !k_p.is_finite() || !k_v.is_finite() || !k_i.is_finite() || k_p < 0.0 || k_v < 0.0 {
+        return None;
+    }
+    Some(LqiAxisGains { k_p, k_v, k_i })
+}
+
+/// Three-axis LQI position controller.
+///
+/// Analytical cousin of `Mpc3dPositionController`: same shape but solves
+/// the infinite-horizon Riccati once at construction, then each tick
+/// evaluates the fixed-gain law `u = −K · [e_p, e_v, i]` and advances
+/// the integrator `i`. Cheap to run (no iterative solver) and has
+/// **zero steady-state bias** under constant disturbances — the MPC's
+/// advantage under transient constraints is traded for the integrator's
+/// advantage under persistent wind / drag.
+#[derive(Clone, Debug)]
+pub struct Lqi3dPositionController {
+    gains_xy: LqiAxisGains,
+    gains_z: LqiAxisGains,
+    /// Integrator state per axis (NED).
+    integrator: Vector3<f32>,
+    /// Per-axis anti-windup cap on the integrator magnitude.
+    pub integrator_max: f32,
+    /// Clamp on commanded acceleration magnitude.
+    pub max_accel: f32,
+    dt_s: f32,
+}
+
+impl Lqi3dPositionController {
+    /// Solve per-axis DAREs and return the controller. `None` on bad
+    /// weights / dt.
+    #[must_use]
+    pub fn new(
+        weights_xy: LqiWeights,
+        weights_z: LqiWeights,
+        dt_s: f32,
+        max_accel: f32,
+        integrator_max: f32,
+    ) -> Option<Self> {
+        Some(Self {
+            gains_xy: compute_lqi_gains(weights_xy, dt_s)?,
+            gains_z: compute_lqi_gains(weights_z, dt_s)?,
+            integrator: Vector3::zeros(),
+            integrator_max,
+            max_accel,
+            dt_s,
+        })
+    }
+
+    /// Cold-start the integrators. Call on mode switches or after a
+    /// large setpoint jump so prior tracking history doesn't pollute
+    /// the new operating point.
+    pub fn reset_integrator(&mut self) {
+        self.integrator = Vector3::zeros();
+    }
+
+    /// Read-only accessor for unit tests + logging.
+    #[must_use]
+    pub fn integrator(&self) -> Vector3<f32> {
+        self.integrator
+    }
+
+    /// One controller tick.
+    pub fn step(
+        &mut self,
+        setpoint: &Setpoint,
+        current_position: Vector3<f32>,
+        current_velocity: Vector3<f32>,
+        mass_kg: f32,
+    ) -> AttitudeAndThrust {
+        // Error coords.
+        let e_p = current_position - setpoint.position_ned;
+        let e_v = current_velocity - setpoint.velocity_ned;
+
+        // Compute control u = −K·z per axis. xy share their gains.
+        let u_x = -(self.gains_xy.k_p * e_p.x
+            + self.gains_xy.k_v * e_v.x
+            + self.gains_xy.k_i * self.integrator.x);
+        let u_y = -(self.gains_xy.k_p * e_p.y
+            + self.gains_xy.k_v * e_v.y
+            + self.gains_xy.k_i * self.integrator.y);
+        let u_z = -(self.gains_z.k_p * e_p.z
+            + self.gains_z.k_v * e_v.z
+            + self.gains_z.k_i * self.integrator.z);
+        let mut accel_cmd = Vector3::new(u_x, u_y, u_z) + setpoint.accel_ned;
+        let mag = accel_cmd.norm();
+        let saturated = mag.is_finite() && mag > self.max_accel;
+        if saturated {
+            accel_cmd *= self.max_accel / mag;
+        }
+
+        // Advance integrator with conditional integration (anti-windup):
+        // only accumulate when the commanded accel is feasible.
+        if !saturated && self.dt_s.is_finite() && self.dt_s > 0.0 {
+            self.integrator += e_p * self.dt_s;
+            self.integrator.x = self
+                .integrator
+                .x
+                .clamp(-self.integrator_max, self.integrator_max);
+            self.integrator.y = self
+                .integrator
+                .y
+                .clamp(-self.integrator_max, self.integrator_max);
+            self.integrator.z = self
+                .integrator
+                .z
+                .clamp(-self.integrator_max, self.integrator_max);
+        }
+
+        let dummy_gains = PositionGains {
+            k_pos: Vector3::zeros(),
+            k_vel: Vector3::zeros(),
+            k_i_vel: Vector3::zeros(),
+            max_accel: self.max_accel,
+            max_integrator: 0.0,
+        };
+        accel_to_attitude_thrust(accel_cmd, setpoint.yaw_rad, mass_kg, &dummy_gains)
+    }
+
+    /// Exposed solved gains for inspection / comparison against LQR.
+    #[must_use]
+    pub fn gains_xy(&self) -> LqiAxisGains {
+        self.gains_xy
+    }
+    #[must_use]
+    pub fn gains_z(&self) -> LqiAxisGains {
+        self.gains_z
+    }
+}
+
 /// Shared last-mile: commanded accel (NED) + desired yaw → body
 /// attitude + thrust magnitude. Factored out of
 /// `position_to_attitude_thrust_pi` so the MPC controller reuses it
@@ -1256,6 +1490,132 @@ mod tests {
             pos.abs() < 0.05 && vel.abs() < 0.05,
             "converged pos={pos} vel={vel}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // M9.3 LQI tests
+    // ------------------------------------------------------------------
+
+    fn default_lqi_weights() -> LqiWeights {
+        LqiWeights {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            q_i: 0.5,
+            r: 0.5,
+        }
+    }
+
+    #[test]
+    fn lqi_default_weights_produce_positive_gains() {
+        let g = compute_lqi_gains(default_lqi_weights(), 0.05).unwrap();
+        assert!(g.k_p > 0.0 && g.k_v > 0.0 && g.k_i > 0.0);
+    }
+
+    #[test]
+    fn lqi_with_zero_qi_matches_lqr() {
+        // q_i = 0 ⇒ the integrator state is free (doesn't cost anything)
+        // and the LQI (k_p, k_v) should equal the LQR gains for the same
+        // (q_pos, q_vel, r). Also k_i ≈ 0.
+        let lqr = compute_lqr_gains(
+            LqrWeights {
+                q_pos: 4.0,
+                q_vel: 1.0,
+                r: 0.5,
+            },
+            0.05,
+        )
+        .unwrap();
+        let mut w = default_lqi_weights();
+        w.q_i = 0.0;
+        let lqi = compute_lqi_gains(w, 0.05).unwrap();
+        assert!(
+            (lqi.k_p - lqr.k_p).abs() < 0.01,
+            "k_p {} vs {}",
+            lqi.k_p,
+            lqr.k_p
+        );
+        assert!(
+            (lqi.k_v - lqr.k_v).abs() < 0.01,
+            "k_v {} vs {}",
+            lqi.k_v,
+            lqr.k_v
+        );
+        assert!(lqi.k_i.abs() < 0.01, "k_i should be ≈0, got {}", lqi.k_i);
+    }
+
+    #[test]
+    fn lqi_invalid_inputs_return_none() {
+        assert!(compute_lqi_gains(default_lqi_weights(), 0.0).is_none());
+        let mut w = default_lqi_weights();
+        w.r = 0.0;
+        assert!(compute_lqi_gains(w, 0.05).is_none());
+        let mut w = default_lqi_weights();
+        w.q_pos = -1.0;
+        assert!(compute_lqi_gains(w, 0.05).is_none());
+    }
+
+    #[test]
+    fn lqi_higher_q_i_produces_larger_k_i() {
+        // Monotone response: raising the integrator weight q_i must
+        // raise k_i (the DARE solution is unique for positive Q/R).
+        let mut w_soft = default_lqi_weights();
+        w_soft.q_i = 0.1;
+        let mut w_stiff = default_lqi_weights();
+        w_stiff.q_i = 2.0;
+        let soft = compute_lqi_gains(w_soft, 0.05).unwrap();
+        let stiff = compute_lqi_gains(w_stiff, 0.05).unwrap();
+        assert!(
+            stiff.k_i > soft.k_i,
+            "k_i soft {} stiff {}",
+            soft.k_i,
+            stiff.k_i
+        );
+    }
+
+    #[test]
+    fn lqi_step_at_origin_holds_hover() {
+        // Zero position error, zero velocity, zero integrator → command
+        // is zero acceleration → thrust exactly cancels gravity.
+        let mut ctl = Lqi3dPositionController::new(
+            default_lqi_weights(),
+            default_lqi_weights(),
+            0.01,
+            20.0,
+            10.0,
+        )
+        .unwrap();
+        let out = ctl.step(
+            &Setpoint::default(),
+            Vector3::zeros(),
+            Vector3::zeros(),
+            0.25,
+        );
+        let hover = 0.25 * GRAVITY_M_S2;
+        assert!((out.thrust_n - hover).abs() < 1.0e-3);
+        assert!(out.q_desired.i.abs() < 1.0e-3 && out.q_desired.j.abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn lqi_reset_integrator_zeros_state() {
+        let mut ctl = Lqi3dPositionController::new(
+            default_lqi_weights(),
+            default_lqi_weights(),
+            0.01,
+            20.0,
+            10.0,
+        )
+        .unwrap();
+        // One step at a bias-generating condition populates integrator.
+        let sp = Setpoint {
+            position_ned: Vector3::new(1.0, -0.5, 0.3),
+            ..Setpoint::default()
+        };
+        for _ in 0..100 {
+            ctl.step(&sp, Vector3::zeros(), Vector3::zeros(), 0.25);
+        }
+        assert!(ctl.integrator().norm() > 0.0);
+        ctl.reset_integrator();
+        assert_eq!(ctl.integrator(), Vector3::zeros());
     }
 
     #[test]
