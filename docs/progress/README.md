@@ -67,6 +67,7 @@
 | [0061](./0061-mpc-constrained.md) | 2026-04-22 | M9.1 带约束的有限 horizon MPC | `43d2af6` | `Mpc1d<const H>` — 单轴 receding-horizon MPC：展开动力学到 dense QP、LQR Riccati P 作终端代价保稳定、projected gradient + Gershgorin 步长 + warm start；5 新测试验证 unconstrained = LQR / 紧约束被遵守 / 紧 box 下闭环收敛；workspace 201 tests 全绿。 |
 | [0062](./0062-mpc-sitl.md) | 2026-04-22 | M9.2 三轴 MPC + SITL | `1b29518` | `Mpc3dPositionController<const H>` 把 xy+z 两个 Mpc1d 打包、.step 返回 `(q_desired, thrust)`；与 PI 路径共享 `accel_to_attitude_thrust` last-mile；**SITL 闭环首飞**：ideal sim 悬停误差 <25cm、u_max=2m/s² 紧约束下 8 秒内到达 1m 设定点 < 50cm；206 tests 全绿。 |
 | [0063](./0063-lqi.md) | 2026-04-22 | M9.3 LQI：integrator 清稳态偏差 | `0e7d1c7` | `LqiWeights { q_pos, q_vel, q_i, r }` + 3×3 DARE → `LqiAxisGains`；`Lqi3dPositionController` 带 3 积分器 + anti-windup；核心 sanity `q_i=0 ⇔ LQR`；**realistic sim + 2m/s 风 + drag**，15 秒 altitude<0.3m、horiz<1m，LQR 在同条件有持续偏差；213 tests 全绿。 |
+| [0064](./0064-controller-shootout.md) | 2026-04-22 | M9.4 `PositionController` enum + shootout | `4585489` | PI/LQR/MPC/LQI 一个 enum `PositionController<H>` 统一 `.step()` / `.reset()` / `.kind()`；**shootout SITL**: ideal sim 4 路 < 25cm 悬停，realistic sim 积分器类 < 0.6m、LQR 松界 < 2m（regime 分层记录）；218 tests 全绿。 |
 
 ## 写新文档时遵守的模板
 
