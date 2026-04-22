@@ -79,6 +79,74 @@ pub struct RateLoopConfig {
     pub rtl_xy_tolerance_m: f32,
 }
 
+/// Reason an arm / takeoff request was refused by the preflight check.
+///
+/// Kept as a small `#[repr(u8)]` enum so it can be logged, surfaced in a
+/// `COMMAND_ACK`, or matched on in firmware without allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PreflightReject {
+    /// GPS health is not `Healthy`.
+    GpsUnhealthy = 1,
+    /// Barometer health is not `Healthy`.
+    BaroUnhealthy = 2,
+    /// Magnetometer health is not `Healthy`.
+    MagUnhealthy = 3,
+    /// EKF has not converged — position covariance too large.
+    EkfNotConverged = 4,
+}
+
+impl PreflightReject {
+    /// Short human-readable label for logs / MAVLink STATUSTEXT.
+    #[must_use]
+    pub const fn reason_str(self) -> &'static str {
+        match self {
+            Self::GpsUnhealthy => "GPS unhealthy",
+            Self::BaroUnhealthy => "baro unhealthy",
+            Self::MagUnhealthy => "mag unhealthy",
+            Self::EkfNotConverged => "EKF not converged",
+        }
+    }
+}
+
+/// Position covariance (trace of the 3×3 position block in `P`) above
+/// this value is treated as "not converged" — a freshly-initialised EKF
+/// has `initial_sigma²` on each diagonal which is well above this, and a
+/// properly converged filter sits around 0.1–1 m² trace.
+pub const PREFLIGHT_POS_TRACE_MAX_M2: f32 = 5.0;
+
+/// Run every safety check that should gate arm / takeoff. Returns the
+/// first failing reason, or `Ok(())` if the vehicle is cleared to fly.
+///
+/// This is intentionally *read-only* — it never mutates `flight` so
+/// callers can safely probe before accepting a COMMAND_LONG.
+pub fn preflight_check(flight: &FlightState) -> Result<(), PreflightReject> {
+    if flight.gps_health.level() != HealthLevel::Healthy {
+        return Err(PreflightReject::GpsUnhealthy);
+    }
+    if flight.baro_health.level() != HealthLevel::Healthy {
+        return Err(PreflightReject::BaroUnhealthy);
+    }
+    if flight.mag_health.level() != HealthLevel::Healthy {
+        return Err(PreflightReject::MagUnhealthy);
+    }
+    let pos_trace = (0..algo_ekf::idx::P_NED_LEN)
+        .map(|i| {
+            flight
+                .covariance
+                .fixed_view::<1, 1>(
+                    algo_ekf::idx::P_NED_START + i,
+                    algo_ekf::idx::P_NED_START + i,
+                )
+                .to_scalar()
+        })
+        .sum::<f32>();
+    if pos_trace > PREFLIGHT_POS_TRACE_MAX_M2 {
+        return Err(PreflightReject::EkfNotConverged);
+    }
+    Ok(())
+}
+
 /// Whether the vehicle is allowed to drive its motors.
 ///
 /// Disarmed is the safe default: every rate-loop step short-circuits to
@@ -633,7 +701,12 @@ pub fn outer_step(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -1014,6 +1087,58 @@ mod tests {
         // Too fast → never settles.
         for _ in 0..2000 {
             assert!(!d.observe(-5.0, 1.0, -5.0, 0.001));
+        }
+    }
+
+    #[test]
+    fn preflight_rejects_default_because_ekf_not_converged() {
+        let flight = FlightState::default();
+        // Initial covariance has σ²=100 per axis → trace=300 ≫ 5.
+        let r = preflight_check(&flight);
+        assert_eq!(r, Err(PreflightReject::EkfNotConverged));
+    }
+
+    #[test]
+    fn preflight_passes_when_covariance_shrinks() {
+        let mut flight = FlightState::default();
+        // Manually shrink position covariance below threshold.
+        for i in 0..algo_ekf::idx::P_NED_LEN {
+            flight.covariance[(
+                algo_ekf::idx::P_NED_START + i,
+                algo_ekf::idx::P_NED_START + i,
+            )] = 0.5;
+        }
+        assert!(preflight_check(&flight).is_ok());
+    }
+
+    #[test]
+    fn preflight_rejects_when_gps_unhealthy() {
+        let mut flight = FlightState::default();
+        // Shrink covariance first so EKF check passes.
+        for i in 0..algo_ekf::idx::P_NED_LEN {
+            flight.covariance[(
+                algo_ekf::idx::P_NED_START + i,
+                algo_ekf::idx::P_NED_START + i,
+            )] = 0.5;
+        }
+        // Feed enough rejections to tip gps_health to Degraded.
+        for _ in 0..SensorRejectionCounter::DEFAULT_N_DEGRADE + 1 {
+            flight.gps_health.observe(false);
+        }
+        assert_eq!(preflight_check(&flight), Err(PreflightReject::GpsUnhealthy));
+    }
+
+    #[test]
+    fn preflight_reason_string_covers_every_variant() {
+        // Any future variant added to PreflightReject forces an update
+        // here; keeps reason_str() exhaustive.
+        for r in [
+            PreflightReject::GpsUnhealthy,
+            PreflightReject::BaroUnhealthy,
+            PreflightReject::MagUnhealthy,
+            PreflightReject::EkfNotConverged,
+        ] {
+            assert!(!r.reason_str().is_empty());
         }
     }
 

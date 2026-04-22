@@ -18,8 +18,9 @@
 use algo_ekf::GRAVITY_M_S2;
 use algo_nmpc::Setpoint;
 use app_copter::{
-    ArmState, FlightState, LandingState, RtlPhase, TakeoffState, apply_baro_measurement,
-    apply_gps_measurement, apply_mag_measurement, default_config_250g, outer_step,
+    ArmState, FlightState, LandingState, PreflightReject, RtlPhase, TakeoffState,
+    apply_baro_measurement, apply_gps_measurement, apply_mag_measurement, default_config_250g,
+    outer_step, preflight_check,
 };
 use mavlink::common::{MavCmd, MavMessage, MavResult};
 use nalgebra::Vector3;
@@ -80,6 +81,12 @@ async fn main() -> anyhow::Result<()> {
     let rtl_phase = Arc::new(Mutex::new(RtlPhase::Idle));
     let rtl_phase_sim = Arc::clone(&rtl_phase);
 
+    // Shared preflight status. Sim thread writes it each tick by calling
+    // `preflight_check`. UDP task reads it when deciding how to respond
+    // to ARM / TAKEOFF commands.
+    let preflight: Arc<Mutex<Option<PreflightReject>>> = Arc::new(Mutex::new(None));
+    let preflight_sim = Arc::clone(&preflight);
+
     let sim_task = tokio::task::spawn_blocking(move || {
         run_sim(
             tx,
@@ -88,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
             landing_state_sim,
             takeoff_state_sim,
             rtl_phase_sim,
+            preflight_sim,
         )
     });
 
@@ -118,12 +126,21 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             if let Some(arm) = arm_change_from_mav_message(&msg) {
-                if let Ok(mut a) = arm_state.lock() {
-                    let new = if arm {
-                        ArmState::Armed
-                    } else {
-                        ArmState::Disarmed
-                    };
+                // DISARM always permitted — failing to disarm is much
+                // worse than failing to arm. ARM gated on preflight.
+                let new = if arm {
+                    ArmState::Armed
+                } else {
+                    ArmState::Disarmed
+                };
+                let preflight_err = if arm {
+                    preflight.lock().ok().and_then(|g| *g)
+                } else {
+                    None
+                };
+                if let Some(reason) = preflight_err {
+                    tracing::warn!(reason = reason.reason_str(), "ARM rejected by preflight");
+                } else if let Ok(mut a) = arm_state.lock() {
                     if *a != new {
                         *a = new;
                         tracing::info!(?new, "arm state changed by GCS");
@@ -147,30 +164,53 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             if let Some(altitude_m) = takeoff_request_from_mav_message(&msg) {
-                // TAKEOFF implies ARM: if the GCS sends TAKEOFF, the
-                // operator wants to fly — auto-arm so the demo does the
-                // intuitive thing (the real vehicle should do preflight
-                // first — M6.3 follow-up).
-                if let Ok(mut a) = arm_state.lock() {
-                    *a = ArmState::Armed;
-                }
-                if let Ok(mut t) = takeoff_state.lock() {
-                    // NED: positive altitude → negative z.
-                    *t = TakeoffState::TakingOff {
-                        target_z_ned: -altitude_m,
-                    };
-                    tracing::info!(altitude_m, "TAKEOFF command received — climbing to target");
+                // TAKEOFF implies ARM. Both are gated on preflight —
+                // don't auto-arm into a known-unhealthy state.
+                let preflight_err = preflight.lock().ok().and_then(|g| *g);
+                if let Some(reason) = preflight_err {
+                    tracing::warn!(
+                        reason = reason.reason_str(),
+                        "TAKEOFF rejected by preflight"
+                    );
+                } else {
+                    if let Ok(mut a) = arm_state.lock() {
+                        *a = ArmState::Armed;
+                    }
+                    if let Ok(mut t) = takeoff_state.lock() {
+                        *t = TakeoffState::TakingOff {
+                            target_z_ned: -altitude_m,
+                        };
+                        tracing::info!(altitude_m, "TAKEOFF command received — climbing to target");
+                    }
                 }
             }
             // Ack any COMMAND_LONG so the GCS doesn't sit waiting. We
-            // accept commands we understand and reply UNSUPPORTED for
-            // anything else.
+            // accept commands we understand, TEMPORARILY_REJECTED for
+            // preflight-gated commands that failed their checks, and
+            // UNSUPPORTED for anything else.
             if let MavMessage::COMMAND_LONG(data) = &msg {
+                let preflight_err = preflight.lock().ok().and_then(|g| *g);
+                // ARM with param1>=0.5 means arm; disarm is never gated.
+                let arm_request = matches!(data.command, MavCmd::MAV_CMD_COMPONENT_ARM_DISARM)
+                    && data.param1 >= 0.5;
                 let result = match data.command {
-                    MavCmd::MAV_CMD_COMPONENT_ARM_DISARM
-                    | MavCmd::MAV_CMD_NAV_LAND
-                    | MavCmd::MAV_CMD_NAV_TAKEOFF
-                    | MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH => MavResult::MAV_RESULT_ACCEPTED,
+                    MavCmd::MAV_CMD_COMPONENT_ARM_DISARM => {
+                        if arm_request && preflight_err.is_some() {
+                            MavResult::MAV_RESULT_TEMPORARILY_REJECTED
+                        } else {
+                            MavResult::MAV_RESULT_ACCEPTED
+                        }
+                    }
+                    MavCmd::MAV_CMD_NAV_TAKEOFF => {
+                        if preflight_err.is_some() {
+                            MavResult::MAV_RESULT_TEMPORARILY_REJECTED
+                        } else {
+                            MavResult::MAV_RESULT_ACCEPTED
+                        }
+                    }
+                    MavCmd::MAV_CMD_NAV_LAND | MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH => {
+                        MavResult::MAV_RESULT_ACCEPTED
+                    }
                     _ => MavResult::MAV_RESULT_UNSUPPORTED,
                 };
                 sink.send_command_ack(data.command, result).await.ok();
@@ -221,6 +261,7 @@ struct Snapshot {
     heading: f32,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sim(
     tx: mpsc::UnboundedSender<Snapshot>,
     setpoint: Arc<Mutex<Setpoint>>,
@@ -228,6 +269,7 @@ fn run_sim(
     landing_state: Arc<Mutex<LandingState>>,
     takeoff_state: Arc<Mutex<TakeoffState>>,
     rtl_phase: Arc<Mutex<RtlPhase>>,
+    preflight: Arc<Mutex<Option<PreflightReject>>>,
 ) {
     let sim_cfg = SimConfig::realistic_dynamics(Vector3::zeros());
     let mut sim_state = SimState {
@@ -279,6 +321,11 @@ fn run_sim(
         }
         if let Ok(mut shared) = rtl_phase.lock() {
             *shared = flight.rtl_phase;
+        }
+        // Update preflight snapshot each tick so the UDP task sees a
+        // fresh answer when the GCS sends ARM / TAKEOFF.
+        if let Ok(mut shared) = preflight.lock() {
+            *shared = preflight_check(&flight).err();
         }
         step(&sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
 
