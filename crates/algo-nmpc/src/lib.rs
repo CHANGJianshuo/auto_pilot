@@ -349,6 +349,308 @@ pub fn lqr_position_gains(
     })
 }
 
+// ----------------------------------------------------------------------------
+// M9.1 — Finite-horizon MPC with box constraints (single axis)
+// ----------------------------------------------------------------------------
+//
+// Extends the LQR design to a true QP-based MPC: we keep the same
+// double-integrator model but solve a box-constrained quadratic program
+// over a finite horizon every tick and apply the first control input
+// (receding-horizon principle). Three-axis combination happens in the
+// outer loop by running three independent 1-D solvers; proper coupled
+// 6-dim MPC is a future expansion if cross-axis constraints matter.
+//
+// Problem (per axis, error coordinates e = x − x_ref):
+//   minimise   Σ_{k=0..H-1} (q_p·e_p_k² + q_v·e_v_k²) + r·u_k²
+//              + e_H^T P_f e_H                     (terminal cost)
+//   s.t.       e_{k+1} = A e_k + B u_k
+//              u_min ≤ u_k ≤ u_max
+//
+// Reduction to a dense QP in u ∈ R^H:
+//   e_k = F_k e_0 + Σ_{j<k} G_{k,j} u_j      (unroll dynamics)
+//   J(u) = ½ uᵀ H u + gᵀ u + const
+//   H = Gᵀ Q_blk G + R_blk + G_fᵀ P_f G_f
+//   g = (Gᵀ Q_blk F + G_fᵀ P_f F_H) e_0     // linear in e_0 ⇒ precompute M
+//
+// Solved with projected gradient descent (step α = 1/L, L = λ_max(H))
+// — for small H the convergence rate is fine and warm-start between
+// ticks cuts iteration count to ~5 after the first one.
+
+/// Static configuration for a 1-axis MPC design.
+#[derive(Clone, Copy, Debug)]
+pub struct Mpc1dConfig {
+    /// Stage cost weights (same struct as LQR; the **infinite-horizon**
+    /// Riccati P is used as the terminal cost so the truncated horizon
+    /// keeps LQR's stability guarantee).
+    pub weights: LqrWeights,
+    /// Discretisation step of the predictor (s). Must match the rate
+    /// at which `solve` is called in closed loop.
+    pub dt_s: f32,
+    /// Input lower bound u_k ≥ u_min.
+    pub u_min: f32,
+    /// Input upper bound u_k ≤ u_max.
+    pub u_max: f32,
+}
+
+/// Precomputed dense-QP data for a `H`-step receding-horizon MPC.
+///
+/// `new` factors out all work that only depends on the model + weights
+/// (computing H, M, the Lipschitz step size, and the terminal cost from
+/// the infinite-horizon DARE). The per-tick `solve` only does the e₀-
+/// dependent linear term and the projected-gradient loop.
+#[derive(Clone, Debug)]
+pub struct Mpc1d<const H: usize> {
+    /// QP Hessian: H × H, SPD.
+    hessian: nalgebra::SMatrix<f32, H, H>,
+    /// Linear term map: g = map · e_0.
+    lin_from_e0: nalgebra::SMatrix<f32, H, 2>,
+    u_min: f32,
+    u_max: f32,
+    /// 1 / λ_max(hessian) — projected-gradient step size.
+    step_size: f32,
+}
+
+impl<const H: usize> Mpc1d<H> {
+    /// Pre-compute the QP data. Returns `None` on invalid inputs
+    /// (negative weights, non-positive `dt`, `u_min > u_max`) or if the
+    /// infinite-horizon LQR Riccati fails to converge — the caller is
+    /// expected to fall back to PI or plain LQR in that case.
+    ///
+    /// # Panics (for clippy's benefit)
+    ///
+    /// The local fixed arrays (`a_pow_b`, `f_pow`) are sized 64 and the
+    /// early `H >= a_pow_b.len()` guard rejects anything larger, so the
+    /// `[m]` / `[k]` indexing inside the body is bounds-safe by
+    /// construction. We locally allow `indexing_slicing` in this
+    /// function to keep the math readable.
+    #[allow(clippy::indexing_slicing)]
+    #[must_use]
+    pub fn new(config: Mpc1dConfig) -> Option<Self> {
+        if H == 0 || !config.dt_s.is_finite() || config.dt_s <= 0.0 {
+            return None;
+        }
+        if config.u_max < config.u_min || !config.u_min.is_finite() || !config.u_max.is_finite() {
+            return None;
+        }
+        if config.weights.r <= 0.0 || config.weights.q_pos < 0.0 || config.weights.q_vel < 0.0 {
+            return None;
+        }
+
+        // Infinite-horizon Riccati P to use as terminal cost.
+        let p_terminal = dare_2x2(config.weights, config.dt_s)?;
+
+        let dt = config.dt_s;
+        let a = nalgebra::Matrix2::new(1.0_f32, dt, 0.0, 1.0);
+        let b_vec = nalgebra::Vector2::new(0.5 * dt * dt, dt);
+        let q_mat = nalgebra::Matrix2::new(config.weights.q_pos, 0.0, 0.0, config.weights.q_vel);
+
+        // F_k = A^k (row k of the "free response" matrix).
+        // G_{k,j} = A^{k-1-j} B for j < k, 0 otherwise (lower triangular).
+        // We need F_H and rows F_1..F_H-1 (for stage cost), plus
+        // G_H (last row) for the terminal term.
+
+        let mut hessian = nalgebra::SMatrix::<f32, H, H>::zeros();
+        let mut lin_from_e0 = nalgebra::SMatrix::<f32, H, 2>::zeros();
+
+        // Cache A^k B_cols to avoid recomputing. a_pow_b[m] = A^m * B.
+        let mut a_pow_b = [nalgebra::Vector2::<f32>::zeros(); 64];
+        if H >= a_pow_b.len() {
+            // Horizon limit: keep it small to avoid heap in no_std.
+            return None;
+        }
+        a_pow_b[0] = b_vec;
+        for m in 1..H {
+            a_pow_b[m] = a * a_pow_b[m - 1];
+        }
+
+        // Free-response F_k e_0. F_k = A^k; store F_1..F_H.
+        let mut f_pow = [nalgebra::Matrix2::<f32>::identity(); 64];
+        for k in 1..=H {
+            f_pow[k] = a * f_pow[k - 1];
+        }
+
+        // Stage cost contributions. For each k=1..H-1:
+        //   e_k = F_k e_0 + Σ_{j=0}^{k-1} A^{k-1-j} B u_j
+        //       = F_k e_0 + Σ_{j=0}^{k-1} a_pow_b[k-1-j] u_j
+        // The row of G at row k, col j is a_pow_b[k-1-j].
+        for k in 1..H {
+            let f_k = f_pow[k];
+            for j in 0..k {
+                let g_col_k_j = a_pow_b[k - 1 - j]; // 2-vec
+                // Accumulate H entries: (a_pow_b[k-1-j'])^T Q (a_pow_b[k-1-j])
+                //   appears at (j', j) for each j'.
+                for jp in 0..k {
+                    let g_col_k_jp = a_pow_b[k - 1 - jp];
+                    let contrib = g_col_k_jp.dot(&(q_mat * g_col_k_j));
+                    let cur = hessian.get((jp, j)).copied().unwrap_or(0.0);
+                    if let Some(slot) = hessian.get_mut((jp, j)) {
+                        *slot = cur + contrib;
+                    }
+                }
+                // g ← g + (a_pow_b[k-1-j])^T Q F_k e_0    (linear in e_0)
+                //   → lin_from_e0 row j gets (Q F_k)^T (a_pow_b[k-1-j])
+                //     which is a 2-vec; accumulate.
+                let row_vec = (q_mat * f_k).transpose() * g_col_k_j;
+                for col in 0..2 {
+                    let cur = lin_from_e0.get((j, col)).copied().unwrap_or(0.0);
+                    if let Some(slot) = lin_from_e0.get_mut((j, col)) {
+                        *slot = cur + row_vec.get(col).copied().unwrap_or(0.0);
+                    }
+                }
+            }
+        }
+
+        // Control-effort term R_blk = r I_H → add r to diagonal.
+        let r = config.weights.r;
+        for k in 0..H {
+            if let Some(slot) = hessian.get_mut((k, k)) {
+                *slot += r;
+            }
+        }
+
+        // Terminal cost e_H^T P_f e_H:
+        //   e_H = F_H e_0 + Σ_{j=0}^{H-1} a_pow_b[H-1-j] u_j
+        //   Let w_j = a_pow_b[H-1-j].
+        let f_h = f_pow[H];
+        for j in 0..H {
+            let w_j = a_pow_b[H - 1 - j];
+            for jp in 0..H {
+                let w_jp = a_pow_b[H - 1 - jp];
+                let contrib = w_jp.dot(&(p_terminal * w_j));
+                let cur = hessian.get((jp, j)).copied().unwrap_or(0.0);
+                if let Some(slot) = hessian.get_mut((jp, j)) {
+                    *slot = cur + contrib;
+                }
+            }
+            let row_vec = (p_terminal * f_h).transpose() * w_j;
+            for col in 0..2 {
+                let cur = lin_from_e0.get((j, col)).copied().unwrap_or(0.0);
+                if let Some(slot) = lin_from_e0.get_mut((j, col)) {
+                    *slot = cur + row_vec.get(col).copied().unwrap_or(0.0);
+                }
+            }
+        }
+
+        // Symmetrise H (float round-off can leave tiny skew).
+        for i in 0..H {
+            for j in 0..i {
+                let avg = 0.5
+                    * (hessian.get((i, j)).copied().unwrap_or(0.0)
+                        + hessian.get((j, i)).copied().unwrap_or(0.0));
+                if let Some(slot) = hessian.get_mut((i, j)) {
+                    *slot = avg;
+                }
+                if let Some(slot) = hessian.get_mut((j, i)) {
+                    *slot = avg;
+                }
+            }
+        }
+
+        // Row-sum upper bound on λ_max (Gershgorin). Gives a safe step
+        // size α = 1/L; projected gradient converges for any α ≤ 2/L.
+        let mut lmax: f32 = 0.0;
+        for i in 0..H {
+            let mut row_sum = 0.0_f32;
+            for j in 0..H {
+                row_sum += hessian.get((i, j)).copied().unwrap_or(0.0).abs();
+            }
+            if row_sum > lmax {
+                lmax = row_sum;
+            }
+        }
+        if lmax <= 0.0 || !lmax.is_finite() {
+            return None;
+        }
+
+        Some(Self {
+            hessian,
+            lin_from_e0,
+            u_min: config.u_min,
+            u_max: config.u_max,
+            step_size: 1.0 / lmax,
+        })
+    }
+
+    /// Solve the QP for current error `e_0 = x - x_ref` and return the
+    /// first control `u_0` from the optimal sequence.
+    ///
+    /// `warm_u` is read as an initial guess (previous tick's solution
+    /// shifted by one is the canonical choice) and **overwritten** with
+    /// the new optimum so the caller can warm-start next call. Pass a
+    /// zero-filled vector on the first invocation.
+    ///
+    /// `max_iter` caps the projected-gradient iterations. 20–50 is
+    /// enough once warm-started; first cold solve may need more.
+    #[must_use]
+    pub fn solve(
+        &self,
+        e_0: nalgebra::Vector2<f32>,
+        warm_u: &mut nalgebra::SVector<f32, H>,
+        max_iter: usize,
+    ) -> f32 {
+        // Linear term g = lin_from_e0 · e_0.
+        let g = self.lin_from_e0 * e_0;
+        // Project initial guess into the box.
+        for k in 0..H {
+            if let Some(slot) = warm_u.get_mut(k) {
+                *slot = slot.clamp(self.u_min, self.u_max);
+            }
+        }
+        // Projected gradient.
+        for _ in 0..max_iter {
+            let grad = self.hessian * (*warm_u) + g;
+            *warm_u -= grad * self.step_size;
+            for k in 0..H {
+                if let Some(slot) = warm_u.get_mut(k) {
+                    *slot = slot.clamp(self.u_min, self.u_max);
+                }
+            }
+        }
+        warm_u.get(0).copied().unwrap_or(0.0)
+    }
+}
+
+/// Internal: solve the 2×2 DARE and return P. Same iteration as
+/// [`compute_lqr_gains`] but returns the full P rather than the gain.
+/// Kept private because callers should stick to the gain API unless
+/// they're building an MPC terminal cost like we are here.
+fn dare_2x2(weights: LqrWeights, dt_s: f32) -> Option<nalgebra::Matrix2<f32>> {
+    if !dt_s.is_finite()
+        || dt_s <= 0.0
+        || weights.r <= 0.0
+        || weights.q_pos < 0.0
+        || weights.q_vel < 0.0
+    {
+        return None;
+    }
+    let a = nalgebra::Matrix2::new(1.0_f32, dt_s, 0.0, 1.0);
+    let b = nalgebra::Vector2::new(0.5 * dt_s * dt_s, dt_s);
+    let q_mat = nalgebra::Matrix2::new(weights.q_pos, 0.0, 0.0, weights.q_vel);
+    let mut p = q_mat;
+    let mut prev_trace = p.m11 + p.m22;
+    for _ in 0..200 {
+        let atp = a.transpose() * p;
+        let btp = b.transpose() * p;
+        let bpb = (btp * b).x;
+        let denom = weights.r + bpb;
+        if denom <= 0.0 || !denom.is_finite() {
+            return None;
+        }
+        let correction = (atp * b * btp * a) * (1.0 / denom);
+        let next = atp * a - correction + q_mat;
+        if !next.iter().all(|x| x.is_finite()) {
+            return None;
+        }
+        let trace = next.m11 + next.m22;
+        p = next;
+        if (trace - prev_trace).abs() < 1.0e-6 * (1.0 + trace.abs()) {
+            break;
+        }
+        prev_trace = trace;
+    }
+    Some(p)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 mod tests {
@@ -688,6 +990,108 @@ mod tests {
         // Integrator disabled in LQR baseline.
         assert_eq!(pg.k_i_vel, Vector3::zeros());
         assert_eq!(pg.max_accel, 8.0);
+    }
+
+    // ------------------------------------------------------------------
+    // M9.1 MPC tests
+    // ------------------------------------------------------------------
+
+    const MPC_H: usize = 10;
+
+    fn default_mpc_config(tight_box: bool) -> Mpc1dConfig {
+        Mpc1dConfig {
+            weights: LqrWeights::default(),
+            dt_s: 0.05,
+            u_min: if tight_box { -3.0 } else { -100.0 },
+            u_max: if tight_box { 3.0 } else { 100.0 },
+        }
+    }
+
+    #[test]
+    fn mpc_new_rejects_bad_inputs() {
+        // dt ≤ 0
+        let mut cfg = default_mpc_config(false);
+        cfg.dt_s = 0.0;
+        assert!(Mpc1d::<MPC_H>::new(cfg).is_none());
+        cfg.dt_s = -0.01;
+        assert!(Mpc1d::<MPC_H>::new(cfg).is_none());
+        cfg.dt_s = f32::NAN;
+        assert!(Mpc1d::<MPC_H>::new(cfg).is_none());
+        // u_min > u_max
+        let mut cfg = default_mpc_config(false);
+        cfg.u_min = 1.0;
+        cfg.u_max = -1.0;
+        assert!(Mpc1d::<MPC_H>::new(cfg).is_none());
+        // r ≤ 0
+        let mut cfg = default_mpc_config(false);
+        cfg.weights.r = 0.0;
+        assert!(Mpc1d::<MPC_H>::new(cfg).is_none());
+        // H = 0 (zero horizon) — exercise the const path.
+        let ok_cfg = default_mpc_config(false);
+        assert!(Mpc1d::<0>::new(ok_cfg).is_none());
+    }
+
+    #[test]
+    fn mpc_unconstrained_solution_matches_lqr_first_action() {
+        // With loose box, first-step MPC command should be very close to
+        // what the infinite-horizon LQR (same Q/R) prescribes.
+        let cfg = default_mpc_config(false);
+        let mpc = Mpc1d::<MPC_H>::new(cfg).unwrap();
+        let lqr = compute_lqr_gains(cfg.weights, cfg.dt_s).unwrap();
+        let e0 = nalgebra::Vector2::new(0.5_f32, 0.0);
+        let mut warm = nalgebra::SVector::<f32, MPC_H>::zeros();
+        let u = mpc.solve(e0, &mut warm, 500);
+        let u_lqr = -(lqr.k_p * e0.x + lqr.k_v * e0.y);
+        assert!((u - u_lqr).abs() < 0.05, "MPC u0 {u} vs LQR u {u_lqr}");
+    }
+
+    #[test]
+    fn mpc_respects_box_constraint() {
+        // Tight u_max. From a large position error, unconstrained LQR
+        // would command far above u_max; MPC must clamp.
+        let cfg = default_mpc_config(true);
+        let mpc = Mpc1d::<MPC_H>::new(cfg).unwrap();
+        let e0 = nalgebra::Vector2::new(10.0_f32, 0.0);
+        let mut warm = nalgebra::SVector::<f32, MPC_H>::zeros();
+        let u = mpc.solve(e0, &mut warm, 200);
+        assert!(u >= cfg.u_min - 1.0e-3);
+        assert!(u <= cfg.u_max + 1.0e-3);
+        // And every horizon step must be feasible too.
+        for k in 0..MPC_H {
+            let w = warm.get(k).copied().unwrap_or(0.0);
+            assert!(w >= cfg.u_min - 1.0e-3 && w <= cfg.u_max + 1.0e-3);
+        }
+    }
+
+    #[test]
+    fn mpc_closed_loop_converges_under_tight_box() {
+        // Simulate double-integrator closed-loop with MPC driving u.
+        // Initial offset (1, 0), u constrained to [-3, 3] — should
+        // converge to ~0 in a few seconds even with constraint active.
+        let cfg = default_mpc_config(true);
+        let mpc = Mpc1d::<MPC_H>::new(cfg).unwrap();
+        let mut warm = nalgebra::SVector::<f32, MPC_H>::zeros();
+        let (mut pos, mut vel) = (1.0_f32, 0.0_f32);
+        for _ in 0..200 {
+            let e = nalgebra::Vector2::new(pos, vel);
+            let u = mpc.solve(e, &mut warm, 50);
+            // Euler-integrate single-axis double integrator at cfg.dt_s.
+            pos += vel * cfg.dt_s + 0.5 * u * cfg.dt_s * cfg.dt_s;
+            vel += u * cfg.dt_s;
+        }
+        assert!(
+            pos.abs() < 0.05 && vel.abs() < 0.05,
+            "converged pos={pos} vel={vel}"
+        );
+    }
+
+    #[test]
+    fn mpc_zero_error_produces_zero_command() {
+        let cfg = default_mpc_config(false);
+        let mpc = Mpc1d::<MPC_H>::new(cfg).unwrap();
+        let mut warm = nalgebra::SVector::<f32, MPC_H>::zeros();
+        let u = mpc.solve(nalgebra::Vector2::zeros(), &mut warm, 100);
+        assert!(u.abs() < 1.0e-4, "expected u≈0, got {u}");
     }
 
     #[test]
