@@ -63,6 +63,7 @@
 | [0057](./0057-embassy-runtime.md) | 2026-04-22 | M7.2 embassy async runtime | `1064645` | `#[embassy_executor::main]` 替代 cortex-m-rt entry；TIM2 time driver；rate_loop @ 1kHz + heartbeat @ 1Hz 两个 task；`critical-section-single-core` 特性解 link 错误；**298 KiB release ELF**。 |
 | [0058](./0058-defmt-probe-rs.md) | 2026-04-22 | M7.3 defmt-rtt + probe-rs runner | `498f320` | `.cargo/config.toml` 加 `runner = probe-rs run --chip STM32H753ZITx` + `-Tdefmt.x`；firmware 用 defmt_rtt/panic_probe；heartbeat_task 每秒 `defmt::info!` 出 RTT；修 `+fp-armv8d16sp` 错指令（M7 用 VFPv5 非 Armv8-M），硬件 FPU 恢复后 release ELF **298 KiB → 91 KiB**。 |
 | [0059](./0059-icm42688-driver.md) | 2026-04-22 | M7.4 ICM-42688 IMU 驱动 | `f371158` | `core-hal::imu::icm42688` 纯 `embedded-hal::SpiDevice` 泛型驱动：`new` 查 WHO_AM_I、`configure` 设 1kHz/±16g/±2000dps、`read_sample` 14-byte burst + SI 标度；6 新测试用自制 MockSpi，workspace 189 全绿；thumbv7em 编译过。 |
+| [0060](./0060-lqr-position.md) | 2026-04-22 | M9.0 LQR 位置环 | `1738c0a` | `compute_lqr_gains` 迭代 DARE 求解 2×2 双积分器最优反馈 + `lqr_position_gains` helper 包三轴；**plan.md 四大创新点之一 NMPC 的起点**（无约束 + 无限 horizon）；SITL 闭环 3s 内悬停误差 < 25 cm；workspace 196 tests 全绿。 |
 
 ## 写新文档时遵守的模板
 
