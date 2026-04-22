@@ -18,7 +18,7 @@
 use algo_ekf::GRAVITY_M_S2;
 use algo_nmpc::Setpoint;
 use app_copter::{
-    ArmState, FlightState, LandingState, TakeoffState, apply_baro_measurement,
+    ArmState, FlightState, LandingState, RtlPhase, TakeoffState, apply_baro_measurement,
     apply_gps_measurement, apply_mag_measurement, default_config_250g, outer_step,
 };
 use mavlink::common::{MavCmd, MavMessage, MavResult};
@@ -27,7 +27,7 @@ use sim_hil::{
     SimConfig, SimRng, SimState, accel_world,
     mavlink_udp::{
         MavlinkUdpSink, arm_change_from_mav_message, land_request_from_mav_message,
-        setpoint_from_mav_message, takeoff_request_from_mav_message,
+        rtl_request_from_mav_message, setpoint_from_mav_message, takeoff_request_from_mav_message,
     },
     sense_baro, sense_gps, sense_imu, sense_mag, step,
 };
@@ -75,6 +75,11 @@ async fn main() -> anyhow::Result<()> {
     let takeoff_state = Arc::new(Mutex::new(TakeoffState::Idle));
     let takeoff_state_sim = Arc::clone(&takeoff_state);
 
+    // Shared RTL phase. RTL command from GCS starts `Climbing`; outer_step
+    // drives through the phases and hands off to Landing at the end.
+    let rtl_phase = Arc::new(Mutex::new(RtlPhase::Idle));
+    let rtl_phase_sim = Arc::clone(&rtl_phase);
+
     let sim_task = tokio::task::spawn_blocking(move || {
         run_sim(
             tx,
@@ -82,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
             arm_state_sim,
             landing_state_sim,
             takeoff_state_sim,
+            rtl_phase_sim,
         )
     });
 
@@ -132,6 +138,14 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            if rtl_request_from_mav_message(&msg) {
+                if let Ok(mut r) = rtl_phase.lock() {
+                    if *r == RtlPhase::Idle {
+                        *r = RtlPhase::Climbing;
+                        tracing::info!("RTL command received — returning to launch");
+                    }
+                }
+            }
             if let Some(altitude_m) = takeoff_request_from_mav_message(&msg) {
                 // TAKEOFF implies ARM: if the GCS sends TAKEOFF, the
                 // operator wants to fly — auto-arm so the demo does the
@@ -155,7 +169,8 @@ async fn main() -> anyhow::Result<()> {
                 let result = match data.command {
                     MavCmd::MAV_CMD_COMPONENT_ARM_DISARM
                     | MavCmd::MAV_CMD_NAV_LAND
-                    | MavCmd::MAV_CMD_NAV_TAKEOFF => MavResult::MAV_RESULT_ACCEPTED,
+                    | MavCmd::MAV_CMD_NAV_TAKEOFF
+                    | MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH => MavResult::MAV_RESULT_ACCEPTED,
                     _ => MavResult::MAV_RESULT_UNSUPPORTED,
                 };
                 sink.send_command_ack(data.command, result).await.ok();
@@ -212,6 +227,7 @@ fn run_sim(
     arm_state: Arc<Mutex<ArmState>>,
     landing_state: Arc<Mutex<LandingState>>,
     takeoff_state: Arc<Mutex<TakeoffState>>,
+    rtl_phase: Arc<Mutex<RtlPhase>>,
 ) {
     let sim_cfg = SimConfig::realistic_dynamics(Vector3::zeros());
     let mut sim_state = SimState {
@@ -245,12 +261,13 @@ fn run_sim(
             .lock()
             .map(|t| *t)
             .unwrap_or(TakeoffState::Idle);
+        flight.rtl_phase = rtl_phase.lock().map(|r| *r).unwrap_or(RtlPhase::Idle);
 
         let out = outer_step(&mut app_cfg, &mut flight, imu, dt, &current_sp);
 
-        // outer_step may auto-disarm, clear landing, or finish takeoff
-        // — push all three back so the telemetry task and the GCS-
-        // facing shared state reflect the latest reality.
+        // outer_step may auto-disarm, clear landing, finish takeoff, or
+        // advance RTL — push all four back so the telemetry task and
+        // the GCS-facing shared state reflect the latest reality.
         if let Ok(mut shared) = arm_state.lock() {
             *shared = flight.arm_state;
         }
@@ -259,6 +276,9 @@ fn run_sim(
         }
         if let Ok(mut shared) = takeoff_state.lock() {
             *shared = flight.takeoff_state;
+        }
+        if let Ok(mut shared) = rtl_phase.lock() {
+            *shared = flight.rtl_phase;
         }
         step(&sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
 

@@ -49,6 +49,18 @@ pub fn setpoint_from_mav_message(msg: &MavMessage) -> Option<Setpoint> {
     }
 }
 
+/// Returns `true` if `msg` is a COMMAND_LONG requesting return-to-
+/// launch (`MAV_CMD_NAV_RETURN_TO_LAUNCH`, id 20). RTL carries no
+/// params — it always goes to the home xy at the configured safe
+/// altitude.
+#[must_use]
+pub fn rtl_request_from_mav_message(msg: &MavMessage) -> bool {
+    if let MavMessage::COMMAND_LONG(data) = msg {
+        return data.command == mavlink::common::MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH;
+    }
+    false
+}
+
 /// Returns `Some(altitude_m)` if `msg` is a COMMAND_LONG requesting
 /// automatic takeoff (`MAV_CMD_NAV_TAKEOFF`, id 22). `altitude_m` is
 /// `param7` — the target altitude in metres above the home position
@@ -416,6 +428,39 @@ mod tests {
             }
             _ => panic!("expected COMMAND_ACK, got {msg:?}"),
         }
+    }
+
+    #[test]
+    fn rtl_request_matches_only_nav_return_to_launch() {
+        use mavlink::common::COMMAND_LONG_DATA;
+        let rtl = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+            param1: 0.0,
+            param2: 0.0,
+            param3: 0.0,
+            param4: 0.0,
+            param5: 0.0,
+            param6: 0.0,
+            param7: 0.0,
+            command: mavlink::common::MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH,
+            target_system: 1,
+            target_component: 1,
+            confirmation: 0,
+        });
+        assert!(rtl_request_from_mav_message(&rtl));
+        let land = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+            param1: 0.0,
+            param2: 0.0,
+            param3: 0.0,
+            param4: 0.0,
+            param5: 0.0,
+            param6: 0.0,
+            param7: 0.0,
+            command: mavlink::common::MavCmd::MAV_CMD_NAV_LAND,
+            target_system: 1,
+            target_component: 1,
+            confirmation: 0,
+        });
+        assert!(!rtl_request_from_mav_message(&land));
     }
 
     #[test]

@@ -70,6 +70,13 @@ pub struct RateLoopConfig {
     /// Commanded climb rate (m/s, magnitude — NED conversion handled
     /// internally) while [`TakeoffState::TakingOff`] is active.
     pub takeoff_climb_mps: f32,
+    /// RTL cruise altitude (m above home, positive). Vehicle climbs to
+    /// this altitude before transiting horizontally to home.
+    pub rtl_safe_alt_m: f32,
+    /// Tolerance (m) for "we've reached the RTL target xy". Smaller →
+    /// tighter station-keeping but more time spent near home; larger →
+    /// early hand-off to Landing.
+    pub rtl_xy_tolerance_m: f32,
 }
 
 /// Whether the vehicle is allowed to drive its motors.
@@ -95,6 +102,25 @@ pub enum LandingState {
     #[default]
     Idle,
     Landing,
+}
+
+/// Automatic return-to-launch state machine.
+///
+/// A 3-phase sequence driven by a single external trigger
+/// (`MAV_CMD_NAV_RETURN_TO_LAUNCH`):
+///
+///   1. `Climbing` — ascend to `rtl_safe_alt_m` above home if currently below it. Skipped if already at / above safe alt.
+///   2. `Returning` — cruise to the home xy while holding `rtl_safe_alt_m`.
+///   3. Automatic hand-off to [`LandingState::Landing`] which runs the existing touchdown-detect + auto-disarm flow.
+///
+/// `Idle` is the default; `outer_step` drops back to `Idle` as soon as
+/// the landing hand-off is made, so the caller's setpoint resumes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RtlPhase {
+    #[default]
+    Idle,
+    Climbing,
+    Returning,
 }
 
 /// Automatic climb-to-altitude state machine.
@@ -223,9 +249,11 @@ pub struct FlightState {
     /// `TakingOff`.
     pub altitude_reached_detector: AltitudeReachedDetector,
     /// Position latched at first arm. Used as the reference for TAKEOFF
-    /// (climb target = home + (0,0,-alt)) and future RTL (return target
-    /// = home xy). `None` until the vehicle has been armed once.
+    /// (climb target = home + (0,0,-alt)) and RTL (return target = home
+    /// xy). `None` until the vehicle has been armed once.
     pub home_position_ned: Option<Vector3<f32>>,
+    /// Return-to-launch phase.
+    pub rtl_phase: RtlPhase,
 }
 
 impl Default for FlightState {
@@ -244,6 +272,7 @@ impl Default for FlightState {
             takeoff_state: TakeoffState::default(),
             altitude_reached_detector: AltitudeReachedDetector::new(),
             home_position_ned: None,
+            rtl_phase: RtlPhase::default(),
         }
     }
 }
@@ -383,6 +412,12 @@ pub fn default_config_250g() -> RateLoopConfig {
         // responsive, slow enough to stay well within the vehicle's
         // thrust envelope at any payload.
         takeoff_climb_mps: 1.0,
+        // 10 m RTL altitude clears typical obstacles (treeline, single-
+        // story buildings). Operators should raise this for forested
+        // environments.
+        rtl_safe_alt_m: 10.0,
+        // 1 m "we're home" threshold. Within this → hand off to Landing.
+        rtl_xy_tolerance_m: 1.0,
     }
 }
 
@@ -445,9 +480,40 @@ pub fn outer_step(
         flight.home_position_ned = Some(flight.state.position_ned);
     }
 
+    // RTL phase transitions (run before setpoint override so the override
+    // sees the post-transition phase).
+    if flight.rtl_phase != RtlPhase::Idle {
+        if let Some(home) = flight.home_position_ned {
+            let safe_z = home.z - cfg.rtl_safe_alt_m;
+            match flight.rtl_phase {
+                RtlPhase::Climbing => {
+                    if flight.state.position_ned.z <= safe_z + 0.3 {
+                        flight.rtl_phase = RtlPhase::Returning;
+                    }
+                }
+                RtlPhase::Returning => {
+                    let dx = flight.state.position_ned.x - home.x;
+                    let dy = flight.state.position_ned.y - home.y;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist < cfg.rtl_xy_tolerance_m {
+                        flight.rtl_phase = RtlPhase::Idle;
+                        flight.landing_state = LandingState::Landing;
+                    }
+                }
+                RtlPhase::Idle => {}
+            }
+        } else {
+            // RTL with no home latched is a no-op; clear it.
+            flight.rtl_phase = RtlPhase::Idle;
+        }
+    }
+
     // Landing and Takeoff are mutually exclusive mode overrides on the
     // setpoint. Landing dominates (safer — "descend and disarm" should
     // always win over "climb"). Otherwise takeoff drives to target_z.
+    // RTL is layered on top: when RTL is active it overrides the caller
+    // setpoint (if not already in Landing) to drive to the safe alt +
+    // home xy.
     let override_sp;
     let active_sp: &Setpoint = if flight.landing_state == LandingState::Landing {
         let current_z = flight.state.position_ned.z;
@@ -473,6 +539,22 @@ pub fn outer_step(
         override_sp = Setpoint {
             position_ned: Vector3::new(home_xy.x, home_xy.y, target_z_ned),
             velocity_ned: Vector3::new(0.0, 0.0, climb_v),
+            accel_ned: Vector3::zeros(),
+            yaw_rad: setpoint.yaw_rad,
+        };
+        &override_sp
+    } else if flight.rtl_phase != RtlPhase::Idle {
+        let home = flight
+            .home_position_ned
+            .unwrap_or(flight.state.position_ned);
+        let safe_z = home.z - cfg.rtl_safe_alt_m;
+        let target_xy = match flight.rtl_phase {
+            RtlPhase::Climbing => (flight.state.position_ned.x, flight.state.position_ned.y),
+            _ => (home.x, home.y),
+        };
+        override_sp = Setpoint {
+            position_ned: Vector3::new(target_xy.0, target_xy.1, safe_z),
+            velocity_ned: Vector3::zeros(),
             accel_ned: Vector3::zeros(),
             yaw_rad: setpoint.yaw_rad,
         };
@@ -933,6 +1015,90 @@ mod tests {
         for _ in 0..2000 {
             assert!(!d.observe(-5.0, 1.0, -5.0, 0.001));
         }
+    }
+
+    #[test]
+    fn rtl_without_home_is_cleared_to_idle() {
+        // Disarmed means the first-arm latch doesn't fire, so
+        // home_position_ned stays None. RTL in this state has no target
+        // and must clear itself.
+        let mut cfg = default_config_250g();
+        let mut flight = FlightState {
+            arm_state: ArmState::Disarmed,
+            rtl_phase: RtlPhase::Climbing,
+            home_position_ned: None,
+            ..FlightState::default()
+        };
+        let _ = outer_step(
+            &mut cfg,
+            &mut flight,
+            stationary_imu(0),
+            0.001,
+            &Setpoint::default(),
+        );
+        assert_eq!(flight.rtl_phase, RtlPhase::Idle);
+        assert!(flight.home_position_ned.is_none());
+    }
+
+    #[test]
+    fn rtl_climb_to_safe_alt_then_transit_then_land() {
+        let mut cfg = default_config_250g();
+        cfg.rtl_safe_alt_m = 5.0;
+        cfg.rtl_xy_tolerance_m = 0.5;
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            rtl_phase: RtlPhase::Climbing,
+            home_position_ned: Some(Vector3::new(0.0, 0.0, 0.0)),
+            ..FlightState::default()
+        };
+        // Start 20 m from home, at -1 m altitude (below safe alt -5).
+        flight.state.position_ned = Vector3::new(15.0, -10.0, -1.0);
+
+        // Step 1: Climbing. Simulate z reaching safe alt.
+        flight.state.position_ned.z = -5.0;
+        let _ = outer_step(
+            &mut cfg,
+            &mut flight,
+            stationary_imu(0),
+            0.001,
+            &Setpoint::default(),
+        );
+        assert_eq!(flight.rtl_phase, RtlPhase::Returning);
+
+        // Step 2: Returning. Simulate xy reaching home within tolerance.
+        flight.state.position_ned = Vector3::new(0.2, -0.1, -5.0);
+        let _ = outer_step(
+            &mut cfg,
+            &mut flight,
+            stationary_imu(0),
+            0.001,
+            &Setpoint::default(),
+        );
+        assert_eq!(flight.rtl_phase, RtlPhase::Idle);
+        assert_eq!(flight.landing_state, LandingState::Landing);
+    }
+
+    #[test]
+    fn rtl_already_above_safe_alt_skips_climb() {
+        let mut cfg = default_config_250g();
+        cfg.rtl_safe_alt_m = 5.0;
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            rtl_phase: RtlPhase::Climbing,
+            home_position_ned: Some(Vector3::new(0.0, 0.0, 0.0)),
+            ..FlightState::default()
+        };
+        // Already at -10 m (10 m above home) — above safe alt of 5 m.
+        flight.state.position_ned = Vector3::new(5.0, 5.0, -10.0);
+        let _ = outer_step(
+            &mut cfg,
+            &mut flight,
+            stationary_imu(0),
+            0.001,
+            &Setpoint::default(),
+        );
+        // One tick is enough to skip to Returning.
+        assert_eq!(flight.rtl_phase, RtlPhase::Returning);
     }
 
     #[test]
