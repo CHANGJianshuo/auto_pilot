@@ -54,6 +54,7 @@
 | [0048](./0048-land-autodisarm.md) | 2026-04-21 | M5.7 LAND + 触地 auto-disarm | `4191611` | `LandingState { Idle(Default), Landing }` + `TouchdownDetector`（三条件 AND + 1s 持续）；Landing 态 outer_step 覆盖 setpoint 原地下降 0.5 m/s 并在触地时自动 disarm；`land_request_from_mav_message` 解 COMMAND_LONG(21)；demo 双向同步；5 新测试，188 单元测试全绿。 |
 | [0049](./0049-command-ack.md) | 2026-04-21 | M5.8 COMMAND_ACK | `a7e24c6` | `encode_command_ack` + `send_command_ack`；demo 对每个 COMMAND_LONG 回 ACCEPTED/UNSUPPORTED，消除 QGC 按钮 spinner；round-trip 测试验证 encode/parse 双向兼容。 |
 | [0050](./0050-fmt-cleanup.md) | 2026-04-22 | M6.0 Workspace fmt 统一 | `9d986af` | `cargo fmt` 一把梭，11 files / 472 lines insertion，0 行为改动；`cargo fmt --check` 现在全绿，下一步进 CI。 |
+| [0051](./0051-ci-workflow.md) | 2026-04-22 | M6.1 CI workflow pinned | `47b1283` | `.github/workflows/ci.yml` fmt/clippy/test/build-fw/geiger 五 job，toolchain 硬 pin 1.88.0 和 `rust-toolchain.toml` 对齐；防 "本地绿 CI 红" 漂移。 |
 
 ## 写新文档时遵守的模板
 
