@@ -55,6 +55,7 @@
 | [0049](./0049-command-ack.md) | 2026-04-21 | M5.8 COMMAND_ACK | `a7e24c6` | `encode_command_ack` + `send_command_ack`；demo 对每个 COMMAND_LONG 回 ACCEPTED/UNSUPPORTED，消除 QGC 按钮 spinner；round-trip 测试验证 encode/parse 双向兼容。 |
 | [0050](./0050-fmt-cleanup.md) | 2026-04-22 | M6.0 Workspace fmt 统一 | `9d986af` | `cargo fmt` 一把梭，11 files / 472 lines insertion，0 行为改动；`cargo fmt --check` 现在全绿，下一步进 CI。 |
 | [0051](./0051-ci-workflow.md) | 2026-04-22 | M6.1 CI workflow pinned | `47b1283` | `.github/workflows/ci.yml` fmt/clippy/test/build-fw/geiger 五 job，toolchain 硬 pin 1.88.0 和 `rust-toolchain.toml` 对齐；防 "本地绿 CI 红" 漂移。 |
+| [0052](./0052-takeoff-home.md) | 2026-04-22 | M6.2 TAKEOFF + home | `d2d1469` | `TakeoffState { Idle, TakingOff { target_z_ned } }` + `AltitudeReachedDetector` + 首次 arm 记 home；`outer_step` 爬升到 target（1 m/s）再回 Idle；`takeoff_request_from_mav_message` 解 COMMAND_LONG(22)；demo auto-arm；4 新测试。 |
 
 ## 写新文档时遵守的模板
 
