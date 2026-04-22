@@ -44,6 +44,9 @@ libm = { workspace = true }
 cortex-m = { workspace = true }
 cortex-m-rt = { workspace = true }
 panic-halt = { workspace = true }
+embassy-executor = { workspace = true }
+embassy-time = { workspace = true }
+embassy-stm32 = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
