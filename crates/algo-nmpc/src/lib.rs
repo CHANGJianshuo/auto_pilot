@@ -610,6 +610,50 @@ impl<const H: usize> Mpc1d<H> {
     }
 }
 
+/// Internal: solve the augmented 3×3 DARE for the LQI problem and
+/// return P. Used as the MPC-I terminal cost in [`Mpc1dI::new`].
+fn dare_3x3(weights: LqiWeights, dt_s: f32) -> Option<nalgebra::Matrix3<f32>> {
+    if !dt_s.is_finite()
+        || dt_s <= 0.0
+        || weights.r <= 0.0
+        || weights.q_pos < 0.0
+        || weights.q_vel < 0.0
+        || weights.q_i < 0.0
+    {
+        return None;
+    }
+    let a = nalgebra::Matrix3::new(1.0_f32, dt_s, 0.0, 0.0, 1.0, 0.0, dt_s, 0.0, 1.0);
+    let b = nalgebra::Vector3::new(0.5 * dt_s * dt_s, dt_s, 0.0);
+    let q_mat = nalgebra::Matrix3::from_diagonal(&nalgebra::Vector3::new(
+        weights.q_pos,
+        weights.q_vel,
+        weights.q_i,
+    ));
+    let mut p = q_mat;
+    let mut prev_trace = p.m11 + p.m22 + p.m33;
+    for _ in 0..500 {
+        let atp = a.transpose() * p;
+        let btp = b.transpose() * p;
+        let bpb = (btp * b).x;
+        let denom = weights.r + bpb;
+        if denom <= 0.0 || !denom.is_finite() {
+            return None;
+        }
+        let correction = (atp * b * btp * a) * (1.0 / denom);
+        let next = atp * a - correction + q_mat;
+        if !next.iter().all(|x| x.is_finite()) {
+            return None;
+        }
+        let trace = next.m11 + next.m22 + next.m33;
+        p = next;
+        if (trace - prev_trace).abs() < 1.0e-6 * (1.0 + trace.abs()) {
+            break;
+        }
+        prev_trace = trace;
+    }
+    Some(p)
+}
+
 /// Internal: solve the 2×2 DARE and return P. Same iteration as
 /// [`compute_lqr_gains`] but returns the full P rather than the gain.
 /// Kept private because callers should stick to the gain API unless
@@ -820,6 +864,9 @@ pub enum PositionController<const H: usize> {
     /// LQR augmented with an integrator state (M9.3). Cheap + cancels
     /// steady-state bias under constant disturbance.
     Lqi(Lqi3dPositionController),
+    /// Constraint-aware MPC + integrator state (M9.5). Combines MPC's
+    /// look-ahead + box constraints with LQI's bias rejection.
+    MpcI(MpcI3dPositionController<H>),
 }
 
 impl<const H: usize> PositionController<H> {
@@ -871,6 +918,19 @@ impl<const H: usize> PositionController<H> {
             .map(Self::Lqi)
     }
 
+    /// Build an `MpcI` variant (MPC with integrator).
+    #[must_use]
+    pub fn mpc_i(
+        cfg_xy: Mpc1dIConfig,
+        cfg_z: Mpc1dIConfig,
+        max_iter: usize,
+        max_accel: f32,
+        integrator_max: f32,
+    ) -> Option<Self> {
+        MpcI3dPositionController::new(cfg_xy, cfg_z, max_iter, max_accel, integrator_max)
+            .map(Self::MpcI)
+    }
+
     /// Single-tick dispatch. `dt_s` is consumed by the PI integrator
     /// update and ignored by variants that baked `dt_s` in at
     /// construction (MPC / LQI).
@@ -905,6 +965,7 @@ impl<const H: usize> PositionController<H> {
             ),
             Self::Mpc(c) => c.step(setpoint, current_position, current_velocity, mass_kg),
             Self::Lqi(c) => c.step(setpoint, current_position, current_velocity, mass_kg),
+            Self::MpcI(c) => c.step(setpoint, current_position, current_velocity, mass_kg),
         }
     }
 
@@ -915,6 +976,7 @@ impl<const H: usize> PositionController<H> {
             Self::Lqr { .. } => {}
             Self::Mpc(c) => c.reset_warm_start(),
             Self::Lqi(c) => c.reset_integrator(),
+            Self::MpcI(c) => c.reset(),
         }
     }
 
@@ -926,6 +988,7 @@ impl<const H: usize> PositionController<H> {
             Self::Lqr { .. } => "LQR",
             Self::Mpc(_) => "MPC",
             Self::Lqi(_) => "LQI",
+            Self::MpcI(_) => "MPC-I",
         }
     }
 }
@@ -1198,6 +1261,328 @@ fn accel_to_attitude_thrust(
     AttitudeAndThrust {
         q_desired: q_des,
         thrust_n: thrust_mag,
+    }
+}
+
+// ----------------------------------------------------------------------------
+// M9.5 — MPC-I: constraint-aware MPC with integrator state
+// ----------------------------------------------------------------------------
+//
+// Combines M9.1 MPC (finite horizon + box constraints) with M9.3 LQI
+// (integrator state to kill constant disturbances). The augmented
+// state carries the integrator as its third component, so the QP
+// terminal cost sees it and the optimiser considers integrator build-up
+// as part of the tracking cost.
+//
+// Augmented model (per axis, error coords z = [e_p, e_v, i]):
+//   A_z = [[1, dt, 0], [0, 1, 0], [dt, 0, 1]]
+//   B_z = [dt²/2, dt, 0]
+//   Q_z = diag(q_pos, q_vel, q_i),  R = r
+//   i_{k+1} = i_k + e_p_k · dt  (third row of A_z)
+//
+// Reduced QP: identical shape to Mpc1d, just with 3-dim state
+// propagation — Hessian is still H×H, linear-term map is H×3 (`z_0`
+// instead of `e_0`).
+
+/// Static configuration for MPC-I.
+#[derive(Clone, Copy, Debug)]
+pub struct Mpc1dIConfig {
+    pub weights: LqiWeights,
+    pub dt_s: f32,
+    pub u_min: f32,
+    pub u_max: f32,
+}
+
+/// MPC-I solver. Sibling of [`Mpc1d`] with augmented-state dynamics.
+#[derive(Clone, Debug)]
+pub struct Mpc1dI<const H: usize> {
+    hessian: nalgebra::SMatrix<f32, H, H>,
+    /// `g = lin_from_z0 · z_0`  where z_0 = [e_p, e_v, i].
+    lin_from_z0: nalgebra::SMatrix<f32, H, 3>,
+    u_min: f32,
+    u_max: f32,
+    step_size: f32,
+}
+
+impl<const H: usize> Mpc1dI<H> {
+    /// Pre-compute the QP matrices. See [`Mpc1d::new`] for the general
+    /// approach; this variant uses a 3-dim state and [`dare_3x3`] for
+    /// the terminal cost.
+    #[allow(clippy::indexing_slicing)]
+    #[must_use]
+    pub fn new(config: Mpc1dIConfig) -> Option<Self> {
+        if H == 0 || !config.dt_s.is_finite() || config.dt_s <= 0.0 {
+            return None;
+        }
+        if config.u_max < config.u_min || !config.u_min.is_finite() || !config.u_max.is_finite() {
+            return None;
+        }
+        if config.weights.r <= 0.0
+            || config.weights.q_pos < 0.0
+            || config.weights.q_vel < 0.0
+            || config.weights.q_i < 0.0
+        {
+            return None;
+        }
+
+        let p_terminal = dare_3x3(config.weights, config.dt_s)?;
+
+        let dt = config.dt_s;
+        let a = nalgebra::Matrix3::new(1.0_f32, dt, 0.0, 0.0, 1.0, 0.0, dt, 0.0, 1.0);
+        let b_vec = nalgebra::Vector3::new(0.5 * dt * dt, dt, 0.0);
+        let q_mat = nalgebra::Matrix3::from_diagonal(&nalgebra::Vector3::new(
+            config.weights.q_pos,
+            config.weights.q_vel,
+            config.weights.q_i,
+        ));
+
+        let mut hessian = nalgebra::SMatrix::<f32, H, H>::zeros();
+        let mut lin_from_z0 = nalgebra::SMatrix::<f32, H, 3>::zeros();
+
+        let mut a_pow_b = [nalgebra::Vector3::<f32>::zeros(); 64];
+        if H >= a_pow_b.len() {
+            return None;
+        }
+        a_pow_b[0] = b_vec;
+        for m in 1..H {
+            a_pow_b[m] = a * a_pow_b[m - 1];
+        }
+
+        let mut f_pow = [nalgebra::Matrix3::<f32>::identity(); 64];
+        for k in 1..=H {
+            f_pow[k] = a * f_pow[k - 1];
+        }
+
+        for k in 1..H {
+            let f_k = f_pow[k];
+            for j in 0..k {
+                let g_col_k_j = a_pow_b[k - 1 - j];
+                for jp in 0..k {
+                    let g_col_k_jp = a_pow_b[k - 1 - jp];
+                    let contrib = g_col_k_jp.dot(&(q_mat * g_col_k_j));
+                    let cur = hessian.get((jp, j)).copied().unwrap_or(0.0);
+                    if let Some(slot) = hessian.get_mut((jp, j)) {
+                        *slot = cur + contrib;
+                    }
+                }
+                let row_vec = (q_mat * f_k).transpose() * g_col_k_j;
+                for col in 0..3 {
+                    let cur = lin_from_z0.get((j, col)).copied().unwrap_or(0.0);
+                    if let Some(slot) = lin_from_z0.get_mut((j, col)) {
+                        *slot = cur + row_vec.get(col).copied().unwrap_or(0.0);
+                    }
+                }
+            }
+        }
+
+        let r = config.weights.r;
+        for k in 0..H {
+            if let Some(slot) = hessian.get_mut((k, k)) {
+                *slot += r;
+            }
+        }
+
+        let f_h = f_pow[H];
+        for j in 0..H {
+            let w_j = a_pow_b[H - 1 - j];
+            for jp in 0..H {
+                let w_jp = a_pow_b[H - 1 - jp];
+                let contrib = w_jp.dot(&(p_terminal * w_j));
+                let cur = hessian.get((jp, j)).copied().unwrap_or(0.0);
+                if let Some(slot) = hessian.get_mut((jp, j)) {
+                    *slot = cur + contrib;
+                }
+            }
+            let row_vec = (p_terminal * f_h).transpose() * w_j;
+            for col in 0..3 {
+                let cur = lin_from_z0.get((j, col)).copied().unwrap_or(0.0);
+                if let Some(slot) = lin_from_z0.get_mut((j, col)) {
+                    *slot = cur + row_vec.get(col).copied().unwrap_or(0.0);
+                }
+            }
+        }
+
+        // Symmetrise H.
+        for i in 0..H {
+            for j in 0..i {
+                let avg = 0.5
+                    * (hessian.get((i, j)).copied().unwrap_or(0.0)
+                        + hessian.get((j, i)).copied().unwrap_or(0.0));
+                if let Some(slot) = hessian.get_mut((i, j)) {
+                    *slot = avg;
+                }
+                if let Some(slot) = hessian.get_mut((j, i)) {
+                    *slot = avg;
+                }
+            }
+        }
+
+        let mut lmax: f32 = 0.0;
+        for i in 0..H {
+            let mut row_sum = 0.0_f32;
+            for j in 0..H {
+                row_sum += hessian.get((i, j)).copied().unwrap_or(0.0).abs();
+            }
+            if row_sum > lmax {
+                lmax = row_sum;
+            }
+        }
+        if lmax <= 0.0 || !lmax.is_finite() {
+            return None;
+        }
+
+        Some(Self {
+            hessian,
+            lin_from_z0,
+            u_min: config.u_min,
+            u_max: config.u_max,
+            step_size: 1.0 / lmax,
+        })
+    }
+
+    /// Solve the QP from augmented state `z_0 = [e_p, e_v, i]`. Returns
+    /// the first control `u_0`.
+    #[must_use]
+    pub fn solve(
+        &self,
+        z_0: nalgebra::Vector3<f32>,
+        warm_u: &mut nalgebra::SVector<f32, H>,
+        max_iter: usize,
+    ) -> f32 {
+        let g = self.lin_from_z0 * z_0;
+        for k in 0..H {
+            if let Some(slot) = warm_u.get_mut(k) {
+                *slot = slot.clamp(self.u_min, self.u_max);
+            }
+        }
+        for _ in 0..max_iter {
+            let grad = self.hessian * (*warm_u) + g;
+            *warm_u -= grad * self.step_size;
+            for k in 0..H {
+                if let Some(slot) = warm_u.get_mut(k) {
+                    *slot = slot.clamp(self.u_min, self.u_max);
+                }
+            }
+        }
+        warm_u.get(0).copied().unwrap_or(0.0)
+    }
+}
+
+/// Three-axis MPC-I position controller.
+///
+/// Mirrors [`Mpc3dPositionController`] and [`Lqi3dPositionController`]:
+/// xy share one solver, z has its own, each axis carries a warm buffer
+/// AND an integrator accumulator. The integrator is **measurement-
+/// driven** (advanced by actual position error, not the QP's prediction)
+/// so it tracks real-world disturbance even when the model is wrong.
+#[derive(Clone, Debug)]
+pub struct MpcI3dPositionController<const H: usize> {
+    mpc_xy: Mpc1dI<H>,
+    mpc_z: Mpc1dI<H>,
+    warm_x: nalgebra::SVector<f32, H>,
+    warm_y: nalgebra::SVector<f32, H>,
+    warm_z: nalgebra::SVector<f32, H>,
+    integrator: Vector3<f32>,
+    pub integrator_max: f32,
+    pub max_iter: usize,
+    pub max_accel: f32,
+    dt_s: f32,
+}
+
+impl<const H: usize> MpcI3dPositionController<H> {
+    /// Build the three-axis controller. Both axes must share `dt_s` —
+    /// the integrator update cadence has to match across the whole xy
+    /// / z stack for the LQI-derived terminal cost to be consistent.
+    #[must_use]
+    pub fn new(
+        config_xy: Mpc1dIConfig,
+        config_z: Mpc1dIConfig,
+        max_iter: usize,
+        max_accel: f32,
+        integrator_max: f32,
+    ) -> Option<Self> {
+        if config_xy.dt_s != config_z.dt_s {
+            return None;
+        }
+        Some(Self {
+            mpc_xy: Mpc1dI::<H>::new(config_xy)?,
+            mpc_z: Mpc1dI::<H>::new(config_z)?,
+            warm_x: nalgebra::SVector::<f32, H>::zeros(),
+            warm_y: nalgebra::SVector::<f32, H>::zeros(),
+            warm_z: nalgebra::SVector::<f32, H>::zeros(),
+            integrator: Vector3::zeros(),
+            integrator_max,
+            max_iter,
+            max_accel,
+            dt_s: config_xy.dt_s,
+        })
+    }
+
+    /// Cold-start: zero the warm buffers AND the integrator.
+    pub fn reset(&mut self) {
+        self.warm_x.fill(0.0);
+        self.warm_y.fill(0.0);
+        self.warm_z.fill(0.0);
+        self.integrator = Vector3::zeros();
+    }
+
+    /// Exposed integrator for unit tests / logging.
+    #[must_use]
+    pub fn integrator(&self) -> Vector3<f32> {
+        self.integrator
+    }
+
+    /// One controller tick.
+    pub fn step(
+        &mut self,
+        setpoint: &Setpoint,
+        current_position: Vector3<f32>,
+        current_velocity: Vector3<f32>,
+        mass_kg: f32,
+    ) -> AttitudeAndThrust {
+        let e_p = current_position - setpoint.position_ned;
+        let e_v = current_velocity - setpoint.velocity_ned;
+
+        let z_x = nalgebra::Vector3::new(e_p.x, e_v.x, self.integrator.x);
+        let z_y = nalgebra::Vector3::new(e_p.y, e_v.y, self.integrator.y);
+        let z_z = nalgebra::Vector3::new(e_p.z, e_v.z, self.integrator.z);
+
+        let u_x = self.mpc_xy.solve(z_x, &mut self.warm_x, self.max_iter);
+        let u_y = self.mpc_xy.solve(z_y, &mut self.warm_y, self.max_iter);
+        let u_z = self.mpc_z.solve(z_z, &mut self.warm_z, self.max_iter);
+
+        let mut accel_cmd = Vector3::new(u_x, u_y, u_z) + setpoint.accel_ned;
+        let mag = accel_cmd.norm();
+        let saturated = mag.is_finite() && mag > self.max_accel;
+        if saturated {
+            accel_cmd *= self.max_accel / mag;
+        }
+
+        // Advance integrator with conditional integration (anti-windup).
+        if !saturated && self.dt_s.is_finite() && self.dt_s > 0.0 {
+            self.integrator += e_p * self.dt_s;
+            self.integrator.x = self
+                .integrator
+                .x
+                .clamp(-self.integrator_max, self.integrator_max);
+            self.integrator.y = self
+                .integrator
+                .y
+                .clamp(-self.integrator_max, self.integrator_max);
+            self.integrator.z = self
+                .integrator
+                .z
+                .clamp(-self.integrator_max, self.integrator_max);
+        }
+
+        let dummy_gains = PositionGains {
+            k_pos: Vector3::zeros(),
+            k_vel: Vector3::zeros(),
+            k_i_vel: Vector3::zeros(),
+            max_accel: self.max_accel,
+            max_integrator: 0.0,
+        };
+        accel_to_attitude_thrust(accel_cmd, setpoint.yaw_rad, mass_kg, &dummy_gains)
     }
 }
 
@@ -1633,6 +2018,145 @@ mod tests {
             pos.abs() < 0.05 && vel.abs() < 0.05,
             "converged pos={pos} vel={vel}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // M9.5 MPC-I tests
+    // ------------------------------------------------------------------
+
+    fn default_mpci_config(tight: bool) -> Mpc1dIConfig {
+        Mpc1dIConfig {
+            weights: LqiWeights {
+                q_pos: 4.0,
+                q_vel: 1.0,
+                q_i: 1.0,
+                r: 0.5,
+            },
+            dt_s: 0.05,
+            u_min: if tight { -3.0 } else { -100.0 },
+            u_max: if tight { 3.0 } else { 100.0 },
+        }
+    }
+
+    #[test]
+    fn mpci_new_rejects_bad_inputs() {
+        let mut cfg = default_mpci_config(false);
+        cfg.dt_s = 0.0;
+        assert!(Mpc1dI::<MPC_H>::new(cfg).is_none());
+        cfg.dt_s = f32::NAN;
+        assert!(Mpc1dI::<MPC_H>::new(cfg).is_none());
+        let mut cfg = default_mpci_config(false);
+        cfg.weights.q_i = -1.0;
+        assert!(Mpc1dI::<MPC_H>::new(cfg).is_none());
+        let mut cfg = default_mpci_config(false);
+        cfg.u_min = 1.0;
+        cfg.u_max = -1.0;
+        assert!(Mpc1dI::<MPC_H>::new(cfg).is_none());
+    }
+
+    #[test]
+    fn mpci_zero_state_zero_command() {
+        let cfg = default_mpci_config(false);
+        let mpc = Mpc1dI::<MPC_H>::new(cfg).unwrap();
+        let mut warm = nalgebra::SVector::<f32, MPC_H>::zeros();
+        let u = mpc.solve(nalgebra::Vector3::zeros(), &mut warm, 100);
+        assert!(u.abs() < 1.0e-4, "u at rest = {u}, expected ≈ 0");
+    }
+
+    #[test]
+    fn mpci_respects_box_constraint() {
+        // Tight u_max + large initial error → must clamp.
+        let cfg = default_mpci_config(true);
+        let mpc = Mpc1dI::<MPC_H>::new(cfg).unwrap();
+        let z0 = nalgebra::Vector3::new(10.0_f32, 0.0, 0.0);
+        let mut warm = nalgebra::SVector::<f32, MPC_H>::zeros();
+        let u = mpc.solve(z0, &mut warm, 200);
+        assert!(u >= cfg.u_min - 1.0e-3);
+        assert!(u <= cfg.u_max + 1.0e-3);
+        for k in 0..MPC_H {
+            let w = warm.get(k).copied().unwrap_or(0.0);
+            assert!(w >= cfg.u_min - 1.0e-3 && w <= cfg.u_max + 1.0e-3);
+        }
+    }
+
+    #[test]
+    fn mpci_integrator_zero_out_reduces_to_plain_mpc() {
+        // With q_i = 0 the integrator state costs nothing and MPC-I's
+        // optimal u_0 should closely track M9.1's Mpc1d from the same
+        // initial (e_p, e_v). Use loose box to isolate the dynamics.
+        let dt = 0.05_f32;
+        let weights_qi0 = LqiWeights {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            q_i: 0.0,
+            r: 0.5,
+        };
+        let mpci = Mpc1dI::<MPC_H>::new(Mpc1dIConfig {
+            weights: weights_qi0,
+            dt_s: dt,
+            u_min: -100.0,
+            u_max: 100.0,
+        })
+        .unwrap();
+        let plain = Mpc1d::<MPC_H>::new(Mpc1dConfig {
+            weights: LqrWeights {
+                q_pos: 4.0,
+                q_vel: 1.0,
+                r: 0.5,
+            },
+            dt_s: dt,
+            u_min: -100.0,
+            u_max: 100.0,
+        })
+        .unwrap();
+        let mut warm_i = nalgebra::SVector::<f32, MPC_H>::zeros();
+        let mut warm_p = nalgebra::SVector::<f32, MPC_H>::zeros();
+        let u_i = mpci.solve(nalgebra::Vector3::new(0.5_f32, 0.0, 0.0), &mut warm_i, 500);
+        let u_p = plain.solve(nalgebra::Vector2::new(0.5_f32, 0.0), &mut warm_p, 500);
+        assert!((u_i - u_p).abs() < 0.05, "MPC-I {u_i} vs Mpc1d {u_p}");
+    }
+
+    #[test]
+    fn mpci_controller_hover_at_origin() {
+        let cfg = default_mpci_config(false);
+        let mut ctl = MpcI3dPositionController::<MPC_H>::new(cfg, cfg, 50, 8.0, 5.0).unwrap();
+        let out = ctl.step(
+            &Setpoint::default(),
+            Vector3::zeros(),
+            Vector3::zeros(),
+            default_mass(),
+        );
+        let hover = default_mass() * GRAVITY_M_S2;
+        assert!((out.thrust_n - hover).abs() < 1.0e-3);
+        assert!(out.q_desired.i.abs() < 1.0e-3 && out.q_desired.j.abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn mpci_controller_reset_clears_everything() {
+        let cfg = default_mpci_config(false);
+        let mut ctl = MpcI3dPositionController::<MPC_H>::new(cfg, cfg, 25, 8.0, 5.0).unwrap();
+        // Drive off-setpoint so warm + integrator populate.
+        let sp = Setpoint {
+            position_ned: Vector3::new(0.5, -0.3, -0.8),
+            ..Setpoint::default()
+        };
+        for _ in 0..80 {
+            ctl.step(&sp, Vector3::zeros(), Vector3::zeros(), default_mass());
+        }
+        assert!(ctl.integrator().norm() > 0.0);
+        ctl.reset();
+        assert_eq!(ctl.integrator(), Vector3::zeros());
+        assert_eq!(ctl.warm_x, nalgebra::SVector::<f32, MPC_H>::zeros());
+        assert_eq!(ctl.warm_y, nalgebra::SVector::<f32, MPC_H>::zeros());
+        assert_eq!(ctl.warm_z, nalgebra::SVector::<f32, MPC_H>::zeros());
+    }
+
+    #[test]
+    fn mpci_is_a_position_controller_variant() {
+        let cfg = default_mpci_config(false);
+        let ctrl: PositionController<MPC_H> =
+            PositionController::mpc_i(cfg, cfg, 25, 8.0, 5.0).unwrap();
+        assert_eq!(ctrl.kind(), "MPC-I");
     }
 
     // ------------------------------------------------------------------

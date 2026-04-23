@@ -874,7 +874,19 @@ mod tests {
         let dt = 0.001_f32;
 
         // Integrating controllers — should hold tight.
-        let tight_cases: [(PositionController<10>, &str); 2] = [
+        let lqi_weights = LqiWeights {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            q_i: 1.5,
+            r: 0.5,
+        };
+        let mpci_cfg = algo_nmpc::Mpc1dIConfig {
+            weights: lqi_weights,
+            dt_s: dt,
+            u_min: -20.0,
+            u_max: 20.0,
+        };
+        let tight_cases: [(PositionController<10>, &str); 3] = [
             (
                 PositionController::pi(PositionGains {
                     k_i_vel: Vector3::new(0.5, 0.5, 0.8),
@@ -884,24 +896,25 @@ mod tests {
             ),
             (
                 PositionController::lqi(
-                    LqiWeights {
-                        q_pos: 4.0,
-                        q_vel: 1.0,
-                        q_i: 1.5,
-                        r: 0.5,
-                    },
-                    LqiWeights {
-                        q_pos: 4.0,
-                        q_vel: 1.0,
-                        q_i: 1.5,
-                        r: 0.5,
-                    },
+                    lqi_weights,
+                    lqi_weights,
                     dt,
                     PositionGains::default().max_accel,
                     5.0,
                 )
                 .unwrap(),
                 "LQI",
+            ),
+            (
+                PositionController::mpc_i(
+                    mpci_cfg,
+                    mpci_cfg,
+                    25,
+                    PositionGains::default().max_accel,
+                    5.0,
+                )
+                .unwrap(),
+                "MPC-I",
             ),
         ];
         for (ctrl, name) in tight_cases {
