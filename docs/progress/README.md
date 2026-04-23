@@ -76,6 +76,7 @@
 | [0070](./0070-kani-core-bus.md) | 2026-04-23 | M12 Kani 扩到 core-bus + CI | `c32b90e` | 5 个新 Kani 证明（HealthLevel u8 序保持 + round-trip / SensorFaultBit 位互斥 + union 保留 / ACTUATOR_MAX_CHANNELS 限 u8）；workspace 证明 13→18；CI 新 `kani` job 4 crate 并行证，总耗时 < 15 秒；plan.md 创新点 1 的"形式化"从声明落到 CI 合同。 |
 | [0071](./0071-full-telemetry-zenoh.md) | 2026-04-23 | M13 全遥测 Zenoh 端到端 | `cc9965c` | `TelemetryPublisher` 把 core-bus 7 条 topic 打包成 typed `.publish_*()`；helper `healthy_msg` + `with_fault`；SITL 测试 2 peer session、7 并行 subscriber、byte-exact round-trip；M10 Zenoh 从"1 条消息"升级到"整套 schema"。 |
 | [0072](./0072-sitl-zenoh-runner.md) | 2026-04-23 | M14 SITL runner 广播 Zenoh | `648b68a` | `run_closed_loop_with_zenoh_telemetry` 把 MPC 闭环 + TelemetryPublisher 合体：每 tick 按 docs/topics.md 速率（IMU 1 kHz / att·vel·pos 250 Hz / setpoint 50 Hz / health 10 Hz）广播；测试 counting subscriber 断言 ≥ 90% 速率 + 飞机保持 < 30 cm 悬停；plan.md 创新点 4 从"能 pub/sub"升级到"闭环里真的实时流"。 |
+| [0073](./0073-shootout-executable.md) | 2026-04-23 | M15 residual+Zenoh / shootout 可执行 | `7deab80` + `206b9bb` | **M15a**：新 runner 让 MpcResidual + TelemetryPublisher 同时跑，policy reject 转 HealthMsg::EKF flag；SITL 风扰 < 1 m。**M15b**：`cargo run -p sim-hil --example controller_shootout --release` 输出六路 markdown 表（PI 0.015 / residual 0.221 / MPC-I 0.226 / LQI 0.239 / MPC 2.74 / LQR 5.18 m），`sim_hil::sitl` 新 public 模块、app-copter 升主 dep。|
 
 ## 写新文档时遵守的模板
 
