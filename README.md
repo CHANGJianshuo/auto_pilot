@@ -13,21 +13,31 @@
 | Signal | Count |
 |---|---|
 | Crates | 12 (11 `no_std`-compatible, 1 host-only) |
-| Unit + integration tests | 248 (default feature) + 5 (`zenoh-host` feature) |
-| Formal proofs (Kani) | **28** across 5 crates, run on every CI push |
+| Unit + integration tests | ~257 (default feature) + 5 (`zenoh-host` feature) |
+| Formal proofs (Kani) | **34** across 5 crates, run on every CI push |
 | Continuous-integration jobs | 7 (fmt, clippy, test, test-zenoh, build-thumbv7em, kani, geiger) |
-| Workspace git commits | 141+ |
+| Workspace git commits | 170+ |
+| Phase III benchmarks (SITL) | **3 of 4** (figure-8, motor failure, flip; Swift gate-pass is stretch) |
 
 ## Four design pillars — status
 
 1. **`core-*` — Rust `no_std` kernel + formal verification.** ✅  
-   Embassy async runtime, zero-heap in safety-critical paths, workspace-level `deny(unwrap, panic, indexing_slicing)`, 28 Kani proofs covering: 24-state EKF normalisation, FDIR monotone transitions, flight-mode state machines (RTL / Landing / Takeoff), ROS 2 message schema invariants.
+   Embassy async runtime, zero-heap in safety-critical paths, workspace-level `deny(unwrap, panic, indexing_slicing)`, **34** Kani proofs covering: 24-state EKF normalisation, FDIR monotone transitions, flight-mode state machines (RTL / Landing / Takeoff), ROS 2 message schema invariants, **MotorFaultDetector latch monotonicity + persistence reset invariants (M20d)**.
 2. **`algo-*` — NMPC + INDI hybrid control.** ✅  
-   Five interchangeable position controllers (PI / LQR / MPC / LQI / MPC-I) behind a single `PositionController<H>` enum. Finite-horizon box-constrained MPC with projected-gradient solver, LQR terminal cost, warm-start across ticks. Agilicious-style angular-rate INDI inner loop.
+   Five interchangeable position controllers (PI / LQR / MPC / LQI / MPC-I) behind a single `PositionController<H>` enum. Finite-horizon box-constrained MPC with projected-gradient solver, LQR terminal cost, warm-start across ticks. Agilicious-style angular-rate INDI inner loop. **M19 `FailoverAllocator` for single-motor loss (4 pre-computed 3-motor pseudoinverses, Mueller 2014 "drop yaw"); M21 yaw handoff in `outer_step` to keep position tracking under spin.**
 3. **`nn-runtime` — onboard NN residual + safety envelope.** ✅  
    `InferenceBackend` trait with a pure-Rust affine reference impl; `ResidualPolicy` bundles inference + envelope check; SITL demo shows a hand-tuned residual **halves** tracking error of bare MPC under wind.
 4. **`core-bus` — ROS 2 / Zenoh native middleware.** ✅ host side.  
    7 typed messages with postcard codec, end-to-end Zenoh pub/sub across two peer sessions, SITL runner broadcasts the full telemetry catalogue at documented rates (IMU 1 kHz, attitude 250 Hz, etc.). Firmware zenoh-pico integration pending hardware.
+
+### Phase III benchmarks — SITL reproduction of Agilicious targets
+
+| Benchmark | Milestone | SITL contract |
+|---|---|---|
+| 8-figure waypoint (lemniscate) | M17 | MPC-I position RMS < 0.5 m, max err < 1.5 m, beats PI cascade on moving target |
+| Single-motor failure | M18–M21 | Detector declares within 250 ms; `FailoverAllocator` drops yaw; altitude < 3 m, xy < 3 m, tilt < 60° |
+| Pitch-roll flip | M22 | INDI drives past inverted (q_w < 0); recovery back to tilt < 30° in 1.5 s; altitude loss < 15 m |
+| Swift-class gate-pass | (stretch) | `ResidualPolicy` plumbing ready; awaits external NN training pipeline |
 
 ## Controller shootout
 
@@ -130,7 +140,7 @@ cargo build -p app-copter --bin firmware \
 
 ```bash
 cargo kani -p core-bus core-rtos algo-fdir algo-ekf app-copter
-# 28 proofs, ~10 s total on a laptop.
+# 34 proofs, ~10 s total on a laptop.
 ```
 
 ### Lint + format
@@ -154,7 +164,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Roadmap
 
-See [`docs/progress/README.md`](./docs/progress/README.md) for a per-commit log of 32+ completed milestones from `M5.6` (MAVLink ARM) through `M16c` (state-machine Kani proofs). Each row has a commit hash and a short narrative.
+See [`docs/progress/README.md`](./docs/progress/README.md) for a per-commit log of 39+ completed milestones from `M5.6` (MAVLink ARM) through `M22` (Phase III roll-flip SITL). Each row has a commit hash and a short narrative.
 
 The blueprint in [`docs/plan.md`](./docs/plan.md) remains the north star; we've reached the "everything verified in SITL" tier and are holding on real-hardware work until a dev board is available.
 

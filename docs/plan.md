@@ -4,16 +4,16 @@
 
 Production-grade Rust open-source flight controller for industrial multirotor (3–30 kg) inspection / mapping. Match or beat PX4 and ArduPilot on reliability, agility, and ecosystem.
 
-## Status summary (2026-04-23)
+## Status summary (2026-04-24)
 
-Everything in the "four pillars" section below has concrete SITL evidence and regression tests. No real hardware has been attached — the entire stack runs in simulation on a developer laptop. See [`docs/progress/README.md`](./progress/README.md) for the per-commit milestone log (32 completed).
+Everything in the "four pillars" section below has concrete SITL evidence and regression tests. **Phase III's three core benchmarks are done (figure-8, motor failure, flip)** — the fourth (Swift-class agile gate-pass) is a stretch goal that requires a trained NN. No real hardware has been attached — the entire stack runs in simulation on a developer laptop. See [`docs/progress/README.md`](./progress/README.md) for the per-commit milestone log (39 completed, 82 docs).
 
 | Signal | Value |
 |---|---|
-| Commits | 142+ |
+| Commits | 170+ |
 | Crates | 12 (11 `no_std`-capable) |
-| Unit + integration tests | 248 (default) + 5 (`zenoh-host`) |
-| Kani formal proofs | 28 across 5 crates |
+| Unit + integration tests | ~257 (default) + 5 (`zenoh-host`) |
+| Kani formal proofs | **34** across 5 crates |
 | CI jobs | 7 (fmt / clippy / test / test-zenoh / build-thumbv7em / kani / geiger) |
 | Firmware ELF on STM32H753 | 91 KiB (release) |
 
@@ -32,6 +32,7 @@ All flight-critical crates (`core-*`, `algo-*`, `comms-mavlink`, `nn-runtime`, `
 * `LandingState::advance` + `TakeoffState::advance` absorbing / exit-shape (M16b, M16c)
 * `core-rtos` Priority ordering + rank round-trip (M1.2)
 * `algo-fdir` HealthLevel transition invariants (M1.4)
+* **`MotorFaultDetector::apply_decision`** — alive latch monotonicity, level monotonicity, persistence reset on Quiet, BestMatch non-match reset, dead_count ≤ 4 (M20d)
 
 **Pending:** `preflight_check` completeness, `ArmState` transition Kani, `PositionController::step` output finiteness. f32-heavy targets still await better CBMC float support.
 
@@ -118,9 +119,20 @@ Everything in the four-pillars section. Key milestones:
 * M9: five-way position controller (LQR / MPC / LQI / MPC-I) + shootout regression
 * M10: core-bus typed messages + Zenoh host pub/sub
 * M11: residual policy + SITL evidence
-* M12–M16: Kani expansion (28 proofs) + README upgrade
+* M12–M16: Kani expansion + README upgrade
 
 See [`docs/progress/README.md`](./progress/README.md) for commit-hashed per-step narrative.
+
+### Phase III (first pass) — SITL benchmark parity with Agilicious (done, 2026-04-24)
+
+Three of the four Phase III benchmarks from the original plan have been reproduced **entirely in SITL** — no real-hardware flight yet, but each has a regression test that locks in a numeric target:
+
+| Benchmark | Milestone | SITL evidence |
+|---|---|---|
+| 8-figure waypoint flight | M17 | MPC-I position RMS < 0.5 m on 2 m × 10 s Gerono lemniscate; beats PI cascade on moving target |
+| Single-motor failure | M18–M21 | Detector finds dead rotor from ω̇ residual within 250 ms; 3-motor `FailoverAllocator` drops yaw and preserves lift; `outer_step` yaw handoff prevents position drift; altitude err < 3 m, xy err < 3 m, tilt < 60°; 6 Kani proofs guarantee detector latch monotonicity |
+| Pitch-roll flip | M22 | INDI carries the vehicle through a 7.5 rad roll burst (past inverted), `attitude_to_rate` recovery returns upright within 1.5 s; altitude loss < 15 m, final tilt < 30°; surfaced the detector-enable flag as a mode-switch primitive |
+| Swift-class agile gate-pass | (stretch) | Blocked on an external training pipeline (aerial_gym Isaac Gym / Flightmare + PPO). The `ResidualPolicy` plumbing is in place — a trained ONNX model just slots into `InferenceBackend` |
 
 ### Phase II — Real hardware (blocked on dev board)
 
@@ -134,25 +146,28 @@ Not started. Requires a Pixhawk 6X class FMU + ICM-42688 breakout or similar. Co
 6. Small test-frame (250 mm / 5″) first flight.
 7. WCET measurement via `DWT::CYCCNT`; confirm 1 kHz inner loop fits the < 500 µs budget.
 
-### Phase III — Real flight benchmarks (after Phase II)
+### Phase III (second pass) — Real flight benchmarks (after Phase II)
 
-Reproduce Agilicious-paper benchmarks on our stack:
+Re-run the same three benchmarks — plus the Swift stretch — on real hardware and publish numbers against PX4 / ArduPilot on identical frames. The SITL pass above locks in the tracking / failure / agility contracts; Phase II + III-second-pass is where they meet actual sensors and gravity.
 
-* 8-figure waypoint flight
-* Pitch-roll flip
-* Single-motor failure recovery (ArduPilot has it, PX4 doesn't)
-* Swift-class agile pass through gates (stretch goal; requires NN policy training)
+Concrete order of operations (proposed):
 
-Publish numbers against PX4 / ArduPilot on identical frames.
+1. Small 5″ test frame (same one used for first flight in Phase II).
+2. Hover hold benchmark against PX4 1.16 / ArduCopter 4.5 on the same frame, 1 m/s wind gust tunnel.
+3. Figure-8 tracking — measure position RMS on GPS RTK outdoors.
+4. Single-motor failure — start at 5 m AGL, ESC-disable motor 1 on PWM channel, land safely.
+5. Flip — 90° bank first, then full 360° roll.
+6. Swift-style gate pass (stretch) — requires a trained NN; the `ResidualPolicy` plumbing is already in place.
 
 ## Expected benchmarks (targets at v1.0)
 
 * Position RMS (1 m/s wind, hover): < 5 cm (PX4 baseline ~15 cm, Agilicious ~3 cm). **SITL today: 22 cm on MPC-I / MPC+residual. Within striking distance with a trained NN.**
-* Max body rate: > 1500 deg/s
+* Figure-8 tracking RMS (2 m × 10 s period, ideal sim): < 0.5 m. **SITL today: passes the MPC-I assertion; numeric target parity with Agilicious paper awaits real hardware.**
+* Max body rate: > 1500 deg/s. **SITL roll-flip benchmark drives ~860 deg/s peak; torque budget on the 250 g test frame is the binding constraint, not the controller.**
 * Max linear accel: > 30 m/s²
-* Single-motor failure: maintain altitude, return to home
+* Single-motor failure: maintain altitude, return to home. **SITL today: detector-triggered failover maintains altitude within 3 m, xy position within 3 m, tilt under 60°; Mueller-style full 3-motor controller still in the "80 % effect" zone (M21).**
 * 1 kHz inner-loop WCET: < 500 µs (measured on hardware in Phase II)
-* `cargo geiger` ≈ 0 unsafe outside `core-hal`, Kani proofs green
+* `cargo geiger` ≈ 0 unsafe outside `core-hal`, Kani proofs green (**34 today across 5 crates**)
 
 ## Architecture
 
