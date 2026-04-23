@@ -194,6 +194,112 @@ impl SensorFaultBit {
     pub const EKF: u32 = 1 << 6;
 }
 
+// ----------------------------------------------------------------------------
+// Formal verification — Kani harnesses
+// ----------------------------------------------------------------------------
+//
+// Scope: integer / bit-level invariants over the message schema. CBMC
+// handles these in sub-second time because there are no floats to
+// reason about symbolically. Proofs that touch payload bytes (serde
+// round-trip) stay in the property-tests module — they're not Kani-
+// tractable at this problem size.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Generate an arbitrary bounded `HealthLevel`. Kani enumerates all
+    /// 4 variants symbolically.
+    fn any_health_level() -> HealthLevel {
+        let s: u8 = kani::any();
+        kani::assume(s < 4);
+        match s {
+            0 => HealthLevel::Healthy,
+            1 => HealthLevel::Degraded,
+            2 => HealthLevel::Emergency,
+            _ => HealthLevel::Failed,
+        }
+    }
+
+    /// `HealthLevel` severity-by-u8-cast ordering matches the declared
+    /// severity order. Catches a future variant reorder that would let
+    /// `Failed` silently land between `Healthy` and `Degraded`.
+    #[kani::proof]
+    fn health_level_u8_cast_preserves_severity_order() {
+        assert!((HealthLevel::Healthy as u8) < (HealthLevel::Degraded as u8));
+        assert!((HealthLevel::Degraded as u8) < (HealthLevel::Emergency as u8));
+        assert!((HealthLevel::Emergency as u8) < (HealthLevel::Failed as u8));
+    }
+
+    /// Round-trip: `HealthLevel` → u8 → HealthLevel recovers the same
+    /// variant for every one.
+    #[kani::proof]
+    fn health_level_u8_round_trip() {
+        let h = any_health_level();
+        let encoded = h as u8;
+        let recovered = match encoded {
+            0 => HealthLevel::Healthy,
+            1 => HealthLevel::Degraded,
+            2 => HealthLevel::Emergency,
+            3 => HealthLevel::Failed,
+            _ => panic!("out of range"),
+        };
+        assert_eq!(h, recovered);
+    }
+
+    /// Each `SensorFaultBit` constant has exactly one bit set and the
+    /// constants are pairwise disjoint. Catches a typo like
+    /// `MOTOR: u32 = 1 << 3` that would silently alias with `IMU`.
+    #[kani::proof]
+    fn sensor_fault_bits_are_distinct_powers_of_two() {
+        let bits = [
+            SensorFaultBit::GPS,
+            SensorFaultBit::MAG,
+            SensorFaultBit::BARO,
+            SensorFaultBit::IMU,
+            SensorFaultBit::MOTOR,
+            SensorFaultBit::BATTERY,
+            SensorFaultBit::EKF,
+        ];
+        // Each has exactly one bit set.
+        for b in bits {
+            assert!(b != 0);
+            assert_eq!(b & (b - 1), 0, "not a power of two");
+        }
+        // Pairwise disjoint.
+        for i in 0..bits.len() {
+            for j in (i + 1)..bits.len() {
+                let bi = bits[i];
+                let bj = bits[j];
+                assert_eq!(bi & bj, 0, "bits collide");
+            }
+        }
+    }
+
+    /// Combining bits via `|` preserves each constituent — `BITS_A |
+    /// BITS_B` contains both masks. The inverse (AND-check for
+    /// specific flags) is how [`HealthMsg::fault_flags`] is consumed,
+    /// so this proof locks the contract in.
+    #[kani::proof]
+    fn sensor_fault_bits_union_preserves_each_member() {
+        let combined = SensorFaultBit::GPS | SensorFaultBit::MAG | SensorFaultBit::EKF;
+        assert_ne!(combined & SensorFaultBit::GPS, 0);
+        assert_ne!(combined & SensorFaultBit::MAG, 0);
+        assert_ne!(combined & SensorFaultBit::EKF, 0);
+        // Bits not in the union stay clear.
+        assert_eq!(combined & SensorFaultBit::BARO, 0);
+        assert_eq!(combined & SensorFaultBit::IMU, 0);
+    }
+
+    /// `ACTUATOR_MAX_CHANNELS` fits in u8 — `ActuatorCmdMsg::n` is u8
+    /// and callers cast `ACTUATOR_MAX_CHANNELS as u8` via
+    /// `u8::try_from`. Verify the hard-coded value never exceeds u8's
+    /// range, catching a future bump past 256.
+    #[kani::proof]
+    fn actuator_max_channels_fits_u8() {
+        assert!(ACTUATOR_MAX_CHANNELS <= (u8::MAX as usize));
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 mod tests {

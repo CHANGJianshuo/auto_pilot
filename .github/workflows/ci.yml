@@ -79,6 +79,27 @@ jobs:
       # region overflow) that a --lib build would miss.
       - run: cargo build -p app-copter --bin firmware --target thumbv7em-none-eabihf --release
 
+  kani:
+    name: formal (cargo-kani)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install --locked kani-verifier || true
+      - run: cargo kani setup || true
+      # Kani proofs live in crates with a #[cfg(kani)] module. Run per-crate
+      # so a failure localises cleanly. CBMC's integer/enum harnesses finish
+      # in sub-second; keep float-heavy targets off this list until we can
+      # budget multi-minute runs.
+      - run: |
+          set -e
+          for crate in core-bus core-rtos algo-fdir algo-ekf; do
+            echo "::group::kani $crate"
+            cargo kani -p "$crate"
+            echo "::endgroup::"
+          done
+
   geiger:
     name: unsafe audit (cargo-geiger)
     runs-on: ubuntu-latest
