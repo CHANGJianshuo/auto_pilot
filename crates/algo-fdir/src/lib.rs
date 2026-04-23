@@ -278,8 +278,20 @@ impl MotorFaultDetector {
         inertia_inv: &Matrix3<f32>,
     ) -> HealthLevel {
         // Expected body torque from commanded thrusts (rows 0..3 of E).
+        // Skip motors that have already been declared dead — they
+        // contribute 0 to *actual* torque regardless of what the
+        // allocator commanded, so including them in the expected sum
+        // would produce a phantom residual on the motor that's
+        // already known to be dead and mask subsequent failures. This
+        // is the core fix behind multi-motor detection (M20e): once
+        // motor N is out, the detector's expected-vs-observed residual
+        // reveals the *next* failure cleanly instead of being polluted
+        // by N's historical signature.
         let mut tau = Vector3::zeros();
-        for i in 0..4 {
+        for (i, &alive_i) in self.alive.iter().enumerate() {
+            if !alive_i {
+                continue;
+            }
             tau.x += effectiveness[(0, i)] * motor_cmd[i];
             tau.y += effectiveness[(1, i)] * motor_cmd[i];
             tau.z += effectiveness[(2, i)] * motor_cmd[i];
@@ -718,6 +730,45 @@ mod tests {
             d.observe(&cmd, obs_clean, &e, &j_inv);
         }
         assert!(!d.alive()[0], "detector must not un-declare a dead motor");
+        assert_eq!(d.level(), HealthLevel::Emergency);
+    }
+
+    /// Two motors die at the exact same tick. The residual is a
+    /// *mixture* of two motor signatures, so scoring will pick one
+    /// (say motor 0) first. After declaration, the detector's own
+    /// `alive[0] = false` drops motor 0 out of the expected-torque
+    /// sum — the residual then reveals motor 3's clean signature,
+    /// which accumulates persistence and gets declared too.
+    ///
+    /// This was the core gap pre-M20e: expected torque included
+    /// *all* motors regardless of alive status, so after declaring
+    /// motor 0 the residual kept looking "mixed" and motor 3's
+    /// signature never resolved.
+    #[test]
+    fn detector_resolves_two_simultaneous_failures() {
+        let (e, j_inv) = test_effectiveness_and_inertia();
+        let mut d = MotorFaultDetector::with_thresholds(1.0, 20);
+        let cmd = SVector::<f32, 4>::from_column_slice(&[0.6, 0.6, 0.6, 0.6]);
+        // Motors 0 and 3 both die — M0 at (+h, +h), M3 at (-h, +h).
+        // Both are on the +y side of the airframe, so their sum
+        // residual is predominantly along the -roll axis plus some
+        // mixed pitch/yaw.
+        let mut alive_actual = [true; 4];
+        alive_actual[0] = false;
+        alive_actual[3] = false;
+        let obs = synthetic_omega_dot(&cmd, alive_actual, &e, &j_inv);
+        // Give it enough ticks for both declarations:
+        //   ~20 for first (persistence threshold)
+        //   ~20 for second after the first drops out of expected τ
+        //   + generous margin
+        for _ in 0..100 {
+            d.observe(&cmd, obs, &e, &j_inv);
+        }
+        assert!(!d.alive()[0], "motor 0 should be declared dead");
+        assert!(!d.alive()[3], "motor 3 should be declared dead");
+        assert!(d.alive()[1], "motor 1 is alive");
+        assert!(d.alive()[2], "motor 2 is alive");
+        assert_eq!(d.dead_count(), 2);
         assert_eq!(d.level(), HealthLevel::Emergency);
     }
 }
