@@ -72,6 +72,7 @@
 | [0066](./0066-zenoh-bus.md) | 2026-04-23 | M10 Zenoh 原生中间件（a+b） | `ee3d94c` + `c943142` | **plan.md 创新点 4 第一次落地**。M10a: core-bus 7 个 typed message（IMU/Attitude/Vel/Pos/Setpoint/ActuatorCmd/Health）+ postcard codec + `no_std` round-trip tests。M10b: `sim-hil::zenoh_bus` 两个 peer session 端到端 pub/sub 通过 Zenoh，feature-gated (`zenoh-host`) 不污染默认 build；233 tests 全绿，CI 新 `test-zenoh` job。 |
 | [0067](./0067-nn-runtime.md) | 2026-04-23 | M11a nn-runtime residual policy | `44b6ce5` | **plan.md 创新点 3 第一次落地**。`FeatureVector` [f32;9] + `Residual(Vector3)`、`InferenceBackend` trait + 参考 `AffineBackend`（pure Rust，no tract dep 避 dev-version 锁定）、`SafetyEnvelope` + typed `EnvelopeReject`、`ResidualPolicy<B>` 统一 policy harness + reject count；11 新测试；workspace 244 全绿；plan.md 四大创新点**全部开始**。 |
 | [0068](./0068-residual-mpc-sitl.md) | 2026-04-23 | M11c MPC + residual 接进 SITL | `88c13bd` | `Mpc3dPositionController` 拆出 `solve_accel` + `accel_to_attitude_thrust` pub；`sim-hil::residual_mpc::MpcResidualController<H, B>` 把 MPC 和 ResidualPolicy 绑一起、envelope reject 静默 fallback；**realistic sim（1.5 m/s 风 + drag）下手调 affine residual 比裸 MPC 横向误差降 > 20 cm**；247 tests 全绿。 |
+| [0069](./0069-three-tier-shootout.md) | 2026-04-23 | M11d 三档 shootout | `0f680c8` | 同 realistic sim 三档对比：bare MPC（漂 > 0.5 m）/ MPC+residual (0.22 m) / LQI (0.24 m)；意外发现手调 PD 残差和 MPC 预测合力追平 LQI；断言**档位**而非 ordering，允许 tuning 摇摆；`residual × 3 < bare`、`max/min < 3`；248 tests 全绿。 |
 
 ## 写新文档时遵守的模板
 
