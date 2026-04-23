@@ -71,6 +71,7 @@
 | [0065](./0065-mpc-i.md) | 2026-04-23 | M9.5 MPC-I：约束 + 积分器合体 | `b150a06` | 把 M9.1 MPC（box 约束）和 M9.3 LQI（integrator）augmented 成 3-state：`z = [e_p, e_v, i]`、`dare_3x3` 终端代价、`Mpc1dI<H>` + `MpcI3dPositionController<H>` + `PositionController::MpcI`；核心 sanity `q_i=0 ⇒ MPC-I ≡ M9.1 Mpc1d`；realistic shootout 3-way（PI+I / LQI / MPC-I）全 < 0.6m；**NMPC 创新点收尾**；225 tests 全绿。 |
 | [0066](./0066-zenoh-bus.md) | 2026-04-23 | M10 Zenoh 原生中间件（a+b） | `ee3d94c` + `c943142` | **plan.md 创新点 4 第一次落地**。M10a: core-bus 7 个 typed message（IMU/Attitude/Vel/Pos/Setpoint/ActuatorCmd/Health）+ postcard codec + `no_std` round-trip tests。M10b: `sim-hil::zenoh_bus` 两个 peer session 端到端 pub/sub 通过 Zenoh，feature-gated (`zenoh-host`) 不污染默认 build；233 tests 全绿，CI 新 `test-zenoh` job。 |
 | [0067](./0067-nn-runtime.md) | 2026-04-23 | M11a nn-runtime residual policy | `44b6ce5` | **plan.md 创新点 3 第一次落地**。`FeatureVector` [f32;9] + `Residual(Vector3)`、`InferenceBackend` trait + 参考 `AffineBackend`（pure Rust，no tract dep 避 dev-version 锁定）、`SafetyEnvelope` + typed `EnvelopeReject`、`ResidualPolicy<B>` 统一 policy harness + reject count；11 新测试；workspace 244 全绿；plan.md 四大创新点**全部开始**。 |
+| [0068](./0068-residual-mpc-sitl.md) | 2026-04-23 | M11c MPC + residual 接进 SITL | `88c13bd` | `Mpc3dPositionController` 拆出 `solve_accel` + `accel_to_attitude_thrust` pub；`sim-hil::residual_mpc::MpcResidualController<H, B>` 把 MPC 和 ResidualPolicy 绑一起、envelope reject 静默 fallback；**realistic sim（1.5 m/s 风 + drag）下手调 affine residual 比裸 MPC 横向误差降 > 20 cm**；247 tests 全绿。 |
 
 ## 写新文档时遵守的模板
 
