@@ -184,6 +184,28 @@ impl HealthLevel {
 
 use nalgebra::{Matrix3, SMatrix, SVector, Vector3};
 
+/// Output of the numeric scoring stage of [`MotorFaultDetector::observe`].
+///
+/// Factored out so the **state-machine** half of `observe` can be
+/// proved with Kani without forcing CBMC through any floating-point
+/// math. `observe` internally computes the decision from the f32
+/// inputs and then calls [`MotorFaultDetector::apply_decision`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetectorDecision {
+    /// Residual below threshold — no evidence of fault this tick.
+    /// Persistence counters must be reset.
+    Quiet,
+    /// Residual above threshold but no motor could be attributed
+    /// (every alive motor's torque direction was numerically
+    /// degenerate, or all motors were already declared dead).
+    /// Persistence unchanged.
+    Inconclusive,
+    /// Motor at index `idx` is the best-aligned fault hypothesis.
+    /// The caller must have verified `idx < 4` and `alive[idx]`
+    /// was true at scoring time.
+    BestMatch(u8),
+}
+
 /// Watches one flight for a single-motor failure.
 ///
 /// Operates on **filtered** observed ω̇ (the caller should pass the same
@@ -267,81 +289,107 @@ impl MotorFaultDetector {
         let residual_mag =
             libm::sqrtf(residual.x * residual.x + residual.y * residual.y + residual.z * residual.z);
 
-        if residual_mag < self.residual_threshold_rad_s2 {
-            self.persistence = [0; 4];
-            return self.level;
-        }
-
-        // Score each motor by alignment between the residual and the
-        // inverse of that motor's torque contribution. A dead motor's
-        // missing contribution shows up as residual pointing along
-        // `-J⁻¹ · e_i`.
-        let mut best_score = 0.0_f32;
-        let mut best_idx: usize = usize::MAX;
-        for (i, &alive_i) in self.alive.iter().enumerate() {
-            if !alive_i {
-                continue;
-            }
-            let e_col = Vector3::new(
-                effectiveness[(0, i)],
-                effectiveness[(1, i)],
-                effectiveness[(2, i)],
-            );
-            let e_torque_direction = inertia_inv * e_col;
-            let norm_sq = e_torque_direction.x * e_torque_direction.x
-                + e_torque_direction.y * e_torque_direction.y
-                + e_torque_direction.z * e_torque_direction.z;
-            if norm_sq < 1.0e-12 {
-                continue;
-            }
-            let norm = libm::sqrtf(norm_sq);
-            let unit_x = e_torque_direction.x / norm;
-            let unit_y = e_torque_direction.y / norm;
-            let unit_z = e_torque_direction.z / norm;
-            let anti_align =
-                -(residual.x * unit_x + residual.y * unit_y + residual.z * unit_z);
-            let cmd_scale = motor_cmd[i].max(0.0);
-            let score = anti_align * cmd_scale;
-            if score > best_score {
-                best_score = score;
-                best_idx = i;
-            }
-        }
-
-        if best_idx == usize::MAX {
-            // No motor could explain the residual (e.g. all declared
-            // dead already, or numeric edge). Don't touch persistence.
-            return self.level;
-        }
-
-        for (i, p) in self.persistence.iter_mut().enumerate() {
-            if i == best_idx {
-                *p = p.saturating_add(1);
-            } else {
-                *p = 0;
-            }
-        }
-
-        let mut should_declare = false;
-        for (i, (&alive_i, &p)) in self
-            .alive
-            .iter()
-            .zip(self.persistence.iter())
-            .enumerate()
-        {
-            if i == best_idx && alive_i && p >= self.n_ticks_to_declare {
-                should_declare = true;
-            }
-        }
-        if should_declare {
-            for (i, a) in self.alive.iter_mut().enumerate() {
-                if i == best_idx {
-                    *a = false;
+        let decision = if residual_mag < self.residual_threshold_rad_s2 {
+            DetectorDecision::Quiet
+        } else {
+            // Score each motor by alignment between the residual and
+            // the inverse of that motor's torque contribution. A dead
+            // motor's missing contribution shows up as residual
+            // pointing along `-J⁻¹ · e_i`.
+            let mut best_score = 0.0_f32;
+            let mut best_idx: usize = usize::MAX;
+            for (i, &alive_i) in self.alive.iter().enumerate() {
+                if !alive_i {
+                    continue;
+                }
+                let e_col = Vector3::new(
+                    effectiveness[(0, i)],
+                    effectiveness[(1, i)],
+                    effectiveness[(2, i)],
+                );
+                let e_torque_direction = inertia_inv * e_col;
+                let norm_sq = e_torque_direction.x * e_torque_direction.x
+                    + e_torque_direction.y * e_torque_direction.y
+                    + e_torque_direction.z * e_torque_direction.z;
+                if norm_sq < 1.0e-12 {
+                    continue;
+                }
+                let norm = libm::sqrtf(norm_sq);
+                let unit_x = e_torque_direction.x / norm;
+                let unit_y = e_torque_direction.y / norm;
+                let unit_z = e_torque_direction.z / norm;
+                let anti_align =
+                    -(residual.x * unit_x + residual.y * unit_y + residual.z * unit_z);
+                let cmd_scale = motor_cmd[i].max(0.0);
+                let score = anti_align * cmd_scale;
+                if score > best_score {
+                    best_score = score;
+                    best_idx = i;
                 }
             }
-            self.level = self.level.transition_in_flight(HealthLevel::Emergency);
-        }
+            if best_idx == usize::MAX {
+                DetectorDecision::Inconclusive
+            } else if best_idx < 4 {
+                // `best_idx < 4` always holds by the loop bound; the
+                // cast is safe and narrows for the enum variant.
+                #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+                DetectorDecision::BestMatch(best_idx as u8)
+            } else {
+                DetectorDecision::Inconclusive
+            }
+        };
 
+        self.apply_decision(decision)
+    }
+
+    /// State-machine half of [`observe`]: applies a pre-computed
+    /// [`DetectorDecision`] to the persistence / liveness / health
+    /// fields.
+    ///
+    /// **Pure in the sense that Kani can prove invariants about it**
+    /// without modelling any floating-point math. `observe` calls
+    /// this internally; external callers generally shouldn't need it.
+    pub fn apply_decision(&mut self, decision: DetectorDecision) -> HealthLevel {
+        match decision {
+            DetectorDecision::Quiet => {
+                self.persistence = [0; 4];
+            }
+            DetectorDecision::Inconclusive => {
+                // Persistence unchanged — the caller observed evidence
+                // of a fault but couldn't attribute it to any alive
+                // motor. This is the expected behaviour once every
+                // motor has already been declared dead.
+            }
+            DetectorDecision::BestMatch(idx) => {
+                let best_usize = usize::from(idx);
+                for (i, p) in self.persistence.iter_mut().enumerate() {
+                    if i == best_usize {
+                        *p = p.saturating_add(1);
+                    } else {
+                        *p = 0;
+                    }
+                }
+                let mut should_declare = false;
+                for (i, (&alive_i, &p)) in self
+                    .alive
+                    .iter()
+                    .zip(self.persistence.iter())
+                    .enumerate()
+                {
+                    if i == best_usize && alive_i && p >= self.n_ticks_to_declare {
+                        should_declare = true;
+                    }
+                }
+                if should_declare {
+                    for (i, a) in self.alive.iter_mut().enumerate() {
+                        if i == best_usize {
+                            *a = false;
+                        }
+                    }
+                    self.level = self.level.transition_in_flight(HealthLevel::Emergency);
+                }
+            }
+        }
         self.level
     }
 
@@ -755,5 +803,147 @@ mod kani_proofs {
         let accepted: bool = kani::any();
         let after = c.observe(accepted);
         assert!(after.severity() >= before.severity());
+    }
+
+    // ---- MotorFaultDetector proofs (M20d) --------------------------------
+    //
+    // The detector's `observe` fn is f32-heavy. Instead of hammering
+    // CBMC through that math (slow / incomplete), we split off
+    // `apply_decision` — a pure state transition over a
+    // [`DetectorDecision`] enum — and prove invariants on that.
+    // `observe` itself is covered by the unit + SITL tests, which
+    // already span every Decision variant (Quiet / Inconclusive /
+    // BestMatch).
+
+    /// Build a detector with arbitrary but well-formed state.
+    fn any_detector() -> MotorFaultDetector {
+        let a0: bool = kani::any();
+        let a1: bool = kani::any();
+        let a2: bool = kani::any();
+        let a3: bool = kani::any();
+        let p0: u32 = kani::any();
+        let p1: u32 = kani::any();
+        let p2: u32 = kani::any();
+        let p3: u32 = kani::any();
+        let n_ticks: u32 = kani::any();
+        kani::assume(n_ticks > 0);
+        let threshold: f32 = 2.0; // exact value doesn't affect apply_decision
+        let level = any_health_level();
+        MotorFaultDetector {
+            persistence: [p0, p1, p2, p3],
+            n_ticks_to_declare: n_ticks,
+            residual_threshold_rad_s2: threshold,
+            alive: [a0, a1, a2, a3],
+            level,
+        }
+    }
+
+    /// Arbitrary but well-formed decision. `BestMatch` payload is
+    /// constrained to `< 4` to match the caller's invariant.
+    fn any_decision() -> DetectorDecision {
+        let tag: u8 = kani::any();
+        kani::assume(tag < 3);
+        match tag {
+            0 => DetectorDecision::Quiet,
+            1 => DetectorDecision::Inconclusive,
+            _ => {
+                let idx: u8 = kani::any();
+                kani::assume(idx < 4);
+                DetectorDecision::BestMatch(idx)
+            }
+        }
+    }
+
+    /// **Latch monotonicity**: once `alive[i]` is `false`, no
+    /// subsequent `apply_decision` call can make it `true` again.
+    /// This mirrors `HealthLevel::transition_in_flight`'s
+    /// no-recovery-in-flight contract and is the single most
+    /// important motor-FDIR invariant.
+    #[kani::proof]
+    fn check_apply_decision_alive_is_monotone() {
+        let mut d = any_detector();
+        let before = d.alive();
+        let decision = any_decision();
+        let _ = d.apply_decision(decision);
+        let after = d.alive();
+        // For every motor: if it was dead before, it stays dead.
+        assert!(before[0] || !after[0]);
+        assert!(before[1] || !after[1]);
+        assert!(before[2] || !after[2]);
+        assert!(before[3] || !after[3]);
+    }
+
+    /// **Level monotonicity**: `apply_decision` never lowers the
+    /// stored `HealthLevel`. Follows from the same one-way contract
+    /// plus `level.transition_in_flight(Emergency)` being monotone.
+    #[kani::proof]
+    fn check_apply_decision_level_is_monotone() {
+        let mut d = any_detector();
+        let before = d.level();
+        let decision = any_decision();
+        let _ = d.apply_decision(decision);
+        let after = d.level();
+        assert!(after.severity() >= before.severity());
+    }
+
+    /// **dead_count bounded**: at most 4 motors can be dead.
+    /// Trivial from the `[bool; 4]` domain but a nice sanity proof
+    /// that no saturating-add wraparound sneaks through
+    /// `dead_count`.
+    #[kani::proof]
+    fn check_dead_count_is_at_most_four() {
+        let d = any_detector();
+        assert!(d.dead_count() <= 4);
+    }
+
+    /// **Persistence reset on Quiet**: `Quiet` zeros every
+    /// persistence counter regardless of prior state.
+    #[kani::proof]
+    fn check_quiet_resets_persistence() {
+        let mut d = any_detector();
+        let _ = d.apply_decision(DetectorDecision::Quiet);
+        assert!(d.persistence() == [0; 4]);
+    }
+
+    /// **Inconclusive is a no-op on persistence**: persistence and
+    /// alive unchanged; level unchanged. Only the decision-
+    /// attribution path can flip anything.
+    #[kani::proof]
+    fn check_inconclusive_does_not_mutate_state() {
+        let mut d = any_detector();
+        let before_alive = d.alive();
+        let before_pers = d.persistence();
+        let before_level = d.level();
+        let _ = d.apply_decision(DetectorDecision::Inconclusive);
+        assert!(d.alive() == before_alive);
+        assert!(d.persistence() == before_pers);
+        assert!(d.level() == before_level);
+    }
+
+    /// **BestMatch resets non-matching counters**: for any
+    /// `BestMatch(idx)`, every persistence counter at index ≠ idx
+    /// must be zero after the call. This is the "only the scored
+    /// motor can accumulate" contract.
+    #[kani::proof]
+    fn check_bestmatch_resets_non_matching_counters() {
+        let mut d = any_detector();
+        let idx: u8 = kani::any();
+        kani::assume(idx < 4);
+        let _ = d.apply_decision(DetectorDecision::BestMatch(idx));
+        let p = d.persistence();
+        let best = usize::from(idx);
+        // Check each of the 4 slots explicitly; CBMC unrolls trivially.
+        if best != 0 {
+            assert!(p[0] == 0);
+        }
+        if best != 1 {
+            assert!(p[1] == 0);
+        }
+        if best != 2 {
+            assert!(p[2] == 0);
+        }
+        if best != 3 {
+            assert!(p[3] == 0);
+        }
     }
 }
