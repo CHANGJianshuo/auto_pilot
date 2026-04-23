@@ -94,7 +94,7 @@ jobs:
       # budget multi-minute runs.
       - run: |
           set -e
-          for crate in core-bus core-rtos algo-fdir algo-ekf; do
+          for crate in core-bus core-rtos algo-fdir algo-ekf app-copter; do
             echo "::group::kani $crate"
             cargo kani -p "$crate"
             echo "::endgroup::"

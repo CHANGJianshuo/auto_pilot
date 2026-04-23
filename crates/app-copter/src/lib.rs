@@ -193,6 +193,78 @@ pub enum RtlPhase {
     Returning,
 }
 
+/// Outcome of [`RtlPhase::advance`]. Kept as a small enum (rather than a
+/// mutable `&mut RtlPhase`) so Kani can reason about the transition
+/// shape without touching the rest of `FlightState`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RtlTransition {
+    /// Caller keeps the current phase unchanged.
+    Stay,
+    /// Caller overwrites the current phase with the contained value.
+    Advance(RtlPhase),
+    /// Returning phase completed — caller switches the RTL state to
+    /// `Idle` and starts [`LandingState::Landing`].
+    Handoff,
+}
+
+impl RtlPhase {
+    /// Pure transition function. Takes current phase + vehicle state +
+    /// relevant config, returns what the caller should do. No mutation,
+    /// no IO, no floats beyond the well-defined comparison arithmetic
+    /// (sqrt was removed by comparing squared distance so Kani can
+    /// reason about the whole function).
+    #[must_use]
+    pub fn advance(
+        self,
+        home_position_ned: Option<Vector3<f32>>,
+        current_position_ned: Vector3<f32>,
+        rtl_safe_alt_m: f32,
+        rtl_xy_tolerance_m: f32,
+    ) -> RtlTransition {
+        // Idle is a sink — the machine never advances from Idle
+        // autonomously; `Climbing` / `Returning` are caller-set by
+        // external commands (MAVLink NAV_RETURN_TO_LAUNCH).
+        if matches!(self, Self::Idle) {
+            return RtlTransition::Stay;
+        }
+        // RTL without a latched home is a no-op.
+        let Some(home) = home_position_ned else {
+            return RtlTransition::Advance(Self::Idle);
+        };
+        let safe_z = home.z - rtl_safe_alt_m;
+        match self {
+            Self::Climbing => {
+                // Climbing → Returning once we're at or above safe alt.
+                // In NED z grows downward, so "high enough" means z is
+                // less (more negative) than safe_z + some margin.
+                if current_position_ned.z <= safe_z + 0.3 {
+                    RtlTransition::Advance(Self::Returning)
+                } else {
+                    RtlTransition::Stay
+                }
+            }
+            Self::Returning => {
+                // Returning → Handoff once we're inside the xy
+                // tolerance of home. Compare squared distance to
+                // avoid sqrt — Kani has trouble reasoning about
+                // `libm::sqrtf` symbolically.
+                let dx = current_position_ned.x - home.x;
+                let dy = current_position_ned.y - home.y;
+                let dist_sq = dx * dx + dy * dy;
+                let tol_sq = rtl_xy_tolerance_m * rtl_xy_tolerance_m;
+                if dist_sq < tol_sq {
+                    RtlTransition::Handoff
+                } else {
+                    RtlTransition::Stay
+                }
+            }
+            // Unreachable — early-return above — but the compiler
+            // needs the arm to make the match exhaustive.
+            Self::Idle => RtlTransition::Stay,
+        }
+    }
+}
+
 /// Automatic climb-to-altitude state machine.
 ///
 /// `Idle`: vehicle follows the caller's setpoint as usual.
@@ -551,31 +623,20 @@ pub fn outer_step(
         flight.home_position_ned = Some(flight.state.position_ned);
     }
 
-    // RTL phase transitions (run before setpoint override so the override
-    // sees the post-transition phase).
-    if flight.rtl_phase != RtlPhase::Idle {
-        if let Some(home) = flight.home_position_ned {
-            let safe_z = home.z - cfg.rtl_safe_alt_m;
-            match flight.rtl_phase {
-                RtlPhase::Climbing => {
-                    if flight.state.position_ned.z <= safe_z + 0.3 {
-                        flight.rtl_phase = RtlPhase::Returning;
-                    }
-                }
-                RtlPhase::Returning => {
-                    let dx = flight.state.position_ned.x - home.x;
-                    let dy = flight.state.position_ned.y - home.y;
-                    let dist = libm::sqrtf(dx * dx + dy * dy);
-                    if dist < cfg.rtl_xy_tolerance_m {
-                        flight.rtl_phase = RtlPhase::Idle;
-                        flight.landing_state = LandingState::Landing;
-                    }
-                }
-                RtlPhase::Idle => {}
-            }
-        } else {
-            // RTL with no home latched is a no-op; clear it.
+    // RTL phase transition — pure function, apply its directive here.
+    match flight.rtl_phase.advance(
+        flight.home_position_ned,
+        flight.state.position_ned,
+        cfg.rtl_safe_alt_m,
+        cfg.rtl_xy_tolerance_m,
+    ) {
+        RtlTransition::Stay => {}
+        RtlTransition::Advance(next) => {
+            flight.rtl_phase = next;
+        }
+        RtlTransition::Handoff => {
             flight.rtl_phase = RtlPhase::Idle;
+            flight.landing_state = LandingState::Landing;
         }
     }
 
@@ -701,6 +762,126 @@ pub fn outer_step(
     }
 
     out
+}
+
+// ----------------------------------------------------------------------------
+// Formal verification — RtlPhase transition-shape invariants (M16a)
+// ----------------------------------------------------------------------------
+//
+// Proves the state-machine shape is what we say it is. Crucially these
+// harnesses do NOT exercise `sqrt` or any other float-heavy op — the
+// `advance` function is designed so squared distance stands in for
+// actual distance, keeping every branch Kani-tractable.
+#[cfg(kani)]
+mod rtl_kani {
+    use super::*;
+
+    fn any_phase() -> RtlPhase {
+        let t: u8 = kani::any();
+        kani::assume(t < 3);
+        match t {
+            0 => RtlPhase::Idle,
+            1 => RtlPhase::Climbing,
+            _ => RtlPhase::Returning,
+        }
+    }
+
+    /// `kani::any::<f32>()` spans every bit pattern, including NaN.
+    /// A real EKF + MPC pipeline never feeds NaN into the RTL
+    /// transition — Kani's job is to verify logical shape, not
+    /// rediscover that `NaN ⊕ NaN = NaN`. Assume finiteness at the
+    /// harness boundary so the proofs focus on the state-machine
+    /// invariants.
+    fn any_finite_f32() -> f32 {
+        let x: f32 = kani::any();
+        kani::assume(x.is_finite());
+        x
+    }
+
+    fn any_finite_vec() -> Vector3<f32> {
+        Vector3::new(any_finite_f32(), any_finite_f32(), any_finite_f32())
+    }
+
+    /// Idle is an absorbing state under `advance`. No vehicle state +
+    /// no config can push it to Climbing / Returning / Handoff —
+    /// those transitions only come from external commands setting
+    /// `flight.rtl_phase` directly.
+    #[kani::proof]
+    fn idle_is_absorbing() {
+        let home_present: bool = kani::any();
+        let home = if home_present {
+            Some(any_finite_vec())
+        } else {
+            None
+        };
+        let pos = any_finite_vec();
+        let safe_alt = any_finite_f32();
+        let tol = any_finite_f32();
+        let r = RtlPhase::Idle.advance(home, pos, safe_alt, tol);
+        assert!(matches!(r, RtlTransition::Stay));
+    }
+
+    /// RTL with no home latched is always cancelled — no vehicle
+    /// position can change that (we can't navigate home if we never
+    /// knew where home was).
+    #[kani::proof]
+    fn no_home_cancels_rtl_to_idle() {
+        let phase = any_phase();
+        // Only Climbing / Returning are state-changeable here; Idle is
+        // covered by `idle_is_absorbing`.
+        kani::assume(matches!(phase, RtlPhase::Climbing | RtlPhase::Returning));
+        let pos = any_finite_vec();
+        let safe_alt = any_finite_f32();
+        let tol = any_finite_f32();
+        let r = phase.advance(None, pos, safe_alt, tol);
+        assert!(matches!(r, RtlTransition::Advance(RtlPhase::Idle)));
+    }
+
+    /// Climbing can only `Stay` or `Advance(Returning)`. It never
+    /// skips directly to `Handoff` (which would be "teleport to
+    /// ground"). Proves `Climbing → Returning → Handoff` is the only
+    /// complete path.
+    #[kani::proof]
+    fn climbing_never_handoffs_directly() {
+        let home = any_finite_vec();
+        let pos = any_finite_vec();
+        let safe_alt = any_finite_f32();
+        let tol = any_finite_f32();
+        let r = RtlPhase::Climbing.advance(Some(home), pos, safe_alt, tol);
+        match r {
+            RtlTransition::Stay => {}
+            RtlTransition::Advance(next) => {
+                // Climbing can only advance *to* Returning, never back
+                // to Climbing or to Idle.
+                assert!(matches!(next, RtlPhase::Returning));
+            }
+            RtlTransition::Handoff => {
+                // Must never happen from Climbing.
+                panic!("Climbing must not produce Handoff");
+            }
+        }
+    }
+
+    /// Returning can only `Stay` or `Handoff`. It never goes back to
+    /// Climbing or sideways to Idle — the only exit is "we're home,
+    /// start landing".
+    #[kani::proof]
+    fn returning_never_advances_to_climbing_or_idle() {
+        let home = any_finite_vec();
+        let pos = any_finite_vec();
+        let safe_alt = any_finite_f32();
+        let tol = any_finite_f32();
+        let r = RtlPhase::Returning.advance(Some(home), pos, safe_alt, tol);
+        match r {
+            RtlTransition::Stay => {}
+            RtlTransition::Handoff => {}
+            RtlTransition::Advance(next) => {
+                // Must never happen from Returning — there's no
+                // advance path.
+                panic!("Returning must not Advance (got {:?})", next);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
