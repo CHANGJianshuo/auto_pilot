@@ -163,6 +163,175 @@ pub fn sim_state_to_telemetry(
     (imu, attitude, velocity, position)
 }
 
+/// Run the existing closed-loop SITL (bare MPC) for `ticks` ticks at
+/// 1 ms per tick and broadcast every topic on `publisher` at the
+/// cadence declared in `docs/topics.md`:
+///
+///   * IMU        — every tick (1 kHz)
+///   * Attitude   — every 4th tick (250 Hz)
+///   * Velocity   — every 4th tick (250 Hz)
+///   * Position   — every 4th tick (250 Hz)
+///   * Setpoint   — every 20th tick (50 Hz)
+///   * Actuator   — every tick (1 kHz)
+///   * Health     — every 100th tick (10 Hz)
+///
+/// Returns the final sim state so callers can assert on tracking
+/// performance **and** on telemetry delivery in the same test.
+///
+/// Publisher work is inline on the tokio task (the `.await` on each
+/// `publish_*` call). At 1 kHz that's ~7000 awaits/sec against a
+/// loopback Zenoh router; well inside tokio's capacity, but this is
+/// a host-only test harness — don't ship it as a firmware loop.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_closed_loop_with_zenoh_telemetry(
+    sim_cfg: &crate::SimConfig,
+    seed: u64,
+    ticks: usize,
+    publisher: &TelemetryPublisher,
+) -> Result<crate::SimState, ZenohBusError> {
+    use algo_indi::attitude_to_rate;
+    use algo_nmpc::{LqrWeights, Mpc1dConfig, Mpc3dPositionController, Setpoint};
+    use app_copter::{
+        ArmState, FlightState, apply_baro_measurement, apply_gps_measurement,
+        apply_mag_measurement, default_config_250g, rate_loop_step,
+    };
+    use core_bus::{ACTUATOR_MAX_CHANNELS, ActuatorCmdMsg, SetpointPositionMsg};
+
+    let mut sim_state = crate::SimState {
+        position_ned: nalgebra::Vector3::new(0.0, 0.0, -1.0),
+        ..crate::SimState::default()
+    };
+    let mut rng = crate::SimRng::new(seed);
+    let dt = 0.001_f32;
+    let mut app_cfg = default_config_250g();
+
+    let weights = LqrWeights {
+        q_pos: 4.0,
+        q_vel: 1.0,
+        r: 0.5,
+    };
+    let cfg = Mpc1dConfig {
+        weights,
+        dt_s: dt,
+        u_min: -20.0,
+        u_max: 20.0,
+    };
+    let mut mpc =
+        Mpc3dPositionController::<10>::new(cfg, cfg, 25, app_cfg.position_gains.max_accel)
+            .ok_or_else(|| {
+                ZenohBusError::Zenoh("MPC DARE failed to converge for default weights".into())
+            })?;
+
+    let mut flight = FlightState {
+        arm_state: ArmState::Armed,
+        ..FlightState::default()
+    };
+    let _ = apply_baro_measurement(
+        &mut flight,
+        &crate::sense_baro(sim_cfg, &sim_state, &mut rng),
+    );
+    let _ = apply_gps_measurement(
+        &mut flight,
+        &crate::sense_gps(sim_cfg, &sim_state, &mut rng),
+    );
+
+    let setpoint = Setpoint {
+        position_ned: nalgebra::Vector3::new(0.0, 0.0, -1.0),
+        ..Setpoint::default()
+    };
+
+    for i in 0..ticks {
+        let accel_w = crate::accel_world(sim_cfg, &sim_state);
+        let imu = crate::sense_imu(sim_cfg, &sim_state, accel_w, &mut rng);
+
+        let att = mpc.step(
+            &setpoint,
+            flight.state.position_ned,
+            flight.state.velocity_ned,
+            app_cfg.mass_kg,
+        );
+        let rate_cmd = attitude_to_rate(flight.state.attitude, att.q_desired, &app_cfg.k_attitude);
+        let saved_hover = app_cfg.hover_thrust_n;
+        app_cfg.hover_thrust_n = att.thrust_n;
+        let out = rate_loop_step(&mut app_cfg, &mut flight, imu, dt, rate_cmd);
+        app_cfg.hover_thrust_n = saved_hover;
+        crate::step(sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
+
+        let ts = u64::try_from(i).unwrap_or(u64::MAX);
+
+        // 1 kHz — IMU, actuator.
+        let imu_msg = ImuMsg {
+            timestamp_us: ts,
+            gyro_rad_s: [imu.gyro_rad_s.x, imu.gyro_rad_s.y, imu.gyro_rad_s.z],
+            accel_m_s2: [imu.accel_m_s2.x, imu.accel_m_s2.y, imu.accel_m_s2.z],
+            temperature_c: imu.temperature_c,
+        };
+        publisher.publish_imu(&imu_msg).await?;
+
+        let mut channels = [0.0_f32; ACTUATOR_MAX_CHANNELS];
+        for (k, slot) in channels.iter_mut().enumerate().take(4) {
+            *slot = out.motor_thrusts_n.fixed_view::<1, 1>(k, 0).to_scalar();
+        }
+        let act_msg = ActuatorCmdMsg {
+            timestamp_us: ts,
+            channels_n: channels,
+            n: 4,
+        };
+        publisher.publish_actuator(&act_msg).await?;
+
+        // 250 Hz — attitude, velocity, position (every 4th tick).
+        if i.is_multiple_of(4) {
+            let (imu_snap, att_msg, vel_msg, pos_msg) = sim_state_to_telemetry(&sim_state, ts);
+            let _ = imu_snap;
+            publisher.publish_attitude(&att_msg).await?;
+            publisher.publish_velocity(&vel_msg).await?;
+            publisher.publish_position(&pos_msg).await?;
+        }
+
+        // 50 Hz — setpoint (every 20th tick).
+        if i.is_multiple_of(20) {
+            publisher
+                .publish_setpoint(&SetpointPositionMsg {
+                    timestamp_us: ts,
+                    position_ned_m: [
+                        setpoint.position_ned.x,
+                        setpoint.position_ned.y,
+                        setpoint.position_ned.z,
+                    ],
+                    velocity_ned_m_s: [0.0; 3],
+                    accel_ned_m_s2: [0.0; 3],
+                    yaw_rad: setpoint.yaw_rad,
+                })
+                .await?;
+        }
+
+        // 10 Hz — health (every 100th tick).
+        if i.is_multiple_of(100) {
+            publisher.publish_health(&healthy_msg(ts)).await?;
+        }
+
+        if i.is_multiple_of(200) {
+            let _ = apply_gps_measurement(
+                &mut flight,
+                &crate::sense_gps(sim_cfg, &sim_state, &mut rng),
+            );
+        }
+        if i.is_multiple_of(40) {
+            let _ = apply_mag_measurement(
+                &mut flight,
+                &crate::sense_mag(sim_cfg, &sim_state, &mut rng),
+            );
+        }
+        if i.is_multiple_of(20) {
+            let _ = apply_baro_measurement(
+                &mut flight,
+                &crate::sense_baro(sim_cfg, &sim_state, &mut rng),
+            );
+        }
+    }
+    Ok(sim_state)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 mod tests {
@@ -313,6 +482,148 @@ mod tests {
             .unwrap();
         assert_eq!(got_hlth, hlth);
         assert_ne!(got_hlth.fault_flags & SensorFaultBit::GPS, 0);
+    }
+
+    /// Run 600 sim-ticks (600 ms of simulated time) while broadcasting
+    /// every topic over Zenoh. A subscriber on each topic counts the
+    /// messages it receives in the same window. Assert every count
+    /// hits the documented rate, within a tolerance that allows for:
+    ///   * Zenoh peer-discovery warm-up losing the first couple of
+    ///     messages
+    ///   * async scheduling latency between sim-tick and recv
+    ///
+    /// The test also asserts that the vehicle is still near the
+    /// setpoint at the end — the publisher shouldn't starve the
+    /// controller of tokio time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sitl_broadcasts_every_topic_at_documented_rate() {
+        let pub_session = ZenohSession::open_peer().await.unwrap();
+        let sub_session = ZenohSession::open_peer().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Declare counting subscribers BEFORE starting the publisher.
+        let sub_imu = sub_session
+            .subscriber::<ImuMsg>(topics::IMU_RAW)
+            .await
+            .unwrap();
+        let sub_att = sub_session
+            .subscriber::<AttitudeMsg>(topics::ATTITUDE)
+            .await
+            .unwrap();
+        let sub_pos = sub_session
+            .subscriber::<PositionNedMsg>(topics::POSITION_NED)
+            .await
+            .unwrap();
+        let sub_sp = sub_session
+            .subscriber::<SetpointPositionMsg>(topics::SETPOINT_POSITION)
+            .await
+            .unwrap();
+        let sub_act = sub_session
+            .subscriber::<ActuatorCmdMsg>(topics::ACTUATOR_CMD)
+            .await
+            .unwrap();
+        let sub_h = sub_session
+            .subscriber::<HealthMsg>(topics::HEALTH)
+            .await
+            .unwrap();
+
+        // Spawn counter tasks that drain each subscriber until the
+        // publisher run completes. They report counts back via
+        // `tokio::sync::oneshot`.
+        use tokio::sync::oneshot;
+        let (tx_imu, rx_imu) = oneshot::channel::<usize>();
+        let (tx_att, rx_att) = oneshot::channel::<usize>();
+        let (tx_pos, rx_pos) = oneshot::channel::<usize>();
+        let (tx_sp, rx_sp) = oneshot::channel::<usize>();
+        let (tx_act, rx_act) = oneshot::channel::<usize>();
+        let (tx_h, rx_h) = oneshot::channel::<usize>();
+
+        async fn count_until_idle<T>(
+            mut sub: crate::zenoh_bus::Subscriber<T>,
+            tx: oneshot::Sender<usize>,
+        ) where
+            T: Send + 'static + for<'de> serde::Deserialize<'de>,
+        {
+            let mut n = 0;
+            while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(500), sub.recv()).await
+            {
+                n += 1;
+            }
+            let _ = tx.send(n);
+        }
+        let h_imu = tokio::spawn(count_until_idle(sub_imu, tx_imu));
+        let h_att = tokio::spawn(count_until_idle(sub_att, tx_att));
+        let h_pos = tokio::spawn(count_until_idle(sub_pos, tx_pos));
+        let h_sp = tokio::spawn(count_until_idle(sub_sp, tx_sp));
+        let h_act = tokio::spawn(count_until_idle(sub_act, tx_act));
+        let h_h = tokio::spawn(count_until_idle(sub_h, tx_h));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Run the SITL with telemetry publishing.
+        let pubs = TelemetryPublisher::new(&pub_session).await.unwrap();
+        let sim_cfg = crate::SimConfig::default();
+        let ticks: usize = 600;
+        let final_state = run_closed_loop_with_zenoh_telemetry(&sim_cfg, 1, ticks, &pubs)
+            .await
+            .unwrap();
+
+        // Let subscribers drain.
+        let c_imu = rx_imu.await.unwrap();
+        let c_att = rx_att.await.unwrap();
+        let c_pos = rx_pos.await.unwrap();
+        let c_sp = rx_sp.await.unwrap();
+        let c_act = rx_act.await.unwrap();
+        let c_h = rx_h.await.unwrap();
+        let _ = h_imu.await;
+        let _ = h_att.await;
+        let _ = h_pos.await;
+        let _ = h_sp.await;
+        let _ = h_act.await;
+        let _ = h_h.await;
+
+        // Expected counts at the documented rates across 600 ticks.
+        // Tolerance 10% down (lose early messages) and allow up to
+        // the published count exactly (no tolerance up — can't
+        // over-publish).
+        // 10 % tolerance on the low side — Zenoh peer discovery may
+        // eat the first couple of messages.
+        #[allow(clippy::integer_division)]
+        let tol_lower = |expected: usize| expected.saturating_sub(expected / 10);
+        assert!(
+            c_imu >= tol_lower(600),
+            "imu count {c_imu}, expected ≥ {}",
+            tol_lower(600)
+        );
+        assert!(
+            c_act >= tol_lower(600),
+            "actuator count {c_act}, expected ≥ {}",
+            tol_lower(600)
+        );
+        assert!(
+            c_att >= tol_lower(150),
+            "attitude count {c_att}, expected ≥ {} (250 Hz × 0.6 s)",
+            tol_lower(150)
+        );
+        assert!(
+            c_pos >= tol_lower(150),
+            "position count {c_pos}, expected ≥ {}",
+            tol_lower(150)
+        );
+        assert!(
+            c_sp >= tol_lower(30),
+            "setpoint count {c_sp}, expected ≥ {} (50 Hz × 0.6 s)",
+            tol_lower(30)
+        );
+        assert!(
+            c_h >= 4,
+            "health count {c_h}, expected ≥ 4 (10 Hz × 0.6 s ≈ 6)"
+        );
+
+        // Sanity on the sim: vehicle still near the 1 m hover
+        // setpoint, i.e. telemetry publishing didn't starve the
+        // controller. Ideal sim, tight bound.
+        let alt_err = (-final_state.position_ned.z - 1.0).abs();
+        assert!(alt_err < 0.3, "SITL altitude err {alt_err} m");
     }
 
     #[test]

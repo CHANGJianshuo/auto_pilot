@@ -14,7 +14,7 @@ workspace = true
 default = []
 # Enable the Zenoh host session + typed pub/sub wrapper. Gated because
 # zenoh pulls ~80 transitive crates and bloats CI build times.
-zenoh-host = ["dep:zenoh", "dep:core-bus", "dep:serde"]
+zenoh-host = ["dep:zenoh", "dep:core-bus", "dep:serde", "dep:app-copter"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -35,6 +35,10 @@ mavlink = { workspace = true }
 core-bus = { path = "../core-bus", optional = true }
 zenoh = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
+# zenoh-host feature also pulls app-copter so the closed-loop SITL
+# runner (M14) can compose the full controller stack. Dev-dep version
+# below covers the same crate for the default test matrix.
+app-copter = { path = "../app-copter", optional = true }
 
 [dev-dependencies]
 app-copter = { path = "../app-copter" }
