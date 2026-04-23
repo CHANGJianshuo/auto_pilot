@@ -53,6 +53,172 @@ impl Default for SitlScenario {
     }
 }
 
+/// Analytical figure-8 (lemniscate-of-Gerono) setpoint generator.
+///
+/// `position(t) = (A sin ω t, B sin 2 ω t, −altitude)` plus the exact
+/// first and second derivatives as velocity and accel feed-forwards.
+/// Matches the Agilicious-paper figure-8 benchmark shape — one
+/// "lobe" per half-period, crossover at t = 0, π/ω, 2π/ω…
+///
+/// `amplitude_xy_m` is the x-axis amplitude A; the y-axis amplitude B
+/// is half of A, which gives the canonical 2 : 1 figure-8 ratio.
+/// `period_s` is the full-8 orbit period (time to trace one lobe +
+/// the other). `altitude_m` is the cruise altitude (NED z = −altitude).
+pub fn figure_eight(
+    amplitude_xy_m: f32,
+    period_s: f32,
+    altitude_m: f32,
+) -> impl FnMut(f32) -> Setpoint + Clone {
+    use core::f32::consts::TAU;
+    let omega = TAU / period_s;
+    let a = amplitude_xy_m;
+    let b = 0.5 * amplitude_xy_m;
+    move |t: f32| {
+        let c1 = libm::cosf(omega * t);
+        let s1 = libm::sinf(omega * t);
+        let c2 = libm::cosf(2.0 * omega * t);
+        let s2 = libm::sinf(2.0 * omega * t);
+        Setpoint {
+            position_ned: Vector3::new(a * s1, b * s2, -altitude_m),
+            velocity_ned: Vector3::new(a * omega * c1, 2.0 * b * omega * c2, 0.0),
+            accel_ned: Vector3::new(-a * omega * omega * s1, -4.0 * b * omega * omega * s2, 0.0),
+            yaw_rad: 0.0,
+        }
+    }
+}
+
+/// Outcome of a trajectory run — adds per-tick tracking error stats
+/// on top of [`SitlResult`]. RMS is computed across the whole window
+/// with no warm-up exclusion; callers that want settle-time-aware
+/// metrics should run the loop themselves.
+#[derive(Clone, Copy, Debug)]
+pub struct TrajectorySitlResult {
+    pub final_state: SimState,
+    pub position_rms_m: f32,
+    pub max_position_err_m: f32,
+    pub velocity_rms_m_s: f32,
+}
+
+/// Run a closed-loop SITL with a *time-varying* setpoint fed by
+/// `trajectory(t_s)`. Same inner stack as [`run_with_controller`],
+/// but the setpoint is queried fresh every tick. Returns position /
+/// velocity RMS across the entire window.
+///
+/// Using an analytical trajectory (versus a stream of discrete
+/// waypoints) matches how the Agilicious paper benchmarks agile
+/// flight — the controller sees continuous position + velocity +
+/// accel feed-forward at every tick.
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_controller_trajectory<const H: usize, F>(
+    scenario: &SitlScenario,
+    controller: &mut PositionController<H>,
+    mut trajectory: F,
+) -> TrajectorySitlResult
+where
+    F: FnMut(f32) -> Setpoint,
+{
+    let mut sim_state = SimState {
+        position_ned: trajectory(0.0).position_ned,
+        ..SimState::default()
+    };
+    let mut rng = SimRng::new(scenario.seed);
+    let mut app_cfg = default_config_250g();
+
+    let mut flight = FlightState {
+        arm_state: ArmState::Armed,
+        ..FlightState::default()
+    };
+    let _ = apply_baro_measurement(
+        &mut flight,
+        &sense_baro(&scenario.sim_cfg, &sim_state, &mut rng),
+    );
+    let _ = apply_gps_measurement(
+        &mut flight,
+        &sense_gps(&scenario.sim_cfg, &sim_state, &mut rng),
+    );
+
+    let mut pos_sq_sum = 0.0_f64;
+    let mut vel_sq_sum = 0.0_f64;
+    let mut max_pos_err = 0.0_f32;
+
+    for i in 0..scenario.ticks {
+        // u32 → f32 is lossless up to 2^24; realistic SITL windows
+        // (15 s at 1 kHz = 15_000 ticks) are well inside that.
+        let i_u32 = u32::try_from(i).unwrap_or(u32::MAX);
+        #[allow(clippy::as_conversions)]
+        let t_s = scenario.dt_s * (i_u32 as f32);
+        let setpoint = trajectory(t_s);
+        let accel_w = accel_world(&scenario.sim_cfg, &sim_state);
+        let imu = sense_imu(&scenario.sim_cfg, &sim_state, accel_w, &mut rng);
+
+        let att = controller.step(
+            &setpoint,
+            flight.state.position_ned,
+            flight.state.velocity_ned,
+            app_cfg.mass_kg,
+            scenario.dt_s,
+        );
+        let rate_cmd = attitude_to_rate(flight.state.attitude, att.q_desired, &app_cfg.k_attitude);
+        let saved_hover = app_cfg.hover_thrust_n;
+        app_cfg.hover_thrust_n = att.thrust_n;
+        let out = rate_loop_step(&mut app_cfg, &mut flight, imu, scenario.dt_s, rate_cmd);
+        app_cfg.hover_thrust_n = saved_hover;
+        step(
+            &scenario.sim_cfg,
+            &mut sim_state,
+            &out.motor_thrusts_n,
+            scenario.dt_s,
+        );
+
+        // Error accumulation using truth (sim_state) vs commanded
+        // setpoint. Using f64 sums to avoid catastrophic cancellation
+        // over long trajectories.
+        let pos_err = sim_state.position_ned - setpoint.position_ned;
+        let pos_err_sq = pos_err.norm_squared();
+        pos_sq_sum += f64::from(pos_err_sq);
+        let pos_err_mag = libm::sqrtf(pos_err_sq);
+        if pos_err_mag > max_pos_err {
+            max_pos_err = pos_err_mag;
+        }
+        let vel_err = sim_state.velocity_ned - setpoint.velocity_ned;
+        vel_sq_sum += f64::from(vel_err.norm_squared());
+
+        if i.is_multiple_of(200) {
+            let _ = apply_gps_measurement(
+                &mut flight,
+                &sense_gps(&scenario.sim_cfg, &sim_state, &mut rng),
+            );
+        }
+        if i.is_multiple_of(40) {
+            let _ = apply_mag_measurement(
+                &mut flight,
+                &sense_mag(&scenario.sim_cfg, &sim_state, &mut rng),
+            );
+        }
+        if i.is_multiple_of(20) {
+            let _ = apply_baro_measurement(
+                &mut flight,
+                &sense_baro(&scenario.sim_cfg, &sim_state, &mut rng),
+            );
+        }
+    }
+
+    let n = f64::from(u32::try_from(scenario.ticks).unwrap_or(u32::MAX)).max(1.0);
+    // Accept the narrowing f64 → f32 for the final-metric cast — the
+    // callers work in f32 m and the f64 sum is only to avoid round-
+    // off accumulation during the loop.
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+    let position_rms_m = libm::sqrtf((pos_sq_sum / n) as f32);
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+    let velocity_rms_m_s = libm::sqrtf((vel_sq_sum / n) as f32);
+    TrajectorySitlResult {
+        final_state: sim_state,
+        position_rms_m,
+        max_position_err_m: max_pos_err,
+        velocity_rms_m_s,
+    }
+}
+
 /// Outcome of a closed-loop run. Trackable metrics only — callers
 /// that need full state snapshots should run the loop themselves.
 #[derive(Clone, Copy, Debug)]
@@ -223,4 +389,123 @@ where
         }
     }
     SitlResult::from_final(sim_state, &scenario.setpoint)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use algo_nmpc::{LqiWeights, Mpc1dIConfig, PositionController, PositionGains};
+
+    /// Figure-8 generator produces position/velocity consistent with
+    /// each other (velocity ≈ dposition/dt) at a few sampled times.
+    #[test]
+    fn figure_eight_derivatives_self_consistent() {
+        let amplitude = 2.0_f32;
+        let period = 10.0_f32;
+        let altitude = 1.0_f32;
+        let mut traj = figure_eight(amplitude, period, altitude);
+        let dt = 0.001_f32;
+        for &t in &[0.0_f32, 0.5, 2.5, 7.5] {
+            let s0 = traj(t);
+            let s1 = traj(t + dt);
+            let fd_vx = (s1.position_ned.x - s0.position_ned.x) / dt;
+            let fd_vy = (s1.position_ned.y - s0.position_ned.y) / dt;
+            assert!(
+                (fd_vx - s0.velocity_ned.x).abs() < 0.01,
+                "t={t}: fd_vx {fd_vx} vs analytical {}",
+                s0.velocity_ned.x
+            );
+            assert!(
+                (fd_vy - s0.velocity_ned.y).abs() < 0.01,
+                "t={t}: fd_vy {fd_vy} vs analytical {}",
+                s0.velocity_ned.y
+            );
+            assert!((s0.position_ned.z - -altitude).abs() < 1.0e-6);
+        }
+    }
+
+    /// Closed-loop figure-8 tracking with MPC-I in ideal sim. 15 s
+    /// (1.5 full orbits) at 2 m amplitude / 10 s period / 1 m alt.
+    /// Target: < 0.5 m position RMS. Phase III's first benchmark.
+    #[test]
+    fn figure_eight_mpc_i_tracks_within_half_meter_rms() {
+        let scenario = SitlScenario {
+            sim_cfg: SimConfig::default(),
+            seed: 7,
+            ticks: 15_000,
+            setpoint: Setpoint::default(),
+            dt_s: 0.001,
+        };
+        let lqi_weights = LqiWeights {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            q_i: 1.5,
+            r: 0.5,
+        };
+        let cfg = Mpc1dIConfig {
+            weights: lqi_weights,
+            dt_s: scenario.dt_s,
+            u_min: -20.0,
+            u_max: 20.0,
+        };
+        let mut ctrl =
+            PositionController::<10>::mpc_i(cfg, cfg, 25, PositionGains::default().max_accel, 5.0)
+                .unwrap();
+        let traj = figure_eight(2.0, 10.0, 1.0);
+        let result = run_with_controller_trajectory(&scenario, &mut ctrl, traj);
+        assert!(
+            result.position_rms_m < 0.5,
+            "position RMS {} m ≥ 0.5 m",
+            result.position_rms_m
+        );
+        assert!(
+            result.max_position_err_m < 1.5,
+            "max position err {} m ≥ 1.5 m",
+            result.max_position_err_m
+        );
+    }
+
+    /// Same trajectory, PI cascade baseline. On a moving target
+    /// MPC-I's predictive horizon + feed-forward should beat
+    /// classical cascade.
+    #[test]
+    fn figure_eight_mpc_i_beats_pi_cascade() {
+        let scenario = SitlScenario {
+            sim_cfg: SimConfig::default(),
+            seed: 7,
+            ticks: 15_000,
+            setpoint: Setpoint::default(),
+            dt_s: 0.001,
+        };
+        let mut pi: PositionController<10> = PositionController::pi(PositionGains {
+            k_i_vel: Vector3::new(0.5, 0.5, 0.8),
+            ..PositionGains::default()
+        });
+        let pi_result =
+            run_with_controller_trajectory(&scenario, &mut pi, figure_eight(2.0, 10.0, 1.0));
+        let lqi_weights = LqiWeights {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            q_i: 1.5,
+            r: 0.5,
+        };
+        let cfg = Mpc1dIConfig {
+            weights: lqi_weights,
+            dt_s: scenario.dt_s,
+            u_min: -20.0,
+            u_max: 20.0,
+        };
+        let mut mpc_i =
+            PositionController::<10>::mpc_i(cfg, cfg, 25, PositionGains::default().max_accel, 5.0)
+                .unwrap();
+        let mpc_result =
+            run_with_controller_trajectory(&scenario, &mut mpc_i, figure_eight(2.0, 10.0, 1.0));
+        assert!(
+            mpc_result.position_rms_m < pi_result.position_rms_m,
+            "MPC-I should beat PI on moving target: PI {} m, MPC-I {} m",
+            pi_result.position_rms_m,
+            mpc_result.position_rms_m
+        );
+    }
 }
