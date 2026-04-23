@@ -74,6 +74,7 @@
 | [0068](./0068-residual-mpc-sitl.md) | 2026-04-23 | M11c MPC + residual 接进 SITL | `88c13bd` | `Mpc3dPositionController` 拆出 `solve_accel` + `accel_to_attitude_thrust` pub；`sim-hil::residual_mpc::MpcResidualController<H, B>` 把 MPC 和 ResidualPolicy 绑一起、envelope reject 静默 fallback；**realistic sim（1.5 m/s 风 + drag）下手调 affine residual 比裸 MPC 横向误差降 > 20 cm**；247 tests 全绿。 |
 | [0069](./0069-three-tier-shootout.md) | 2026-04-23 | M11d 三档 shootout | `0f680c8` | 同 realistic sim 三档对比：bare MPC（漂 > 0.5 m）/ MPC+residual (0.22 m) / LQI (0.24 m)；意外发现手调 PD 残差和 MPC 预测合力追平 LQI；断言**档位**而非 ordering，允许 tuning 摇摆；`residual × 3 < bare`、`max/min < 3`；248 tests 全绿。 |
 | [0070](./0070-kani-core-bus.md) | 2026-04-23 | M12 Kani 扩到 core-bus + CI | `c32b90e` | 5 个新 Kani 证明（HealthLevel u8 序保持 + round-trip / SensorFaultBit 位互斥 + union 保留 / ACTUATOR_MAX_CHANNELS 限 u8）；workspace 证明 13→18；CI 新 `kani` job 4 crate 并行证，总耗时 < 15 秒；plan.md 创新点 1 的"形式化"从声明落到 CI 合同。 |
+| [0071](./0071-full-telemetry-zenoh.md) | 2026-04-23 | M13 全遥测 Zenoh 端到端 | `cc9965c` | `TelemetryPublisher` 把 core-bus 7 条 topic 打包成 typed `.publish_*()`；helper `healthy_msg` + `with_fault`；SITL 测试 2 peer session、7 并行 subscriber、byte-exact round-trip；M10 Zenoh 从"1 条消息"升级到"整套 schema"。 |
 
 ## 写新文档时遵守的模板
 
