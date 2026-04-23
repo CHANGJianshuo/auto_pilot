@@ -128,6 +128,13 @@ async fn main() -> anyhow::Result<()> {
     // so a drop should never happen in flight anyway, but silencing
     // "health improved!" toasts is the right default.
     let mut prev_health = HealthLevel::Healthy;
+    // Edge detection for landing: Landing→Idle === touchdown
+    // detector fired + auto-disarm happened. Emit "LANDED" so the
+    // pilot knows the motors are safely off. Unlike the mode-change
+    // alerts we deliberately suppress (RTL activated, takeoff
+    // reached), this one is pilot-actionable: throttle stick can
+    // be moved without spinning motors.
+    let mut prev_landing = LandingState::Idle;
 
     loop {
         // Drain any incoming snapshots to keep `latest` fresh.
@@ -311,6 +318,17 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!(level = label, "emitted STATUSTEXT: HEALTH");
             }
             prev_health = s.overall_health;
+
+            // Landing completion edge. Auto-disarm fires
+            // synchronously with Landing → Idle, so the pilot needs
+            // to know NOW (before they reach for the throttle).
+            if prev_landing == LandingState::Landing && s.landing_state == LandingState::Idle {
+                sink.send_statustext(MavSeverity::MAV_SEVERITY_INFO, "LANDED")
+                    .await
+                    .ok();
+                tracing::info!("emitted STATUSTEXT: LANDED");
+            }
+            prev_landing = s.landing_state;
         }
 
         // If the sim task ever exited, bail.
@@ -345,6 +363,10 @@ struct Snapshot {
     /// Sensor-subsystem rollup health. Edge-detected for WARNING
     /// (→ Degraded) / CRITICAL (→ Emergency) STATUSTEXTs.
     overall_health: HealthLevel,
+    /// Landing mode state. Edge-detected for `Landing → Idle`
+    /// (touchdown detector fired + auto-disarm) to emit a "LANDED"
+    /// STATUSTEXT.
+    landing_state: LandingState,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -438,6 +460,7 @@ fn run_sim(
                 motor_alive: flight.motor_alive,
                 preflight: preflight_check(&flight).err(),
                 overall_health: flight.overall_health(),
+                landing_state: flight.landing_state,
             };
             if tx.send(snap).is_err() {
                 // Receiver dropped — main exited; wind down.

@@ -48,17 +48,20 @@ not (per `HealthLevel`'s no-recovery-in-flight contract).
 | `HEALTH: EMERGENCY` | `CRITICAL` | At least one sensor has 50+ consecutive EKF rejects. Mission abort. | Land at the nearest safe location — don't try to return to launch if it requires non-trivial navigation. |
 | `HEALTH: FAILED` | `EMERGENCY` | A subsystem reached the absorbing Failed state. | Immediate power-off if on ground; if in air, emergency descent (parachute or cut throttle). Vehicle is no longer trustable. |
 
-## Flight mode (planned, not yet wired)
+## Flight mode
 
 Motion-mode entries (TAKEOFF / LAND / RTL) **deliberately don't**
 emit STATUSTEXTs — the pilot just sent that command; they're
 watching the result in ATTITUDE / GLOBAL_POSITION_INT. Adding "RTL
 ACTIVATED" confirmations would pollute the alert channel.
 
-Exception: **landing complete** emits `LANDED` because auto-disarm
+Exception — **landing complete** emits `LANDED` because auto-disarm
 happens synchronously with touchdown and the pilot needs to know
-before they touch the throttle stick. Planned for M24; not yet
-wired.
+before they touch the throttle stick:
+
+| Text | Severity | Trigger | Next tick cleanup |
+|---|---|---|---|
+| `LANDED` | `INFO` | `flight.landing_state` transitions `Landing → Idle` (touchdown detector fired; `rate_loop_step` has already auto-disarmed). | Vehicle is safe to approach. Power-cycle if the flight logs need pulling. |
 
 ## Implementation notes
 
