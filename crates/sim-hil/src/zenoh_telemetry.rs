@@ -332,6 +332,154 @@ pub async fn run_closed_loop_with_zenoh_telemetry(
     Ok(sim_state)
 }
 
+/// Residual-policy variant of [`run_closed_loop_with_zenoh_telemetry`].
+///
+/// Swaps the bare MPC for an [`MpcResidualController`] so the NN
+/// correction path rides alongside the Zenoh telemetry fan-out. Proves
+/// pillar 3 (onboard NN) and pillar 4 (Zenoh) work at the same time
+/// without starving each other.
+///
+/// Caller owns the controller to keep policy-tuning decisions visible
+/// at the test site (hand-crafted affine weights for now; a trained
+/// model once the training pipeline lands).
+pub async fn run_closed_loop_residual_with_zenoh_telemetry<B>(
+    sim_cfg: &crate::SimConfig,
+    seed: u64,
+    ticks: usize,
+    publisher: &TelemetryPublisher,
+    controller: &mut crate::residual_mpc::MpcResidualController<10, B>,
+) -> Result<crate::SimState, ZenohBusError>
+where
+    B: nn_runtime::InferenceBackend,
+{
+    use algo_indi::attitude_to_rate;
+    use algo_nmpc::Setpoint;
+    use app_copter::{
+        ArmState, FlightState, apply_baro_measurement, apply_gps_measurement,
+        apply_mag_measurement, default_config_250g, rate_loop_step,
+    };
+    use core_bus::{ACTUATOR_MAX_CHANNELS, ActuatorCmdMsg, SetpointPositionMsg};
+
+    let mut sim_state = crate::SimState {
+        position_ned: nalgebra::Vector3::new(0.0, 0.0, -1.0),
+        ..crate::SimState::default()
+    };
+    let mut rng = crate::SimRng::new(seed);
+    let dt = 0.001_f32;
+    let mut app_cfg = default_config_250g();
+
+    let mut flight = FlightState {
+        arm_state: ArmState::Armed,
+        ..FlightState::default()
+    };
+    let _ = apply_baro_measurement(
+        &mut flight,
+        &crate::sense_baro(sim_cfg, &sim_state, &mut rng),
+    );
+    let _ = apply_gps_measurement(
+        &mut flight,
+        &crate::sense_gps(sim_cfg, &sim_state, &mut rng),
+    );
+
+    let setpoint = Setpoint {
+        position_ned: nalgebra::Vector3::new(0.0, 0.0, -1.0),
+        ..Setpoint::default()
+    };
+
+    for i in 0..ticks {
+        let accel_w = crate::accel_world(sim_cfg, &sim_state);
+        let imu = crate::sense_imu(sim_cfg, &sim_state, accel_w, &mut rng);
+
+        let att = controller.step(
+            &setpoint,
+            flight.state.position_ned,
+            flight.state.velocity_ned,
+            flight.state.attitude,
+            app_cfg.mass_kg,
+        );
+        let rate_cmd = attitude_to_rate(flight.state.attitude, att.q_desired, &app_cfg.k_attitude);
+        let saved_hover = app_cfg.hover_thrust_n;
+        app_cfg.hover_thrust_n = att.thrust_n;
+        let out = rate_loop_step(&mut app_cfg, &mut flight, imu, dt, rate_cmd);
+        app_cfg.hover_thrust_n = saved_hover;
+        crate::step(sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
+
+        let ts = u64::try_from(i).unwrap_or(u64::MAX);
+
+        // Same rate table as the bare-MPC runner; keep the two runners
+        // symmetric so telemetry-side regression tests swap cleanly.
+        publisher
+            .publish_imu(&ImuMsg {
+                timestamp_us: ts,
+                gyro_rad_s: [imu.gyro_rad_s.x, imu.gyro_rad_s.y, imu.gyro_rad_s.z],
+                accel_m_s2: [imu.accel_m_s2.x, imu.accel_m_s2.y, imu.accel_m_s2.z],
+                temperature_c: imu.temperature_c,
+            })
+            .await?;
+        let mut channels = [0.0_f32; ACTUATOR_MAX_CHANNELS];
+        for (k, slot) in channels.iter_mut().enumerate().take(4) {
+            *slot = out.motor_thrusts_n.fixed_view::<1, 1>(k, 0).to_scalar();
+        }
+        publisher
+            .publish_actuator(&ActuatorCmdMsg {
+                timestamp_us: ts,
+                channels_n: channels,
+                n: 4,
+            })
+            .await?;
+        if i.is_multiple_of(4) {
+            let (_, att_msg, vel_msg, pos_msg) = sim_state_to_telemetry(&sim_state, ts);
+            publisher.publish_attitude(&att_msg).await?;
+            publisher.publish_velocity(&vel_msg).await?;
+            publisher.publish_position(&pos_msg).await?;
+        }
+        if i.is_multiple_of(20) {
+            publisher
+                .publish_setpoint(&SetpointPositionMsg {
+                    timestamp_us: ts,
+                    position_ned_m: [
+                        setpoint.position_ned.x,
+                        setpoint.position_ned.y,
+                        setpoint.position_ned.z,
+                    ],
+                    velocity_ned_m_s: [0.0; 3],
+                    accel_ned_m_s2: [0.0; 3],
+                    yaw_rad: setpoint.yaw_rad,
+                })
+                .await?;
+        }
+        if i.is_multiple_of(100) {
+            // Surface the policy's reject count via the health topic
+            // so subscribers can see if the NN is being blocked.
+            let mut h = healthy_msg(ts);
+            if controller.reject_count() > 0 {
+                h = with_fault(h, core_bus::SensorFaultBit::EKF);
+            }
+            publisher.publish_health(&h).await?;
+        }
+
+        if i.is_multiple_of(200) {
+            let _ = apply_gps_measurement(
+                &mut flight,
+                &crate::sense_gps(sim_cfg, &sim_state, &mut rng),
+            );
+        }
+        if i.is_multiple_of(40) {
+            let _ = apply_mag_measurement(
+                &mut flight,
+                &crate::sense_mag(sim_cfg, &sim_state, &mut rng),
+            );
+        }
+        if i.is_multiple_of(20) {
+            let _ = apply_baro_measurement(
+                &mut flight,
+                &crate::sense_baro(sim_cfg, &sim_state, &mut rng),
+            );
+        }
+    }
+    Ok(sim_state)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 mod tests {
@@ -624,6 +772,122 @@ mod tests {
         // controller. Ideal sim, tight bound.
         let alt_err = (-final_state.position_ned.z - 1.0).abs();
         assert!(alt_err < 0.3, "SITL altitude err {alt_err} m");
+    }
+
+    /// Residual policy + Zenoh telemetry on the same SITL run.
+    /// Proves pillar 3 (NN) and pillar 4 (Zenoh) compose: the
+    /// residual controller isn't starved by the async publishers,
+    /// and the publishers aren't starved by the policy inference.
+    ///
+    /// Hand-tuned affine residual — same (pos_err_x, vel_x) PD shape
+    /// as the M11c SITL demo. Wind disturbance 1.5 m/s along +x so
+    /// the policy actually has work to do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sitl_residual_with_zenoh_telemetry() {
+        use crate::residual_mpc::MpcResidualController;
+        use algo_nmpc::{LqrWeights, Mpc1dConfig, Mpc3dPositionController};
+        use nn_runtime::{AffineBackend, ResidualPolicy, SafetyEnvelope};
+
+        let pub_session = ZenohSession::open_peer().await.unwrap();
+        let sub_session = ZenohSession::open_peer().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let sub_imu = sub_session
+            .subscriber::<ImuMsg>(topics::IMU_RAW)
+            .await
+            .unwrap();
+        let sub_health = sub_session
+            .subscriber::<HealthMsg>(topics::HEALTH)
+            .await
+            .unwrap();
+
+        use tokio::sync::oneshot;
+        let (tx_imu, rx_imu) = oneshot::channel::<usize>();
+        let (tx_h, rx_h) = oneshot::channel::<usize>();
+
+        async fn count_until_idle<T>(
+            mut sub: crate::zenoh_bus::Subscriber<T>,
+            tx: oneshot::Sender<usize>,
+        ) where
+            T: Send + 'static + for<'de> serde::Deserialize<'de>,
+        {
+            let mut n = 0;
+            while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(500), sub.recv()).await
+            {
+                n += 1;
+            }
+            let _ = tx.send(n);
+        }
+        let h_imu = tokio::spawn(count_until_idle(sub_imu, tx_imu));
+        let h_health = tokio::spawn(count_until_idle(sub_health, tx_h));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let pubs = TelemetryPublisher::new(&pub_session).await.unwrap();
+
+        // Build MPC + residual policy. PD-shaped affine on x-axis,
+        // same as the M11c SITL demo.
+        let dt = 0.001_f32;
+        let weights = LqrWeights {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            r: 0.5,
+        };
+        let cfg = Mpc1dConfig {
+            weights,
+            dt_s: dt,
+            u_min: -20.0,
+            u_max: 20.0,
+        };
+        let mpc = Mpc3dPositionController::<10>::new(cfg, cfg, 25, 8.0).unwrap();
+        let mut w = [[0.0_f32; nn_runtime::FEATURE_LEN]; nn_runtime::RESIDUAL_LEN];
+        w[0][0] = -2.0; // pos_err_x → residual_x
+        w[0][3] = -1.0; // vel_x     → residual_x
+        let backend = AffineBackend::new(w, [0.0; nn_runtime::RESIDUAL_LEN], 5.0);
+        let policy = ResidualPolicy::new(backend, SafetyEnvelope::small_multirotor_default());
+        let mut controller = MpcResidualController::new(mpc, policy);
+
+        let sim_cfg = crate::SimConfig::realistic_dynamics(nalgebra::Vector3::new(1.5, 0.0, 0.0));
+        let ticks = 600_usize;
+        let final_state = run_closed_loop_residual_with_zenoh_telemetry(
+            &sim_cfg,
+            3,
+            ticks,
+            &pubs,
+            &mut controller,
+        )
+        .await
+        .unwrap();
+
+        let c_imu = rx_imu.await.unwrap();
+        let c_h = rx_h.await.unwrap();
+        let _ = h_imu.await;
+        let _ = h_health.await;
+
+        // Rate check: 1 kHz × 0.6 s = 600 IMU, 10% tolerance.
+        assert!(c_imu >= 540, "imu count {c_imu}, expected ≥ 540");
+        // Health: 10 Hz × 0.6 s = 6 ± 1.
+        assert!(c_h >= 4, "health count {c_h}, expected ≥ 4");
+
+        // The residual should keep the vehicle closer than the M14
+        // bare-MPC run under the same 1.5 m/s wind. M14 was ideal sim,
+        // so we can't directly compare — here we assert that with
+        // wind active the residual-compensated tracking is still
+        // bounded (NOT the 2.7+ m the M11c bare-MPC test showed).
+        let horiz =
+            (final_state.position_ned.x.powi(2) + final_state.position_ned.y.powi(2)).sqrt();
+        assert!(
+            horiz < 1.0,
+            "residual-compensated SITL horizontal err {horiz} m ≥ 1.0 m"
+        );
+
+        // Policy should produce zero rejections with this tuning —
+        // the hand-crafted residual stays inside the safety envelope.
+        assert_eq!(
+            controller.reject_count(),
+            0,
+            "unexpected policy rejections: {}",
+            controller.reject_count()
+        );
     }
 
     #[test]
