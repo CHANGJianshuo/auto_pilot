@@ -71,10 +71,12 @@ before they touch the throttle stick:
   pattern at Phase II with `heapless::String<50>` in place of
   `std::format!`.
 - UDP transport means **STATUSTEXT can be lost** without the sender
-  knowing. For `CRITICAL` + `EMERGENCY` alerts the firmware will
-  (M25, planned) retransmit 3× at 1 s intervals to cross any
-  plausible burst-loss window. Best-effort even so; pilots must
-  corroborate with the HUD values if an alert seems overdue.
+  knowing. For `CRITICAL` + `EMERGENCY` alerts the `sitl_mavlink`
+  example (M25, implemented) retransmits **3× total** — the initial
+  send plus two retries at +1 s and +2 s. This crosses most
+  plausible burst-loss windows. Best-effort even so; pilots must
+  corroborate with the HUD values if an alert seems overdue. The
+  embedded firmware will inherit the same pattern at Phase II.
 - The 50-byte MAVLink text field is a hard ceiling. Every alert
   template above fits within 49 bytes for all possible parameters
   (longest: `"PREFLIGHT: EKF not converged"` = 28 bytes).

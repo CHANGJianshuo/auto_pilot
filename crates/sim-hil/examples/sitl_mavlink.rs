@@ -118,6 +118,11 @@ async fn main() -> anyhow::Result<()> {
     // motor actually transitions from alive to dead (not every tick
     // while it stays dead, which would flood the MAVLink link).
     let mut prev_motor_alive: [bool; 4] = [true; 4];
+    // Retry queue for CRITICAL / EMERGENCY alerts. UDP can drop
+    // packets silently, so for events the pilot MUST hear we queue
+    // two extra retransmits at +1 s and +2 s from the first send.
+    // INFO / WARNING don't retry (not worth the link bandwidth).
+    let mut alert_retries: Vec<(Instant, MavSeverity, String)> = Vec::new();
     // Edge detection for preflight: on None→Some(reason), emit a
     // STATUSTEXT. On Some(a)→Some(b) where a != b, re-emit (the
     // failing subsystem changed, pilot should know).
@@ -251,6 +256,20 @@ async fn main() -> anyhow::Result<()> {
         let now = Instant::now();
         let t_ms: u32 = u32::try_from(now.duration_since(start).as_millis()).unwrap_or(u32::MAX);
 
+        // M25 retry pump: any queued retransmit whose due-time has
+        // passed goes out now. Preserves relative ordering because
+        // enqueues always push future-dated entries.
+        let mut retry_i = 0;
+        while retry_i < alert_retries.len() {
+            if alert_retries[retry_i].0 <= now {
+                let (_, sev, text) = alert_retries.remove(retry_i);
+                sink.send_statustext(sev, &text).await.ok();
+                tracing::debug!(text = %text, "retransmitted STATUSTEXT");
+            } else {
+                retry_i += 1;
+            }
+        }
+
         if now.duration_since(last_hb) >= Duration::from_secs(1) {
             sink.send_heartbeat().await.ok();
             last_hb = now;
@@ -271,6 +290,8 @@ async fn main() -> anyhow::Result<()> {
             }
             // Edge-triggered motor-failure alert: any motor that just
             // transitioned from alive → dead emits one STATUSTEXT.
+            // CRITICAL severity → M25 retry policy applies (two
+            // retransmits at +1 s and +2 s).
             for (idx, (&was_alive, &is_alive)) in
                 prev_motor_alive.iter().zip(s.motor_alive.iter()).enumerate()
             {
@@ -279,9 +300,10 @@ async fn main() -> anyhow::Result<()> {
                     // On the embedded target a `heapless::String<50>` +
                     // `core::fmt::write!` would be the equivalent.
                     let text = format!("MOTOR {idx} FAILED");
-                    sink.send_statustext(MavSeverity::MAV_SEVERITY_CRITICAL, &text)
-                        .await
-                        .ok();
+                    let severity = MavSeverity::MAV_SEVERITY_CRITICAL;
+                    sink.send_statustext(severity, &text).await.ok();
+                    alert_retries.push((now + Duration::from_secs(1), severity, text.clone()));
+                    alert_retries.push((now + Duration::from_secs(2), severity, text));
                     tracing::warn!(motor = idx, "emitted STATUSTEXT: MOTOR FAILED");
                 }
             }
@@ -305,7 +327,8 @@ async fn main() -> anyhow::Result<()> {
             // Edge-triggered health escalation. Only climb in severity
             // emits — HealthLevel never recovers in flight so a drop
             // shouldn't happen; if it does we silently accept it
-            // (flight stack bug, not a pilot-actionable alert).
+            // (flight stack bug, not a pilot-actionable alert). CRITICAL
+            // and EMERGENCY trigger the M25 retry policy.
             if s.overall_health.severity() > prev_health.severity() {
                 let (severity, label) = match s.overall_health {
                     HealthLevel::Healthy => (MavSeverity::MAV_SEVERITY_INFO, "HEALTHY"),
@@ -315,6 +338,13 @@ async fn main() -> anyhow::Result<()> {
                 };
                 let text = format!("HEALTH: {label}");
                 sink.send_statustext(severity, &text).await.ok();
+                if matches!(
+                    severity,
+                    MavSeverity::MAV_SEVERITY_CRITICAL | MavSeverity::MAV_SEVERITY_EMERGENCY
+                ) {
+                    alert_retries.push((now + Duration::from_secs(1), severity, text.clone()));
+                    alert_retries.push((now + Duration::from_secs(2), severity, text));
+                }
                 tracing::warn!(level = label, "emitted STATUSTEXT: HEALTH");
             }
             prev_health = s.overall_health;
