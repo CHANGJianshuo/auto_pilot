@@ -12,8 +12,9 @@
 
 use mavlink::common::{
     ATTITUDE_DATA, COMMAND_ACK_DATA, GLOBAL_POSITION_INT_DATA, HEARTBEAT_DATA, MavCmd, MavMessage,
-    MavResult,
+    MavResult, STATUSTEXT_DATA,
 };
+pub use mavlink::common::MavSeverity;
 use mavlink::{MAVLinkV2MessageRaw, MavHeader};
 use nalgebra::{Quaternion, Vector3};
 
@@ -94,6 +95,45 @@ pub fn encode_command_ack(
     result: MavResult,
 ) -> FrameBuffer {
     let msg = MavMessage::COMMAND_ACK(COMMAND_ACK_DATA { command, result });
+    let header = MavHeader {
+        system_id,
+        component_id,
+        sequence,
+    };
+    encode(&header, &msg)
+}
+
+/// Build a `STATUSTEXT` frame.
+///
+/// MAVLink STATUSTEXT is a 50-byte UTF-8 payload with an attached
+/// severity (EMERGENCY → DEBUG). QGroundControl surfaces these as
+/// toast notifications in the HUD — the canonical channel for
+/// out-of-band pilot alerts such as "MOTOR 0 FAILED".
+///
+/// `text` is copied byte-for-byte into the 50-byte buffer, null-
+/// terminated. Input longer than 50 bytes is silently truncated;
+/// input shorter is null-padded. No multi-chunk fragmentation is
+/// performed — a single 50-byte message covers every alert the
+/// current firmware emits.
+#[must_use]
+pub fn encode_statustext(
+    system_id: u8,
+    component_id: u8,
+    sequence: u8,
+    severity: MavSeverity,
+    text: &str,
+) -> FrameBuffer {
+    let mut buf = [0_u8; 50];
+    // Copy up to 49 bytes; leave index 49 as the implicit null terminator.
+    let src = text.as_bytes();
+    let n = if src.len() > 49 { 49 } else { src.len() };
+    for (dst, &byte) in buf.iter_mut().take(n).zip(src.iter()) {
+        *dst = byte;
+    }
+    let msg = MavMessage::STATUSTEXT(STATUSTEXT_DATA {
+        severity,
+        text: buf,
+    });
     let header = MavHeader {
         system_id,
         component_id,
@@ -279,7 +319,12 @@ fn clamp_f32_to_i16(v: f32) -> i16 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -402,5 +447,41 @@ mod tests {
         }
         let res = parse_frame(frame.as_slice());
         assert!(res.is_err(), "expected error on CRC flip, got {res:?}");
+    }
+
+    #[test]
+    fn statustext_round_trips_short_message() {
+        let frame = encode_statustext(1, 1, 0, MavSeverity::MAV_SEVERITY_CRITICAL, "MOTOR 0 FAILED");
+        assert_eq!(byte_at(&frame, 0), 0xFD);
+        // Parse it back and confirm the message reaches the caller.
+        let (_hdr, msg) = parse_frame(frame.as_slice()).expect("parse failed");
+        if let MavMessage::STATUSTEXT(s) = msg {
+            assert_eq!(s.severity, MavSeverity::MAV_SEVERITY_CRITICAL);
+            // 14 chars + 36 null bytes; text field is fixed [u8; 50].
+            let prefix: &[u8] = b"MOTOR 0 FAILED";
+            assert_eq!(&s.text[..prefix.len()], prefix);
+            for &b in &s.text[prefix.len()..] {
+                assert_eq!(b, 0, "expected null-padded tail, got {b:#x}");
+            }
+        } else {
+            panic!("parsed wrong message variant");
+        }
+    }
+
+    #[test]
+    fn statustext_truncates_overlong_text() {
+        // 60-byte input — only 49 bytes should fit (last slot is the
+        // null terminator).
+        let long = "X".repeat(60);
+        let frame = encode_statustext(1, 1, 0, MavSeverity::MAV_SEVERITY_INFO, &long);
+        let (_hdr, msg) = parse_frame(frame.as_slice()).expect("parse failed");
+        if let MavMessage::STATUSTEXT(s) = msg {
+            for &b in &s.text[..49] {
+                assert_eq!(b, b'X');
+            }
+            assert_eq!(s.text[49], 0, "byte 49 should be the null terminator");
+        } else {
+            panic!("parsed wrong message variant");
+        }
     }
 }
