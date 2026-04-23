@@ -466,27 +466,36 @@ mod tests {
         );
     }
 
-    /// Phase III benchmark #2: single-motor failure injection.
+    /// Phase III benchmark #2: single-motor failure + 3-motor
+    /// failover allocation.
     ///
-    /// Start in steady hover, zero motor 0 at t = 2 s, run 3 more
-    /// seconds. At the M18 stage the flight stack has no
-    /// motor-fail-aware allocation: `algo-alloc` uses a fixed 4-motor
-    /// `E_inv` that produces garbage when one motor is dead. The
-    /// vehicle therefore falls. What we *can* verify today:
+    /// Start in steady hover at 1 m, zero motor 0 at t = 2 s, and
+    /// simultaneously mark `flight.motor_alive[0] = false` so the
+    /// rate loop engages the [`FailoverAllocator`] (M19a+b). Run
+    /// 3 more seconds.
+    ///
+    /// What we now verify (M19c, tightened from M18 free-fall bound):
     ///
     ///   * state stays finite (no NaN, no ±∞)
-    ///   * altitude response is bounded by free-fall physics
-    ///     (≈ 44 m descent in 3 s at g)
-    ///   * tilt doesn't exceed a physical envelope
+    ///   * altitude err < 3 m — sustained hover via the 3-motor
+    ///     allocation; total thrust is still maintained at
+    ///     `hover_thrust_n`, only yaw is sacrificed
+    ///   * tilt < 60° — body z-axis wanders because yaw is
+    ///     uncontrolled (vehicle spins), but roll/pitch stay
+    ///     inside a recoverable envelope
     ///
-    /// M19 will add 3-motor allocation + FDIR detection; at that
-    /// point the assertion changes to "maintain altitude ± 2 m" and
-    /// this test becomes the regression that catches a broken
-    /// failover path. Until then this is the **honest baseline**:
-    /// the infrastructure (`motor_fault_mask`, injection, survival
-    /// metrics) is in place; the **controller response** is the gap.
+    /// What we **don't** verify and won't until a dedicated Mueller-
+    /// style 3-motor controller lands (queued as M20):
+    ///
+    ///   * yaw rate bound — the two surviving CCW-propeller motors
+    ///     both yaw the airframe in the same direction, producing
+    ///     a sustained spin that's expected behaviour per Mueller &
+    ///     D'Andrea 2014
+    ///   * position tracking in xy — the yaw spin couples
+    ///     into the body-frame roll/pitch commands, so xy RMS will
+    ///     be larger than nominal hover; left unchecked here
     #[test]
-    fn single_motor_failure_state_stays_bounded() {
+    fn single_motor_failure_failover_maintains_altitude() {
         use algo_ekf::GRAVITY_M_S2;
         use algo_indi::attitude_to_rate;
         use algo_nmpc::Setpoint;
@@ -556,6 +565,13 @@ mod tests {
                 // often softer (ESC thermal cutoff, commutation loss)
                 // but 0 is the hardest single-motor case.
                 sim_cfg.motor_fault_mask[0] = 0.0;
+                // Oracle fault notification: the controller learns
+                // of the failure instantly. A real FDIR module
+                // (future M20) would detect the fault from
+                // commanded-vs-observed angular acceleration with
+                // a small latency (ms scale). Oracle mode isolates
+                // the allocator's behaviour from the detector's.
+                flight.motor_alive[0] = false;
             }
             let accel_w = accel_world(&sim_cfg, &sim_state);
             let imu = sense_imu(&sim_cfg, &sim_state, accel_w, &mut rng);
@@ -605,12 +621,13 @@ mod tests {
             }
         }
 
-        // Survival assertions — what we can prove today:
+        // Survival assertions — now that failover is wired:
         //   1. position + velocity finite (no NaN / ∞)
-        //   2. altitude response physical — can't fall faster than
-        //      free-fall over the 3 s post-failure window (≈ 44 m)
-        //   3. tilt bounded (doesn't flip upside-down at infinite
-        //      rate)
+        //   2. altitude err < 3 m — 3-motor allocation preserves
+        //      the total thrust magnitude, so vertical equilibrium
+        //      holds modulo yaw-coupled drift
+        //   3. tilt < 60° (≈ 1.05 rad) — uncontrolled yaw spin
+        //      perturbs roll/pitch but the vehicle stays upright
         assert!(
             sim_state.position_ned.norm().is_finite(),
             "position went non-finite: {:?}",
@@ -621,17 +638,13 @@ mod tests {
             "velocity went non-finite: {:?}",
             sim_state.velocity_ned
         );
-        // Free-fall over 3 s: ½ g t² ≈ 44 m. Give 10 % headroom for
-        // residual thrust from the 3 surviving motors + integration.
         assert!(
-            max_alt_err < 60.0,
-            "altitude err {max_alt_err} m ≥ 60 m (beyond free-fall bound)"
+            max_alt_err < 3.0,
+            "altitude err {max_alt_err} m ≥ 3 m — 3-motor failover not preserving lift",
         );
-        // Even without failover allocation, tilt shouldn't rotate
-        // through 180°. 170° = ~3 rad.
         assert!(
-            max_tilt_rad < 3.0,
-            "max tilt {max_tilt_rad} rad (> 170°) — state machine NaN-crashed",
+            max_tilt_rad < 1.05,
+            "max tilt {max_tilt_rad} rad (> 60°) — vehicle losing upright posture",
         );
     }
 
