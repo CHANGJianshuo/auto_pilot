@@ -174,6 +174,46 @@ pub enum LandingState {
     Landing,
 }
 
+/// Outcome of [`LandingState::advance`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LandingTransition {
+    /// No change — caller continues feeding the landing setpoint.
+    Stay,
+    /// Touchdown detector fired — caller disarms, resets the
+    /// landing state to Idle, and resets the detector's accumulator.
+    Complete,
+}
+
+impl LandingState {
+    /// Pure transition. Given the current vehicle velocity + position
+    /// and the detector's accumulator state, returns what `outer_step`
+    /// should do next.
+    ///
+    /// Advancing the detector is an unavoidable side effect (the
+    /// accumulator has to grow or reset), so the function takes a
+    /// `&mut TouchdownDetector`. The `LandingState` value itself is
+    /// handed in by value and never mutated — the return enum carries
+    /// the directive instead. Kani can still reason about the
+    /// transition shape because the detector's observable result
+    /// (touchdown yes/no) is a pure function of its inputs.
+    pub fn advance(
+        self,
+        detector: &mut TouchdownDetector,
+        velocity_ned: Vector3<f32>,
+        position_z_ned: f32,
+        dt_s: f32,
+    ) -> LandingTransition {
+        if matches!(self, Self::Idle) {
+            return LandingTransition::Stay;
+        }
+        if detector.observe(velocity_ned, position_z_ned, dt_s) {
+            LandingTransition::Complete
+        } else {
+            LandingTransition::Stay
+        }
+    }
+}
+
 /// Automatic return-to-launch state machine.
 ///
 /// A 3-phase sequence driven by a single external trigger
@@ -352,9 +392,11 @@ impl TouchdownDetector {
 
     pub fn observe(&mut self, velocity_ned: Vector3<f32>, position_z_ned: f32, dt_s: f32) -> bool {
         let vertical_quiet = velocity_ned.z.abs() < Self::VZ_THRESHOLD_MPS;
-        let horizontal =
-            libm::sqrtf(velocity_ned.x * velocity_ned.x + velocity_ned.y * velocity_ned.y);
-        let horizontal_quiet = horizontal < Self::VXY_THRESHOLD_MPS;
+        // Squared comparison avoids libm::sqrtf so the whole method
+        // becomes Kani-tractable — see the `sqrtf`-removal rationale in
+        // `RtlPhase::advance`.
+        let horizontal_sq = velocity_ned.x * velocity_ned.x + velocity_ned.y * velocity_ned.y;
+        let horizontal_quiet = horizontal_sq < Self::VXY_THRESHOLD_MPS * Self::VXY_THRESHOLD_MPS;
         let near_ground = position_z_ned > Self::Z_THRESHOLD_M;
         if vertical_quiet && horizontal_quiet && near_ground {
             self.settled_s += dt_s;
@@ -730,16 +772,15 @@ pub fn outer_step(
     let out = rate_loop_step(cfg, flight, imu, dt_s, rate_cmd);
     cfg.hover_thrust_n = saved_hover;
 
-    // Auto-disarm on touchdown — only while landing, so a vehicle that
-    // happens to be sitting on the ground with motors spun up for a
-    // rolling launch isn't instantly disarmed.
-    if flight.landing_state == LandingState::Landing {
-        let touchdown = flight.touchdown_detector.observe(
-            flight.state.velocity_ned,
-            flight.state.position_ned.z,
-            dt_s,
-        );
-        if touchdown {
+    // Auto-disarm on touchdown — pure transition fn + side effects.
+    match flight.landing_state.advance(
+        &mut flight.touchdown_detector,
+        flight.state.velocity_ned,
+        flight.state.position_ned.z,
+        dt_s,
+    ) {
+        LandingTransition::Stay => {}
+        LandingTransition::Complete => {
             flight.arm_state = ArmState::Disarmed;
             flight.landing_state = LandingState::Idle;
             flight.touchdown_detector.reset();
@@ -865,6 +906,60 @@ mod rtl_kani {
     /// Returning can only `Stay` or `Handoff`. It never goes back to
     /// Climbing or sideways to Idle — the only exit is "we're home,
     /// start landing".
+    // ---- LandingState (M16b) -----------------------------------------
+
+    /// `LandingState::Idle` cannot auto-advance to `Landing` — the only
+    /// path in is an explicit MAVLink NAV_LAND or RTL handoff flipping
+    /// `flight.landing_state = Landing` externally.
+    #[kani::proof]
+    fn landing_idle_is_absorbing() {
+        let mut det = TouchdownDetector::new();
+        // Detector accumulator state is arbitrary too; idle must
+        // still be absorbing.
+        det.settled_s = any_finite_f32();
+        kani::assume(det.settled_s >= 0.0);
+        let vel = any_finite_vec();
+        let pos_z = any_finite_f32();
+        let dt = any_finite_f32();
+        let r = LandingState::Idle.advance(&mut det, vel, pos_z, dt);
+        assert!(matches!(r, LandingTransition::Stay));
+    }
+
+    /// `LandingState::Landing` can only `Stay` or `Complete`. No
+    /// state-space magic lets it teleport to something else.
+    #[kani::proof]
+    fn landing_only_exits_via_complete() {
+        let mut det = TouchdownDetector::new();
+        det.settled_s = any_finite_f32();
+        kani::assume(det.settled_s >= 0.0);
+        let vel = any_finite_vec();
+        let pos_z = any_finite_f32();
+        let dt = any_finite_f32();
+        let r = LandingState::Landing.advance(&mut det, vel, pos_z, dt);
+        assert!(matches!(
+            r,
+            LandingTransition::Stay | LandingTransition::Complete
+        ));
+    }
+
+    /// Idle never advances the detector. The accumulator value the
+    /// caller hands in survives unchanged — important because real
+    /// flight toggles Idle → Landing → Idle repeatedly, and each new
+    /// Landing has to start from a clean detector state via the
+    /// outer_step `reset` call on Complete (not silently mid-Idle).
+    #[kani::proof]
+    fn landing_idle_does_not_touch_detector() {
+        let mut det = TouchdownDetector::new();
+        let before: f32 = any_finite_f32();
+        kani::assume(before >= 0.0);
+        det.settled_s = before;
+        let vel = any_finite_vec();
+        let pos_z = any_finite_f32();
+        let dt = any_finite_f32();
+        let _ = LandingState::Idle.advance(&mut det, vel, pos_z, dt);
+        assert!(det.settled_s == before);
+    }
+
     #[kani::proof]
     fn returning_never_advances_to_climbing_or_idle() {
         let home = any_finite_vec();
