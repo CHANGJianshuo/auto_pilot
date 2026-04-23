@@ -38,6 +38,10 @@ pub mod gazebo;
 /// residual policy, producing an "NMPC + NN-compensated" controller.
 pub mod residual_mpc;
 
+/// Public SITL runners shared between unit tests, integration tests,
+/// and the `controller_shootout` example binary.
+pub mod sitl;
+
 /// Host-side Zenoh pub/sub wrapper binding `core_bus` messages to a
 /// live Zenoh session. Opt-in via the `zenoh-host` feature because the
 /// dep graph is heavy.
