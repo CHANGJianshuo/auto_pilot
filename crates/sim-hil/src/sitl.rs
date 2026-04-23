@@ -466,6 +466,175 @@ mod tests {
         );
     }
 
+    /// Phase III benchmark #2: single-motor failure injection.
+    ///
+    /// Start in steady hover, zero motor 0 at t = 2 s, run 3 more
+    /// seconds. At the M18 stage the flight stack has no
+    /// motor-fail-aware allocation: `algo-alloc` uses a fixed 4-motor
+    /// `E_inv` that produces garbage when one motor is dead. The
+    /// vehicle therefore falls. What we *can* verify today:
+    ///
+    ///   * state stays finite (no NaN, no ±∞)
+    ///   * altitude response is bounded by free-fall physics
+    ///     (≈ 44 m descent in 3 s at g)
+    ///   * tilt doesn't exceed a physical envelope
+    ///
+    /// M19 will add 3-motor allocation + FDIR detection; at that
+    /// point the assertion changes to "maintain altitude ± 2 m" and
+    /// this test becomes the regression that catches a broken
+    /// failover path. Until then this is the **honest baseline**:
+    /// the infrastructure (`motor_fault_mask`, injection, survival
+    /// metrics) is in place; the **controller response** is the gap.
+    #[test]
+    fn single_motor_failure_state_stays_bounded() {
+        use algo_ekf::GRAVITY_M_S2;
+        use algo_indi::attitude_to_rate;
+        use algo_nmpc::Setpoint;
+        use app_copter::{
+            ArmState, FlightState, apply_baro_measurement, apply_gps_measurement,
+            apply_mag_measurement, default_config_250g, rate_loop_step,
+        };
+        use nalgebra::SVector;
+
+        // Realistic actuator dynamics so the failure is a physical
+        // event, not an instantaneous command cut.
+        let mut sim_cfg = SimConfig {
+            motor_tau_s: 0.02,
+            motor_fault_mask: [1.0; 4],
+            ..SimConfig::default()
+        };
+
+        let mut sim_state = SimState {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            motor_thrusts_actual_n: SVector::<f32, 4>::repeat(sim_cfg.mass_kg * GRAVITY_M_S2 / 4.0),
+            ..SimState::default()
+        };
+        let mut rng = SimRng::new(123);
+        let dt = 0.001_f32;
+        let mut app_cfg = default_config_250g();
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
+        let _ = apply_baro_measurement(&mut flight, &sense_baro(&sim_cfg, &sim_state, &mut rng));
+        let _ = apply_gps_measurement(&mut flight, &sense_gps(&sim_cfg, &sim_state, &mut rng));
+
+        let lqi_weights = algo_nmpc::LqiWeights {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            q_i: 1.5,
+            r: 0.5,
+        };
+        let cfg_mpci = algo_nmpc::Mpc1dIConfig {
+            weights: lqi_weights,
+            dt_s: dt,
+            u_min: -20.0,
+            u_max: 20.0,
+        };
+        let mut ctrl = PositionController::<10>::mpc_i(
+            cfg_mpci,
+            cfg_mpci,
+            25,
+            PositionGains::default().max_accel,
+            5.0,
+        )
+        .unwrap();
+
+        let setpoint = Setpoint {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..Setpoint::default()
+        };
+
+        let fail_tick: usize = 2_000; // 2 s
+        let total_ticks: usize = 5_000; // 5 s total, 3 s post-failure
+        let mut max_tilt_rad = 0.0_f32;
+        let mut max_alt_err = 0.0_f32;
+
+        for i in 0_usize..total_ticks {
+            if i == fail_tick {
+                // Motor 0 dies completely. Real motor failures are
+                // often softer (ESC thermal cutoff, commutation loss)
+                // but 0 is the hardest single-motor case.
+                sim_cfg.motor_fault_mask[0] = 0.0;
+            }
+            let accel_w = accel_world(&sim_cfg, &sim_state);
+            let imu = sense_imu(&sim_cfg, &sim_state, accel_w, &mut rng);
+            let att = ctrl.step(
+                &setpoint,
+                flight.state.position_ned,
+                flight.state.velocity_ned,
+                app_cfg.mass_kg,
+                dt,
+            );
+            let rate_cmd =
+                attitude_to_rate(flight.state.attitude, att.q_desired, &app_cfg.k_attitude);
+            let saved_hover = app_cfg.hover_thrust_n;
+            app_cfg.hover_thrust_n = att.thrust_n;
+            let out = rate_loop_step(&mut app_cfg, &mut flight, imu, dt, rate_cmd);
+            app_cfg.hover_thrust_n = saved_hover;
+            step(&sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
+
+            if i >= fail_tick {
+                // Tilt from body z-axis: arccos(R[2,2]) where R is
+                // the body→world rotation. Cheap approximation via
+                // quaternion w component.
+                let q_w = sim_state.attitude.w.abs();
+                let tilt = libm::acosf((2.0 * q_w * q_w - 1.0).clamp(-1.0, 1.0));
+                if tilt > max_tilt_rad {
+                    max_tilt_rad = tilt;
+                }
+                let alt_err = (-sim_state.position_ned.z - 1.0).abs();
+                if alt_err > max_alt_err {
+                    max_alt_err = alt_err;
+                }
+            }
+
+            if i.is_multiple_of(200) {
+                let _ =
+                    apply_gps_measurement(&mut flight, &sense_gps(&sim_cfg, &sim_state, &mut rng));
+            }
+            if i.is_multiple_of(40) {
+                let _ =
+                    apply_mag_measurement(&mut flight, &sense_mag(&sim_cfg, &sim_state, &mut rng));
+            }
+            if i.is_multiple_of(20) {
+                let _ = apply_baro_measurement(
+                    &mut flight,
+                    &sense_baro(&sim_cfg, &sim_state, &mut rng),
+                );
+            }
+        }
+
+        // Survival assertions — what we can prove today:
+        //   1. position + velocity finite (no NaN / ∞)
+        //   2. altitude response physical — can't fall faster than
+        //      free-fall over the 3 s post-failure window (≈ 44 m)
+        //   3. tilt bounded (doesn't flip upside-down at infinite
+        //      rate)
+        assert!(
+            sim_state.position_ned.norm().is_finite(),
+            "position went non-finite: {:?}",
+            sim_state.position_ned
+        );
+        assert!(
+            sim_state.velocity_ned.norm().is_finite(),
+            "velocity went non-finite: {:?}",
+            sim_state.velocity_ned
+        );
+        // Free-fall over 3 s: ½ g t² ≈ 44 m. Give 10 % headroom for
+        // residual thrust from the 3 surviving motors + integration.
+        assert!(
+            max_alt_err < 60.0,
+            "altitude err {max_alt_err} m ≥ 60 m (beyond free-fall bound)"
+        );
+        // Even without failover allocation, tilt shouldn't rotate
+        // through 180°. 170° = ~3 rad.
+        assert!(
+            max_tilt_rad < 3.0,
+            "max tilt {max_tilt_rad} rad (> 170°) — state machine NaN-crashed",
+        );
+    }
+
     /// Same trajectory, PI cascade baseline. On a moving target
     /// MPC-I's predictive horizon + feed-forward should beat
     /// classical cascade.

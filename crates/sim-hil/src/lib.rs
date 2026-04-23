@@ -76,6 +76,13 @@ pub struct SimConfig {
     pub wind_ned: Vector3<f32>,
     /// Sensor noise. See [`NoiseConfig`].
     pub noise: NoiseConfig,
+    /// Per-motor fault injection. Each element multiplies that
+    /// motor's *actual* thrust (after first-order lag) by the given
+    /// factor. Default `[1.0; 4]` = no fault. Set element `i` to
+    /// `0.0` to simulate a dead motor; `0.5` for a degraded motor;
+    /// `1.3` for a runaway. Modified mid-run by the M18 SITL failure
+    /// test.
+    pub motor_fault_mask: [f32; 4],
 }
 
 /// 1-σ per-channel noise injected by `sense_*`. Zero = ideal sensor.
@@ -122,6 +129,7 @@ impl Default for SimConfig {
             drag_quadratic: 0.0,
             wind_ned: Vector3::zeros(),
             noise: NoiseConfig::default(),
+            motor_fault_mask: [1.0; 4],
         }
     }
 }
@@ -192,6 +200,18 @@ pub fn step(
             (motor_thrusts_cmd_n - state.motor_thrusts_actual_n) * alpha;
     } else {
         state.motor_thrusts_actual_n = *motor_thrusts_cmd_n;
+    }
+    // --- Motor fault injection ----------------------------------------
+    // Mask is applied AFTER the lag filter so a just-faulted motor
+    // doesn't blip back up due to the lag's slow decay. The mask sets
+    // the actual delivered thrust for this tick; next tick the lag
+    // filter sees the masked value as the new "actual" baseline.
+    for (slot, mask) in state
+        .motor_thrusts_actual_n
+        .iter_mut()
+        .zip(cfg.motor_fault_mask.iter())
+    {
+        *slot *= *mask;
     }
     let motor_thrusts_n = state.motor_thrusts_actual_n;
 

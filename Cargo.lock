@@ -3238,6 +3238,7 @@ dependencies = [
  "libm",
  "mavlink",
  "nalgebra",
+ "nn-runtime",
  "serde",
  "thiserror 1.0.69",
  "tokio",
