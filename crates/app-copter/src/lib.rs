@@ -25,7 +25,7 @@ use algo_ekf::{
     BaroMeasurement, Covariance, GpsMeasurement, ImuMeasurement, MagMeasurement, ProcessNoise,
     State, baro_update, gps_update, mag_update, predict_step_with_drag,
 };
-use algo_fdir::{HealthLevel, SensorRejectionCounter};
+use algo_fdir::{HealthLevel, MotorFaultDetector, SensorRejectionCounter};
 use algo_indi::{
     AttitudeGain, IndiInput, Inertia, LowPassFilterVec3, RateCommand, RateGain, attitude_to_rate,
     compute_torque_increment,
@@ -52,6 +52,16 @@ pub struct RateLoopConfig {
     pub alpha_lpf: LowPassFilterVec3,
     /// Pre-computed effectiveness inverse for the 4-motor configuration.
     pub e_inv: Matrix4<f32>,
+    /// Forward effectiveness matrix `E` (4×4): `[τ, F] = E · T`.
+    /// Kept alongside `e_inv` so the motor-fault detector can compute
+    /// the expected body torque from commanded thrusts without
+    /// redoing the inverse dance every tick. Populated by
+    /// [`default_config_250g`]; constructors that bypass it must set
+    /// this explicitly.
+    pub effectiveness: Matrix4<f32>,
+    /// Pre-computed `J⁻¹` used by the motor-fault detector. Populated
+    /// by [`default_config_250g`] from [`RateLoopConfig::inertia`].
+    pub inertia_inv: nalgebra::Matrix3<f32>,
     /// Optional motor-failure-aware allocator. When set AND
     /// [`FlightState::motor_alive`] is not all-true, the rate loop
     /// dispatches through [`allocate_with_failover`] instead of the
@@ -488,6 +498,16 @@ pub struct FlightState {
     /// anything is `false` AND [`RateLoopConfig::failover`] is
     /// `Some`, `rate_loop_step` switches to the failover allocator.
     pub motor_alive: [bool; 4],
+    /// On-line motor-fault detector. `rate_loop_step` feeds it each
+    /// tick; its `alive()` output is copied into `motor_alive`, so a
+    /// real fault declaration automatically engages the failover
+    /// allocator on the very next tick.
+    pub motor_fault_detector: MotorFaultDetector,
+    /// Previous tick's commanded motor thrusts (after saturation).
+    /// Stored so the detector can pair "commanded at tick N−1" with
+    /// "ω̇ observed at tick N" — the pairing that actually matches
+    /// the physical cause-effect ordering.
+    pub last_motor_cmd: SVector<f32, 4>,
 }
 
 impl Default for FlightState {
@@ -508,6 +528,8 @@ impl Default for FlightState {
             home_position_ned: None,
             rtl_phase: RtlPhase::default(),
             motor_alive: [true; 4],
+            motor_fault_detector: MotorFaultDetector::new(),
+            last_motor_cmd: SVector::<f32, 4>::zeros(),
         }
     }
 }
@@ -535,6 +557,9 @@ pub struct RateLoopOutput {
     pub motor_thrusts_n: SVector<f32, 4>,
     /// Virtual command that was sent to the allocator.
     pub virtual_cmd: VirtualCommand,
+    /// LPF-filtered angular acceleration (rad/s²) used by INDI this
+    /// tick. Exposed for instrumentation / regression tests.
+    pub omega_dot_filtered: Vector3<f32>,
 }
 
 /// Single iteration of the inner rate loop.
@@ -603,9 +628,38 @@ pub fn rate_loop_step(
         ArmState::Disarmed => SVector::<f32, 4>::zeros(),
     };
 
+    // -- 5. Motor-fault detection -----------------------------------------
+    // Pair the PREVIOUS tick's commanded thrusts with the CURRENT tick's
+    // ω̇ — that's the physical cause-effect ordering (torque applied
+    // during [N−1, N] shows up as ω̇ sampled at N). On tick 0 the
+    // last-cmd is zero and the detector just sees a "baseline" residual
+    // which is well under the default threshold.
+    //
+    // Run this only while armed; disarmed ground runs produce zero cmd +
+    // whatever IMU noise is on the bench and should not accumulate
+    // persistence.
+    if flight.arm_state == ArmState::Armed {
+        flight.motor_fault_detector.observe(
+            &flight.last_motor_cmd,
+            omega_dot_filtered,
+            &cfg.effectiveness,
+            &cfg.inertia_inv,
+        );
+        // Logical AND: the detector can flip a motor from alive→dead,
+        // but never from dead→alive. This preserves any pre-declared
+        // fault (test oracle, manual override from a higher-level
+        // FDIR) alongside the detector's own verdicts.
+        let det_alive = flight.motor_fault_detector.alive();
+        for (slot, &d) in flight.motor_alive.iter_mut().zip(det_alive.iter()) {
+            *slot = *slot && d;
+        }
+    }
+    flight.last_motor_cmd = final_thrusts;
+
     RateLoopOutput {
         motor_thrusts_n: final_thrusts,
         virtual_cmd,
+        omega_dot_filtered,
     }
 }
 
@@ -618,15 +672,21 @@ pub fn default_config_250g() -> RateLoopConfig {
     let e_mat: Matrix4<f32> = e.into_owned();
     let e_inv = invert_quad_effectiveness(&e_mat).unwrap_or(Matrix4::identity());
     let failover = build_failover_allocator(&motors);
+    let inertia = nalgebra::Matrix3::from_diagonal(&Vector3::new(0.015, 0.015, 0.025));
+    let inertia_inv = inertia
+        .try_inverse()
+        .unwrap_or_else(nalgebra::Matrix3::identity);
     RateLoopConfig {
         k_rate: Vector3::new(25.0, 25.0, 15.0),
         k_attitude: Vector3::new(8.0, 8.0, 5.0),
-        inertia: nalgebra::Matrix3::from_diagonal(&Vector3::new(0.015, 0.015, 0.025)),
+        inertia,
         mass_kg: 0.25,
         process_noise: ProcessNoise::default(),
         gyro_lpf: LowPassFilterVec3::new(80.0, 1000.0),
         alpha_lpf: LowPassFilterVec3::new(30.0, 1000.0),
         e_inv,
+        effectiveness: e_mat,
+        inertia_inv,
         failover,
         motor_min_n: 0.0,
         motor_max_n: 6.0,
@@ -1724,6 +1784,36 @@ mod tests {
             assert!(
                 (ai - bi).abs() < 1.0e-5,
                 "motor {i} diverges: classic={ai}, failover={bi}"
+            );
+        }
+    }
+
+    /// Detector wiring: rate_loop_step advances the in-state
+    /// MotorFaultDetector, and its alive() output can only clear
+    /// motor_alive bits (never set them). Asserts the AND-monotone
+    /// contract from the commit doc.
+    #[test]
+    fn rate_loop_detector_and_logic_preserves_dead_motors() {
+        let mut cfg = default_config_250g();
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
+        // Pre-declare motor 2 dead via the oracle path. Detector's
+        // internal state still has motor 2 as "alive", so without
+        // AND-logic the slot would be resurrected each tick.
+        flight.motor_alive[2] = false;
+        for i in 0..20 {
+            let _ = rate_loop_step(
+                &mut cfg,
+                &mut flight,
+                stationary_imu(i),
+                0.001,
+                RateCommand::default(),
+            );
+            assert!(
+                !flight.motor_alive[2],
+                "tick {i}: motor 2 was resurrected by detector"
             );
         }
     }
