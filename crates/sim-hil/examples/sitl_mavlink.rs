@@ -12,14 +12,19 @@
 //!     + INDI + allocation + drag-free EKF).
 //!   * Broadcasts HEARTBEAT at 1 Hz, ATTITUDE at 50 Hz,
 //!     GLOBAL_POSITION_INT at 5 Hz.
-//!   * Emits a STATUSTEXT (severity CRITICAL) the moment the
-//!     motor-fault detector latches a motor as dead. QGC surfaces
-//!     these as HUD toast notifications.
+//!   * Emits STATUSTEXT alerts, edge-triggered:
+//!       - CRITICAL "MOTOR N FAILED" on motor-fault declaration
+//!       - ERROR "PREFLIGHT: <reason>" when preflight starts /
+//!         changes failure mode
+//!       - WARNING / CRITICAL / EMERGENCY "HEALTH: <level>" when
+//!         the sensor-rollup overall_health escalates
+//!     QGC surfaces these as HUD toast notifications.
 //!   * Holds the vehicle at an (0, 0, -1 m) hover setpoint forever —
 //!     kill with Ctrl-C.
 
 use algo_ekf::GRAVITY_M_S2;
 use algo_nmpc::Setpoint;
+use algo_fdir::HealthLevel;
 use app_copter::{
     ArmState, FlightState, LandingState, PreflightReject, RtlPhase, TakeoffState,
     apply_baro_measurement, apply_gps_measurement, apply_mag_measurement, default_config_250g,
@@ -113,6 +118,16 @@ async fn main() -> anyhow::Result<()> {
     // motor actually transitions from alive to dead (not every tick
     // while it stays dead, which would flood the MAVLink link).
     let mut prev_motor_alive: [bool; 4] = [true; 4];
+    // Edge detection for preflight: on None→Some(reason), emit a
+    // STATUSTEXT. On Some(a)→Some(b) where a != b, re-emit (the
+    // failing subsystem changed, pilot should know).
+    let mut prev_preflight: Option<PreflightReject> = None;
+    // Edge detection for overall health: any bump up in severity
+    // emits a STATUSTEXT. Drops in severity never emit — levels
+    // only recover on the ground (see HealthLevel::reset_on_ground)
+    // so a drop should never happen in flight anyway, but silencing
+    // "health improved!" toasts is the right default.
+    let mut prev_health = HealthLevel::Healthy;
 
     loop {
         // Drain any incoming snapshots to keep `latest` fresh.
@@ -264,6 +279,38 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             prev_motor_alive = s.motor_alive;
+
+            // Edge-triggered preflight alert: re-emit whenever the
+            // failing reason changes (None → Some, or Some(a) → Some(b)).
+            // Rate-limit via the equality check — no flood while a
+            // single reason persists.
+            if s.preflight != prev_preflight {
+                if let Some(reason) = s.preflight {
+                    let text = format!("PREFLIGHT: {}", reason.reason_str());
+                    sink.send_statustext(MavSeverity::MAV_SEVERITY_ERROR, &text)
+                        .await
+                        .ok();
+                    tracing::warn!(reason = reason.reason_str(), "emitted STATUSTEXT: PREFLIGHT");
+                }
+                prev_preflight = s.preflight;
+            }
+
+            // Edge-triggered health escalation. Only climb in severity
+            // emits — HealthLevel never recovers in flight so a drop
+            // shouldn't happen; if it does we silently accept it
+            // (flight stack bug, not a pilot-actionable alert).
+            if s.overall_health.severity() > prev_health.severity() {
+                let (severity, label) = match s.overall_health {
+                    HealthLevel::Healthy => (MavSeverity::MAV_SEVERITY_INFO, "HEALTHY"),
+                    HealthLevel::Degraded => (MavSeverity::MAV_SEVERITY_WARNING, "DEGRADED"),
+                    HealthLevel::Emergency => (MavSeverity::MAV_SEVERITY_CRITICAL, "EMERGENCY"),
+                    HealthLevel::Failed => (MavSeverity::MAV_SEVERITY_EMERGENCY, "FAILED"),
+                };
+                let text = format!("HEALTH: {label}");
+                sink.send_statustext(severity, &text).await.ok();
+                tracing::warn!(level = label, "emitted STATUSTEXT: HEALTH");
+            }
+            prev_health = s.overall_health;
         }
 
         // If the sim task ever exited, bail.
@@ -290,6 +337,14 @@ struct Snapshot {
     /// task does edge detection on this to emit a STATUSTEXT
     /// alert on the tick a motor first goes from alive to dead.
     motor_alive: [bool; 4],
+    /// Preflight gate result at this tick: `Some(reason)` if any
+    /// arm-gating check is failing, `None` if good-to-arm. Edge-
+    /// detected by the telemetry task to surface "PREFLIGHT
+    /// REJECTED: <reason>" to the pilot.
+    preflight: Option<PreflightReject>,
+    /// Sensor-subsystem rollup health. Edge-detected for WARNING
+    /// (→ Degraded) / CRITICAL (→ Emergency) STATUSTEXTs.
+    overall_health: HealthLevel,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -381,6 +436,8 @@ fn run_sim(
                 velocity: flight.state.velocity_ned,
                 heading: yaw,
                 motor_alive: flight.motor_alive,
+                preflight: preflight_check(&flight).err(),
+                overall_health: flight.overall_health(),
             };
             if tx.send(snap).is_err() {
                 // Receiver dropped — main exited; wind down.
