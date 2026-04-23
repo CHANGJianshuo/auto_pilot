@@ -44,6 +44,12 @@ pub mod residual_mpc;
 #[cfg(feature = "zenoh-host")]
 pub mod zenoh_bus;
 
+/// Full-telemetry publisher that declares one Zenoh publisher per
+/// `core_bus::topics` string and exposes typed `publish_*` methods at
+/// the cadences documented in `docs/topics.md`.
+#[cfg(feature = "zenoh-host")]
+pub mod zenoh_telemetry;
+
 /// Static simulator parameters (mass, inertia, geometry, noise).
 #[derive(Clone, Debug)]
 pub struct SimConfig {
