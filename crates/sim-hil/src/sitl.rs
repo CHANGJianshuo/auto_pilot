@@ -392,7 +392,12 @@ where
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use algo_nmpc::{LqiWeights, Mpc1dIConfig, PositionController, PositionGains};
@@ -645,6 +650,198 @@ mod tests {
         assert!(
             max_tilt_rad < 1.05,
             "max tilt {max_tilt_rad} rad (> 60°) — vehicle losing upright posture",
+        );
+    }
+
+    /// M20c end-to-end: inject a motor fault with NO oracle —
+    /// `flight.motor_alive` starts `[true; 4]` and the
+    /// `MotorFaultDetector` wired into `FlightState` by M20b has to
+    /// find the dead rotor on its own from the ω̇ residual.
+    ///
+    /// Flow:
+    ///   1. 2 s of nominal hover — detector sees zero residual,
+    ///      persistence stays at 0
+    ///   2. `sim_cfg.motor_fault_mask[0] = 0.0` — motor 0 dies
+    ///   3. Within ~50 ms (the detector's default
+    ///      n_ticks_to_declare) persistence on motor 0 crosses
+    ///      threshold → detector latches `alive[0] = false` → next
+    ///      tick's AND-update propagates to `flight.motor_alive[0]`
+    ///   4. Failover allocator engages; altitude recovers
+    ///
+    /// Assertions:
+    ///   * `flight.motor_alive[0] == false` by the end
+    ///   * `flight.motor_fault_detector.level() == Emergency`
+    ///   * Altitude error < 5 m (looser than M19c's 3 m because of
+    ///     the detection latency window during which allocation was
+    ///     still wrong)
+    ///   * Tilt stays under 75° (1.31 rad); the extra 15° vs M19c
+    ///     accounts for the pre-detection transient
+    #[test]
+    fn single_motor_failure_detected_end_to_end_without_oracle() {
+        use algo_ekf::GRAVITY_M_S2;
+        use algo_indi::attitude_to_rate;
+        use algo_nmpc::Setpoint;
+        use app_copter::{
+            ArmState, FlightState, apply_baro_measurement, apply_gps_measurement,
+            apply_mag_measurement, default_config_250g, rate_loop_step,
+        };
+        use nalgebra::SVector;
+
+        let mut sim_cfg = SimConfig {
+            motor_tau_s: 0.02,
+            motor_fault_mask: [1.0; 4],
+            ..SimConfig::default()
+        };
+
+        let mut sim_state = SimState {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            motor_thrusts_actual_n: SVector::<f32, 4>::repeat(sim_cfg.mass_kg * GRAVITY_M_S2 / 4.0),
+            ..SimState::default()
+        };
+        let mut rng = SimRng::new(321);
+        let dt = 0.001_f32;
+        let mut app_cfg = default_config_250g();
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
+        let _ = apply_baro_measurement(&mut flight, &sense_baro(&sim_cfg, &sim_state, &mut rng));
+        let _ = apply_gps_measurement(&mut flight, &sense_gps(&sim_cfg, &sim_state, &mut rng));
+
+        let lqi_weights = algo_nmpc::LqiWeights {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            q_i: 1.5,
+            r: 0.5,
+        };
+        let cfg_mpci = algo_nmpc::Mpc1dIConfig {
+            weights: lqi_weights,
+            dt_s: dt,
+            u_min: -20.0,
+            u_max: 20.0,
+        };
+        let mut ctrl = PositionController::<10>::mpc_i(
+            cfg_mpci,
+            cfg_mpci,
+            25,
+            PositionGains::default().max_accel,
+            5.0,
+        )
+        .unwrap();
+
+        let setpoint = Setpoint {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..Setpoint::default()
+        };
+
+        let fail_tick: usize = 2_000;
+        let total_ticks: usize = 5_000;
+        let mut max_tilt_rad = 0.0_f32;
+        let mut max_alt_err = 0.0_f32;
+        let mut declared_tick: Option<usize> = None;
+
+        for i in 0_usize..total_ticks {
+            if i == fail_tick {
+                sim_cfg.motor_fault_mask[0] = 0.0;
+                // Crucially: no oracle write to flight.motor_alive.
+            }
+            let accel_w = accel_world(&sim_cfg, &sim_state);
+            let imu = sense_imu(&sim_cfg, &sim_state, accel_w, &mut rng);
+            let att = ctrl.step(
+                &setpoint,
+                flight.state.position_ned,
+                flight.state.velocity_ned,
+                app_cfg.mass_kg,
+                dt,
+            );
+            let rate_cmd =
+                attitude_to_rate(flight.state.attitude, att.q_desired, &app_cfg.k_attitude);
+            let saved_hover = app_cfg.hover_thrust_n;
+            app_cfg.hover_thrust_n = att.thrust_n;
+            let out = rate_loop_step(&mut app_cfg, &mut flight, imu, dt, rate_cmd);
+            app_cfg.hover_thrust_n = saved_hover;
+            step(&sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
+
+            if declared_tick.is_none() && !flight.motor_alive[0] {
+                declared_tick = Some(i);
+            }
+
+            if i >= fail_tick {
+                let q_w = sim_state.attitude.w.abs();
+                let tilt = libm::acosf((2.0 * q_w * q_w - 1.0).clamp(-1.0, 1.0));
+                if tilt > max_tilt_rad {
+                    max_tilt_rad = tilt;
+                }
+                let alt_err = (-sim_state.position_ned.z - 1.0).abs();
+                if alt_err > max_alt_err {
+                    max_alt_err = alt_err;
+                }
+            }
+
+            if i.is_multiple_of(200) {
+                let _ =
+                    apply_gps_measurement(&mut flight, &sense_gps(&sim_cfg, &sim_state, &mut rng));
+            }
+            if i.is_multiple_of(40) {
+                let _ =
+                    apply_mag_measurement(&mut flight, &sense_mag(&sim_cfg, &sim_state, &mut rng));
+            }
+            if i.is_multiple_of(20) {
+                let _ = apply_baro_measurement(
+                    &mut flight,
+                    &sense_baro(&sim_cfg, &sim_state, &mut rng),
+                );
+            }
+        }
+
+        // Detector must have declared motor 0 dead.
+        assert!(
+            !flight.motor_alive[0],
+            "detector failed to declare motor 0 dead"
+        );
+        let det_alive = flight.motor_fault_detector.alive();
+        assert!(!det_alive[0], "detector.alive()[0] should be false");
+        for i in 1..4 {
+            assert!(
+                det_alive[i],
+                "detector wrongly declared motor {i} dead (only motor 0 actually died)"
+            );
+        }
+        assert_eq!(
+            flight.motor_fault_detector.level(),
+            algo_fdir::HealthLevel::Emergency
+        );
+
+        // Detection latency: must be under 250 ticks (250 ms).
+        // Default detector threshold is 50 ticks of persistence,
+        // but the residual magnitude ramps up gradually with the
+        // 20 ms motor-lag, so the "first threshold-crossing tick"
+        // is typically ~70–100 after the fault. 250 ms gives
+        // generous headroom for the noisy SITL.
+        let dec = declared_tick.expect("detector never declared");
+        let latency = dec - fail_tick;
+        assert!(
+            latency < 250,
+            "detection latency {latency} ticks ≥ 250 ms — detector too slow",
+        );
+
+        assert!(
+            sim_state.position_ned.norm().is_finite(),
+            "position went non-finite: {:?}",
+            sim_state.position_ned
+        );
+        assert!(
+            sim_state.velocity_ned.norm().is_finite(),
+            "velocity went non-finite: {:?}",
+            sim_state.velocity_ned
+        );
+        assert!(
+            max_alt_err < 5.0,
+            "altitude err {max_alt_err} m ≥ 5 m — end-to-end detection+failover didn't preserve lift",
+        );
+        assert!(
+            max_tilt_rad < 1.31,
+            "max tilt {max_tilt_rad} rad (> 75°) — pre-detection transient too extreme",
         );
     }
 
