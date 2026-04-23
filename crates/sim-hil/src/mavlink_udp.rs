@@ -14,8 +14,8 @@
 
 use algo_nmpc::Setpoint;
 use comms_mavlink::{
-    FrameBuffer, ParseError, encode_attitude, encode_command_ack, encode_global_position_int,
-    encode_heartbeat, parse_frame,
+    FrameBuffer, MavSeverity, ParseError, encode_attitude, encode_command_ack,
+    encode_global_position_int, encode_heartbeat, encode_statustext, parse_frame,
 };
 use mavlink::MavHeader;
 use mavlink::common::{MavCmd, MavMessage, MavResult};
@@ -241,10 +241,34 @@ impl MavlinkUdpSink {
         );
         self.send_frame(&frame).await
     }
+
+    /// Emit a STATUSTEXT alert — pilot-facing notice (motor failed,
+    /// preflight rejected, etc.). See `comms_mavlink::encode_statustext`
+    /// for the 50-byte truncation + null-pad semantics. GCS clients
+    /// surface these as HUD toasts.
+    pub async fn send_statustext(
+        &self,
+        severity: MavSeverity,
+        text: &str,
+    ) -> std::io::Result<()> {
+        let frame = encode_statustext(
+            self.system_id,
+            self.component_id,
+            self.next_seq(),
+            severity,
+            text,
+        );
+        self.send_frame(&frame).await
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -266,6 +290,36 @@ mod tests {
                 .unwrap();
         assert!(n >= 12, "frame too small: {n}");
         assert_eq!(buf.first().copied(), Some(0xFD), "expected v2 magic");
+    }
+
+    #[tokio::test]
+    async fn statustext_broadcast_round_trips_over_udp() {
+        let recv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+        let sink = MavlinkUdpSink::bind("127.0.0.1:0", &recv_addr.to_string())
+            .await
+            .unwrap();
+        sink.send_statustext(MavSeverity::MAV_SEVERITY_CRITICAL, "MOTOR 0 FAILED")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(buf.first().copied(), Some(0xFD));
+        // Round-trip parse to confirm the UDP receiver sees the same
+        // message we encoded.
+        let (_hdr, msg) =
+            comms_mavlink::parse_frame(&buf[..n]).expect("receiver couldn't parse STATUSTEXT");
+        if let MavMessage::STATUSTEXT(data) = msg {
+            assert_eq!(data.severity, MavSeverity::MAV_SEVERITY_CRITICAL);
+            let prefix: &[u8] = b"MOTOR 0 FAILED";
+            assert_eq!(&data.text[..prefix.len()], prefix);
+        } else {
+            panic!("received wrong message variant");
+        }
     }
 
     #[tokio::test]

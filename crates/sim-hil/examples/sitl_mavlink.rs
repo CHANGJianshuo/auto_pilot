@@ -12,6 +12,9 @@
 //!     + INDI + allocation + drag-free EKF).
 //!   * Broadcasts HEARTBEAT at 1 Hz, ATTITUDE at 50 Hz,
 //!     GLOBAL_POSITION_INT at 5 Hz.
+//!   * Emits a STATUSTEXT (severity CRITICAL) the moment the
+//!     motor-fault detector latches a motor as dead. QGC surfaces
+//!     these as HUD toast notifications.
 //!   * Holds the vehicle at an (0, 0, -1 m) hover setpoint forever —
 //!     kill with Ctrl-C.
 
@@ -22,6 +25,7 @@ use app_copter::{
     apply_baro_measurement, apply_gps_measurement, apply_mag_measurement, default_config_250g,
     outer_step, preflight_check,
 };
+use comms_mavlink::MavSeverity;
 use mavlink::common::{MavCmd, MavMessage, MavResult};
 use nalgebra::Vector3;
 use sim_hil::{
@@ -104,6 +108,11 @@ async fn main() -> anyhow::Result<()> {
     let mut last_att = Instant::now();
     let mut last_pos = Instant::now();
     let mut latest: Option<Snapshot> = None;
+    // Edge-triggered alert state: remember the previous snapshot's
+    // motor_alive mask so we only emit a STATUSTEXT on the tick a
+    // motor actually transitions from alive to dead (not every tick
+    // while it stays dead, which would flood the MAVLink link).
+    let mut prev_motor_alive: [bool; 4] = [true; 4];
 
     loop {
         // Drain any incoming snapshots to keep `latest` fresh.
@@ -238,6 +247,23 @@ async fn main() -> anyhow::Result<()> {
                 .ok();
                 last_pos = now;
             }
+            // Edge-triggered motor-failure alert: any motor that just
+            // transitioned from alive → dead emits one STATUSTEXT.
+            for (idx, (&was_alive, &is_alive)) in
+                prev_motor_alive.iter().zip(s.motor_alive.iter()).enumerate()
+            {
+                if was_alive && !is_alive {
+                    // Example is host-only — std::format is fine here.
+                    // On the embedded target a `heapless::String<50>` +
+                    // `core::fmt::write!` would be the equivalent.
+                    let text = format!("MOTOR {idx} FAILED");
+                    sink.send_statustext(MavSeverity::MAV_SEVERITY_CRITICAL, &text)
+                        .await
+                        .ok();
+                    tracing::warn!(motor = idx, "emitted STATUSTEXT: MOTOR FAILED");
+                }
+            }
+            prev_motor_alive = s.motor_alive;
         }
 
         // If the sim task ever exited, bail.
@@ -259,6 +285,11 @@ struct Snapshot {
     position: Vector3<f32>,
     velocity: Vector3<f32>,
     heading: f32,
+    /// Per-motor liveness latched by the rate loop (AND of
+    /// FlightState.motor_alive + detector output). The telemetry
+    /// task does edge detection on this to emit a STATUSTEXT
+    /// alert on the tick a motor first goes from alive to dead.
+    motor_alive: [bool; 4],
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -349,6 +380,7 @@ fn run_sim(
                 position: flight.state.position_ned,
                 velocity: flight.state.velocity_ned,
                 heading: yaw,
+                motor_alive: flight.motor_alive,
             };
             if tx.send(snap).is_err() {
                 // Receiver dropped — main exited; wind down.
