@@ -503,6 +503,13 @@ pub struct FlightState {
     /// real fault declaration automatically engages the failover
     /// allocator on the very next tick.
     pub motor_fault_detector: MotorFaultDetector,
+    /// Gate the detector. When `false`, `rate_loop_step` skips the
+    /// `observe()` call entirely — persistence doesn't accumulate and
+    /// `motor_alive` can't be cleared by the detector this tick.
+    /// Useful during aggressive maneuvers (flip / acro) where
+    /// actuator saturation produces ω̇ residuals indistinguishable
+    /// from a real motor failure. Default `true`.
+    pub motor_fault_detector_enabled: bool,
     /// Previous tick's commanded motor thrusts (after saturation).
     /// Stored so the detector can pair "commanded at tick N−1" with
     /// "ω̇ observed at tick N" — the pairing that actually matches
@@ -529,6 +536,7 @@ impl Default for FlightState {
             rtl_phase: RtlPhase::default(),
             motor_alive: [true; 4],
             motor_fault_detector: MotorFaultDetector::new(),
+            motor_fault_detector_enabled: true,
             last_motor_cmd: SVector::<f32, 4>::zeros(),
         }
     }
@@ -638,7 +646,7 @@ pub fn rate_loop_step(
     // Run this only while armed; disarmed ground runs produce zero cmd +
     // whatever IMU noise is on the bench and should not accumulate
     // persistence.
-    if flight.arm_state == ArmState::Armed {
+    if flight.arm_state == ArmState::Armed && flight.motor_fault_detector_enabled {
         flight.motor_fault_detector.observe(
             &flight.last_motor_cmd,
             omega_dot_filtered,
