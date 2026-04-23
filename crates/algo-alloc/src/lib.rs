@@ -34,7 +34,7 @@
 //! * [`allocate`] — apply a pre-computed `E⁺` to a virtual command.
 //! * [`saturate`] — clip per-motor thrusts to `[min_n, max_n]`.
 
-use nalgebra::{Matrix4, SMatrix, SVector, Vector3, Vector4};
+use nalgebra::{Matrix3, Matrix4, SMatrix, SVector, Vector3, Vector4};
 
 /// Geometry of a single motor in the body frame.
 ///
@@ -159,6 +159,140 @@ pub fn standard_x_quad(arm_m: f32, k_yaw: f32) -> [MotorGeometry; 4] {
             yaw_torque_per_thrust: -k_yaw,
         },
     ]
+}
+
+// ============================================================================
+// Failover allocator — survives a single motor failure by switching to a
+// pre-computed 3-motor pseudoinverse.
+//
+// Approach (Mueller & D'Andrea 2014, "Stability and control of a
+// quadrocopter despite the complete loss of one, two, or three
+// propellers"): with 3 surviving motors a quadrotor has only 3
+// controllable directions, so one body axis must be sacrificed.
+// We sacrifice **yaw** because:
+//   * yaw rate is low-consequence for a safe descent
+//   * yaw torque coefficient is ~10× smaller than roll/pitch,
+//     making it the numerically weakest column regardless
+//   * published literature on 3-motor flight converges on this
+//     choice as the common-sense lower-risk option
+//
+// Math: for dead motor k, the 3 survivors give a 3×3 effectiveness
+//
+//   E_3(k) = [-y_s, +x_s, 1]   (rows are roll, pitch, thrust)
+//
+// where s iterates the 3 survivor indices in ascending order. This
+// matrix is invertible for any non-degenerate X-quad geometry; the
+// inverse is pre-computed at boot (same pattern as the normal 4-motor
+// inverse) and applied at runtime.
+// ============================================================================
+
+/// Effectiveness + pre-computed inverses for the 4-motor nominal case
+/// plus all four 3-motor failover subsets.
+///
+/// Intended lifetime: build once at boot, pass by reference at every
+/// control tick. No runtime matrix inversion.
+#[derive(Clone, Copy, Debug)]
+pub struct FailoverAllocator {
+    /// 4×4 inverse used when every motor is alive.
+    pub e_inv_4: Matrix4<f32>,
+    /// 3×3 inverse for each possible dead-motor index ∈ `0..4`.
+    /// Maps `[τ_roll, τ_pitch, F_total]` → `[T_survivor0, T_survivor1, T_survivor2]`
+    /// where survivors are in ascending motor-index order.
+    pub e_inv_3: [Matrix3<f32>; 4],
+    /// For each dead-motor index, the three surviving indices in
+    /// ascending order. Redundant with `0..4 \ {dead}` but carried
+    /// explicitly so the allocator path has no loops / allocations.
+    pub survivors: [[usize; 3]; 4],
+}
+
+/// Build a [`FailoverAllocator`] for a 4-motor geometry.
+///
+/// Returns `None` if any of the five matrices (the 4×4 or any 3×3)
+/// is singular. This should be impossible for a well-formed X-quad;
+/// a `None` result indicates a geometry bug that the caller must
+/// surface before flight.
+#[must_use]
+pub fn build_failover_allocator(motors: &[MotorGeometry; 4]) -> Option<FailoverAllocator> {
+    let e4 = build_effectiveness(motors);
+    let e_inv_4 = invert_quad_effectiveness(&e4.into_owned())?;
+
+    let mut e_inv_3 = [Matrix3::zeros(); 4];
+    let mut survivors = [[0_usize; 3]; 4];
+    for dead in 0..4 {
+        let mut surv = [0_usize; 3];
+        let mut s_idx = 0_usize;
+        for i in 0..4 {
+            if i != dead {
+                surv[s_idx] = i;
+                s_idx += 1;
+            }
+        }
+        survivors[dead] = surv;
+
+        // Build 3×3 sub-effectiveness for (roll, pitch, thrust).
+        // Yaw row dropped — the 4th row of the full E is the yaw
+        // coefficient; we sacrifice that axis in failover.
+        let mut e3 = Matrix3::zeros();
+        for (col, &mi) in surv.iter().enumerate() {
+            let m = motors[mi];
+            e3[(0, col)] = -m.position_m.y;
+            e3[(1, col)] = m.position_m.x;
+            e3[(2, col)] = 1.0;
+        }
+        e_inv_3[dead] = e3.try_inverse()?;
+    }
+
+    Some(FailoverAllocator {
+        e_inv_4,
+        e_inv_3,
+        survivors,
+    })
+}
+
+/// Apply the appropriate pre-computed inverse given a liveness mask.
+///
+/// * All 4 alive → classic 4-motor allocation (yaw controlled).
+/// * Exactly 3 alive → 3-motor failover, yaw uncontrolled, dead
+///   motor's slot stays at `0.0`.
+/// * 2 or fewer alive → returns `[0.0; 4]` (vehicle is not
+///   controllable; caller must initiate emergency landing /
+///   auto-rotation — out of scope for this allocator).
+#[must_use]
+pub fn allocate_with_failover(
+    alloc: &FailoverAllocator,
+    alive: [bool; 4],
+    cmd: &VirtualCommand,
+) -> SVector<f32, 4> {
+    let n_alive = alive.iter().filter(|&&a| a).count();
+    let mut out = SVector::<f32, 4>::zeros();
+
+    if n_alive == 4 {
+        let v = cmd.as_vector4();
+        let t4 = alloc.e_inv_4 * v;
+        out.copy_from(&t4);
+        return out;
+    }
+
+    if n_alive == 3 {
+        // Exactly one dead motor.
+        let mut dead = 0_usize;
+        for (i, &a) in alive.iter().enumerate() {
+            if !a {
+                dead = i;
+                break;
+            }
+        }
+        let rpt = Vector3::new(cmd.torque.x, cmd.torque.y, cmd.thrust_n);
+        let t3 = alloc.e_inv_3[dead] * rpt;
+        let surv = alloc.survivors[dead];
+        for (i, &mi) in surv.iter().enumerate() {
+            out[mi] = t3[i];
+        }
+        return out;
+    }
+
+    // 2-or-fewer alive: vehicle uncontrollable — zero thrust.
+    out
 }
 
 #[cfg(test)]
@@ -288,6 +422,125 @@ mod tests {
                 let val = cell4(&s1, i);
                 prop_assert!((0.0..=5.0).contains(&val));
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // FailoverAllocator tests.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn failover_allocator_builds_for_standard_x_quad() {
+        let alloc = build_failover_allocator(&test_motors());
+        assert!(alloc.is_some(), "standard X-quad should yield a valid failover allocator");
+        let a = alloc.unwrap();
+        // Survivor lists are the complement of each dead index.
+        for dead in 0..4 {
+            assert!(!a.survivors[dead].contains(&dead));
+            let mut sorted = a.survivors[dead];
+            sorted.sort_unstable();
+            assert_eq!(sorted, a.survivors[dead]);
+        }
+    }
+
+    #[test]
+    fn failover_all_alive_matches_classic_allocator() {
+        let motors = test_motors();
+        let alloc = build_failover_allocator(&motors).unwrap();
+        let e_mat: Matrix4<f32> = build_effectiveness(&motors).into_owned();
+        let e_inv_classic = invert_quad_effectiveness(&e_mat).unwrap();
+        let cmd = VirtualCommand {
+            torque: Vector3::new(0.05, -0.02, 0.01),
+            thrust_n: 8.0,
+        };
+        let failover = allocate_with_failover(&alloc, [true; 4], &cmd);
+        let classic = e_inv_classic * cmd.as_vector4();
+        for i in 0..4 {
+            let diff = (cell(&failover, i) - cell4(&classic, i)).abs();
+            assert!(diff < 1.0e-4, "motor {i} diverges: {diff}");
+        }
+    }
+
+    #[test]
+    fn failover_3_motor_satisfies_roll_pitch_thrust_exactly() {
+        let motors = test_motors();
+        let alloc = build_failover_allocator(&motors).unwrap();
+        let cmd = VirtualCommand {
+            torque: Vector3::new(0.04, -0.03, 0.02), // yaw component WILL be ignored
+            thrust_n: 6.0,
+        };
+        for dead in 0..4 {
+            let mut alive = [true; 4];
+            alive[dead] = false;
+            let thrusts = allocate_with_failover(&alloc, alive, &cmd);
+            // Dead motor's slot stays zero.
+            assert!(cell(&thrusts, dead).abs() < 1.0e-6, "dead {dead} non-zero: {}", cell(&thrusts, dead));
+            // Reconstruct roll/pitch/thrust from survivors.
+            let mut tau_roll = 0.0_f32;
+            let mut tau_pitch = 0.0_f32;
+            let mut f_total = 0.0_f32;
+            for mi in 0..4 {
+                let t = cell(&thrusts, mi);
+                tau_roll  += -motors[mi].position_m.y * t;
+                tau_pitch += motors[mi].position_m.x * t;
+                f_total   += t;
+            }
+            assert!((tau_roll - cmd.torque.x).abs() < 1.0e-3, "roll mismatch dead {dead}: want {}, got {tau_roll}", cmd.torque.x);
+            assert!((tau_pitch - cmd.torque.y).abs() < 1.0e-3, "pitch mismatch dead {dead}: want {}, got {tau_pitch}", cmd.torque.y);
+            assert!((f_total - cmd.thrust_n).abs() < 1.0e-3, "thrust mismatch dead {dead}: want {}, got {f_total}", cmd.thrust_n);
+        }
+    }
+
+    #[test]
+    fn failover_with_two_or_fewer_alive_yields_zero_thrust() {
+        let motors = test_motors();
+        let alloc = build_failover_allocator(&motors).unwrap();
+        let cmd = VirtualCommand {
+            torque: Vector3::new(0.1, 0.1, 0.1),
+            thrust_n: 10.0,
+        };
+        for mask in [[false, false, true, true], [true, false, false, true], [false; 4]] {
+            let thrusts = allocate_with_failover(&alloc, mask, &cmd);
+            for i in 0..4 {
+                assert!(cell(&thrusts, i).abs() < 1.0e-9, "mask {mask:?} motor {i} non-zero");
+            }
+        }
+    }
+
+    proptest! {
+        /// Failover 3-motor: whatever roll/pitch/thrust we request
+        /// (within realistic bounds), the resulting motor thrusts
+        /// must reconstruct roll/pitch/thrust to within 1 mN·m / 1 mN.
+        /// Yaw is intentionally unchecked — it's the sacrificed axis.
+        #[test]
+        fn failover_3motor_roundtrip_on_rpt(
+            roll in -0.05f32..0.05,
+            pitch in -0.05f32..0.05,
+            thrust in 2.0f32..12.0,
+            dead in 0_usize..4,
+        ) {
+            let motors = test_motors();
+            let alloc = build_failover_allocator(&motors).unwrap();
+            let mut alive = [true; 4];
+            alive[dead] = false;
+            let cmd = VirtualCommand {
+                torque: Vector3::new(roll, pitch, 0.0),
+                thrust_n: thrust,
+            };
+            let thrusts = allocate_with_failover(&alloc, alive, &cmd);
+            prop_assert!(cell(&thrusts, dead).abs() < 1.0e-6);
+            let mut tau_roll = 0.0_f32;
+            let mut tau_pitch = 0.0_f32;
+            let mut f_total = 0.0_f32;
+            for mi in 0..4 {
+                let t = cell(&thrusts, mi);
+                tau_roll  += -motors[mi].position_m.y * t;
+                tau_pitch += motors[mi].position_m.x * t;
+                f_total   += t;
+            }
+            prop_assert!((tau_roll - roll).abs() < 1.0e-3);
+            prop_assert!((tau_pitch - pitch).abs() < 1.0e-3);
+            prop_assert!((f_total - thrust).abs() < 1.0e-3);
         }
     }
 }
