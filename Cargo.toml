@@ -84,6 +84,9 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 anyhow = "1.0"
 thiserror = "1.0"
+# Zenoh pub/sub over any transport — opt-in because the dep graph is
+# huge (~80 transitive crates). Enable via `sim-hil` feature flag.
+zenoh = "1.9"
 
 # Testing
 proptest = "1.5"

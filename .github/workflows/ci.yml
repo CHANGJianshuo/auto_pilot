@@ -41,6 +41,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  test-zenoh:
+    name: test (zenoh-host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      # Exercise the opt-in Zenoh pub/sub wrapper. Separate job so the
+      # default test matrix stays fast; this one pulls the full zenoh
+      # transitive graph (~80 crates).
+      - run: cargo test -p sim-hil --features zenoh-host
+
   build-firmware:
     name: build (thumbv7em)
     runs-on: ubuntu-latest

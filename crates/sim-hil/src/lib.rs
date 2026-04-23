@@ -34,6 +34,12 @@ pub mod mavlink_udp;
 
 pub mod gazebo;
 
+/// Host-side Zenoh pub/sub wrapper binding `core_bus` messages to a
+/// live Zenoh session. Opt-in via the `zenoh-host` feature because the
+/// dep graph is heavy.
+#[cfg(feature = "zenoh-host")]
+pub mod zenoh_bus;
+
 /// Static simulator parameters (mass, inertia, geometry, noise).
 #[derive(Clone, Debug)]
 pub struct SimConfig {

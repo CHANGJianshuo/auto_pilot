@@ -10,11 +10,18 @@ description = "Host-side harness for SITL / HITL — bridges firmware with Gazeb
 [lints]
 workspace = true
 
+[features]
+default = []
+# Enable the Zenoh host session + typed pub/sub wrapper. Gated because
+# zenoh pulls ~80 transitive crates and bloats CI build times.
+zenoh-host = ["dep:zenoh", "dep:core-bus", "dep:serde"]
+
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 nalgebra = { workspace = true }
 libm = { workspace = true }
 algo-ekf = { path = "../algo-ekf" }
@@ -23,6 +30,10 @@ algo-nmpc = { path = "../algo-nmpc" }
 core-hal = { path = "../core-hal" }
 comms-mavlink = { path = "../comms-mavlink" }
 mavlink = { workspace = true }
+# Optional Zenoh host integration (see `zenoh-host` feature).
+core-bus = { path = "../core-bus", optional = true }
+zenoh = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 app-copter = { path = "../app-copter" }
