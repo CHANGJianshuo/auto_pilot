@@ -1011,9 +1011,14 @@ mod rtl_kani {
         let pos_z = any_finite_f32();
         let vel_z = any_finite_f32();
         let dt = any_finite_f32();
-        let r = TakeoffState::TakingOff { target_z_ned: target_z }
-            .advance(&mut det, pos_z, vel_z, dt);
-        assert!(matches!(r, TakeoffTransition::Stay | TakeoffTransition::Reached));
+        let r = TakeoffState::TakingOff {
+            target_z_ned: target_z,
+        }
+        .advance(&mut det, pos_z, vel_z, dt);
+        assert!(matches!(
+            r,
+            TakeoffTransition::Stay | TakeoffTransition::Reached
+        ));
     }
 
     /// Idle leaves the altitude detector untouched. Symmetric to the
