@@ -35,8 +35,9 @@ use core_hal::traits::ImuSample;
 use nalgebra::{Matrix4, SVector, Vector3};
 
 pub use algo_alloc::{
-    MotorGeometry, VirtualCommand, allocate, build_effectiveness, invert_quad_effectiveness,
-    saturate, standard_x_quad,
+    FailoverAllocator, MotorGeometry, VirtualCommand, allocate, allocate_with_failover,
+    build_effectiveness, build_failover_allocator, invert_quad_effectiveness, saturate,
+    standard_x_quad,
 };
 
 /// Per-flight tunable parameters that are static at boot.
@@ -51,6 +52,12 @@ pub struct RateLoopConfig {
     pub alpha_lpf: LowPassFilterVec3,
     /// Pre-computed effectiveness inverse for the 4-motor configuration.
     pub e_inv: Matrix4<f32>,
+    /// Optional motor-failure-aware allocator. When set AND
+    /// [`FlightState::motor_alive`] is not all-true, the rate loop
+    /// dispatches through [`allocate_with_failover`] instead of the
+    /// classic 4-motor `e_inv`. When `None`, the classic path is
+    /// always taken (legacy behaviour).
+    pub failover: Option<FailoverAllocator>,
     /// Per-motor thrust limits (N).
     pub motor_min_n: f32,
     pub motor_max_n: f32,
@@ -476,6 +483,11 @@ pub struct FlightState {
     pub home_position_ned: Option<Vector3<f32>>,
     /// Return-to-launch phase.
     pub rtl_phase: RtlPhase,
+    /// Liveness of each of the 4 motors. `true` = alive, `false` =
+    /// dead (caller / FDIR sets this; default `[true; 4]`). When
+    /// anything is `false` AND [`RateLoopConfig::failover`] is
+    /// `Some`, `rate_loop_step` switches to the failover allocator.
+    pub motor_alive: [bool; 4],
 }
 
 impl Default for FlightState {
@@ -495,6 +507,7 @@ impl Default for FlightState {
             altitude_reached_detector: AltitudeReachedDetector::new(),
             home_position_ned: None,
             rtl_phase: RtlPhase::default(),
+            motor_alive: [true; 4],
         }
     }
 }
@@ -577,7 +590,11 @@ pub fn rate_loop_step(
         torque: torque.body_torque_nm,
         thrust_n: cfg.hover_thrust_n,
     };
-    let raw = allocate(&cfg.e_inv, &virtual_cmd);
+    let all_alive = flight.motor_alive == [true; 4];
+    let raw = match (&cfg.failover, all_alive) {
+        (Some(fa), false) => allocate_with_failover(fa, flight.motor_alive, &virtual_cmd),
+        _ => allocate(&cfg.e_inv, &virtual_cmd),
+    };
     let clipped = saturate(raw, cfg.motor_min_n, cfg.motor_max_n);
 
     // Arm-state gate: disarmed vehicles emit zero thrust unconditionally.
@@ -600,6 +617,7 @@ pub fn default_config_250g() -> RateLoopConfig {
     let e = build_effectiveness(&motors);
     let e_mat: Matrix4<f32> = e.into_owned();
     let e_inv = invert_quad_effectiveness(&e_mat).unwrap_or(Matrix4::identity());
+    let failover = build_failover_allocator(&motors);
     RateLoopConfig {
         k_rate: Vector3::new(25.0, 25.0, 15.0),
         k_attitude: Vector3::new(8.0, 8.0, 5.0),
@@ -609,6 +627,7 @@ pub fn default_config_250g() -> RateLoopConfig {
         gyro_lpf: LowPassFilterVec3::new(80.0, 1000.0),
         alpha_lpf: LowPassFilterVec3::new(30.0, 1000.0),
         e_inv,
+        failover,
         motor_min_n: 0.0,
         motor_max_n: 6.0,
         hover_thrust_n: 2.45, // m=0.25 kg × g=9.8 m/s²
@@ -1650,5 +1669,107 @@ mod tests {
         let m4 = out.motor_thrusts_n.fixed_view::<1, 1>(3, 0).to_scalar();
         assert!(m2 > m1);
         assert!(m3 > m4);
+    }
+
+    /// When `motor_alive` is all-true the failover-enabled config
+    /// must produce byte-identical motor thrusts to the classic
+    /// path. Regression guard: M19b adds the branch, this locks in
+    /// that the default path is unchanged.
+    #[test]
+    fn rate_loop_all_alive_matches_pre_m19() {
+        let mut cfg_classic = default_config_250g();
+        cfg_classic.failover = None; // force classic
+        let mut cfg_failover = default_config_250g(); // failover = Some(...)
+
+        let mut fl_classic = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
+        let mut fl_failover = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
+        // Seed & step both with an identical IMU stream + non-trivial
+        // torque command.
+        for i in 0..20 {
+            let _ = rate_loop_step(
+                &mut cfg_classic,
+                &mut fl_classic,
+                stationary_imu(i),
+                0.001,
+                RateCommand::default(),
+            );
+            let _ = rate_loop_step(
+                &mut cfg_failover,
+                &mut fl_failover,
+                stationary_imu(i),
+                0.001,
+                RateCommand::default(),
+            );
+        }
+        let cmd = RateCommand {
+            body_rate_rad_s: Vector3::new(0.5, -0.3, 0.1),
+        };
+        let a = rate_loop_step(&mut cfg_classic, &mut fl_classic, stationary_imu(99), 0.001, cmd);
+        let b = rate_loop_step(
+            &mut cfg_failover,
+            &mut fl_failover,
+            stationary_imu(99),
+            0.001,
+            cmd,
+        );
+        for i in 0..4 {
+            let ai = a.motor_thrusts_n.fixed_view::<1, 1>(i, 0).to_scalar();
+            let bi = b.motor_thrusts_n.fixed_view::<1, 1>(i, 0).to_scalar();
+            assert!(
+                (ai - bi).abs() < 1.0e-5,
+                "motor {i} diverges: classic={ai}, failover={bi}"
+            );
+        }
+    }
+
+    /// When one motor is marked dead, the rate loop must drive its
+    /// slot to ~0 and still sum to roughly `hover_thrust_n` from
+    /// the 3 survivors.
+    #[test]
+    fn rate_loop_motor_dead_zeroes_slot_and_redistributes_thrust() {
+        let mut cfg = default_config_250g();
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
+        // Seed with a few stationary samples before declaring the
+        // motor dead — we want the LPF filters to be at steady state.
+        for i in 0..10 {
+            let _ = rate_loop_step(
+                &mut cfg,
+                &mut flight,
+                stationary_imu(i),
+                0.001,
+                RateCommand::default(),
+            );
+        }
+        flight.motor_alive[0] = false;
+        let out = rate_loop_step(
+            &mut cfg,
+            &mut flight,
+            stationary_imu(11),
+            0.001,
+            RateCommand::default(),
+        );
+        let m0 = out.motor_thrusts_n.fixed_view::<1, 1>(0, 0).to_scalar();
+        let total: f32 = (0..4)
+            .map(|i| out.motor_thrusts_n.fixed_view::<1, 1>(i, 0).to_scalar())
+            .sum();
+        assert!(m0.abs() < 1.0e-5, "dead motor should output ~0, got {m0}");
+        // With motor_alive[0]=false and stationary gyro, failover
+        // produces t = [0, 0, hover/2, hover/2] (by the X-quad
+        // diagonal-cancellation geometry worked out in M19a docs).
+        // Total should still equal hover_thrust_n ≈ 2.45.
+        assert!(
+            (total - cfg.hover_thrust_n).abs() < 0.05,
+            "total {total} should be ~hover {}",
+            cfg.hover_thrust_n
+        );
     }
 }
