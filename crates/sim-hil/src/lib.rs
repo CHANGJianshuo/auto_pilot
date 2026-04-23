@@ -1043,6 +1043,117 @@ mod tests {
         sim_state
     }
 
+    /// Three-tier comparison in the same wind + drag scenario:
+    ///
+    ///   bare MPC    — bias-blind, big steady-state drift
+    ///   MPC+residual — hand-tuned PD-shaped residual
+    ///   LQI         — proper integrator
+    ///
+    /// Expected classes (not absolute ordering): bare MPC is the
+    /// "bias-blind tier" — everything else sits much closer to the
+    /// setpoint. MPC+residual and LQI are both "bias-tolerant tier";
+    /// which one wins depends on tuning and can swap between them
+    /// without a regression.
+    ///
+    /// Hand-tuning note: a PD-shaped residual (pos + vel features,
+    /// no memory) ought to be *weaker* than LQI on paper because only
+    /// the integrator can kill a constant disturbance at steady
+    /// state. Empirically on this sim scenario a well-chosen PD gain
+    /// pair keeps up with LQI — MPC's look-ahead is doing part of the
+    /// work. The test doesn't assert a winner between those two; it
+    /// asserts both are in the right tier.
+    #[test]
+    fn controller_shootout_residual_sits_between_bare_mpc_and_lqi() {
+        use algo_nmpc::{LqiWeights, LqrWeights, PositionController, PositionGains};
+        use nn_runtime::{AffineBackend, FEATURE_LEN, RESIDUAL_LEN};
+
+        let sim_cfg = SimConfig::realistic_dynamics(Vector3::new(1.5, 0.0, 0.0));
+        let dt = 0.001_f32;
+        let lqr_weights = LqrWeights {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            r: 0.5,
+        };
+        let lqi_weights = LqiWeights {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            q_i: 1.5,
+            r: 0.5,
+        };
+
+        // Tier 1 — bare MPC (bias-blind).
+        let bare_sim = run_closed_loop_with_mpc_residual(
+            &sim_cfg,
+            13,
+            15_000,
+            lqr_weights,
+            lqr_weights,
+            AffineBackend::zero(),
+        );
+        let bare_horiz = (bare_sim.position_ned.x.powi(2) + bare_sim.position_ned.y.powi(2)).sqrt();
+
+        // Tier 2 — MPC + PD-shaped residual.
+        let mut w = [[0.0_f32; FEATURE_LEN]; RESIDUAL_LEN];
+        w[0][0] = -2.0; // pos_err_x → residual_x (restoring)
+        w[0][3] = -1.0; // vel_x     → residual_x (damping)
+        let tuned = AffineBackend::new(w, [0.0; RESIDUAL_LEN], 5.0);
+        let residual_sim = run_closed_loop_with_mpc_residual(
+            &sim_cfg,
+            13,
+            15_000,
+            lqr_weights,
+            lqr_weights,
+            tuned,
+        );
+        let residual_horiz =
+            (residual_sim.position_ned.x.powi(2) + residual_sim.position_ned.y.powi(2)).sqrt();
+
+        // Tier 3 — LQI (integrator-based bias killer). Reuse the enum
+        // shootout path for this one since LQI is a stateless-config
+        // controller after construction.
+        let lqi = PositionController::<10>::lqi(
+            lqi_weights,
+            lqi_weights,
+            dt,
+            PositionGains::default().max_accel,
+            5.0,
+        )
+        .unwrap();
+        let lqi_sim = run_closed_loop_with_controller(&sim_cfg, 13, 15_000, lqi);
+        let lqi_horiz = (lqi_sim.position_ned.x.powi(2) + lqi_sim.position_ned.y.powi(2)).sqrt();
+
+        // Tier assertions:
+        //
+        //   (a) MPC+residual must materially beat bare MPC
+        //   (b) LQI must materially beat bare MPC
+        //   (c) both bias-tolerant controllers are in the same class
+        //       — within a generous factor of each other
+        //
+        // No ordering assertion between residual and LQI because their
+        // relative ranking is tuning-dependent in this scenario.
+        assert!(
+            residual_horiz * 3.0 < bare_horiz,
+            "residual should cut err ≥ 3×: bare {bare_horiz} m, residual {residual_horiz} m"
+        );
+        assert!(
+            lqi_horiz * 3.0 < bare_horiz,
+            "LQI should cut err ≥ 3×: bare {bare_horiz} m, lqi {lqi_horiz} m"
+        );
+        // Same class: neither should be wildly worse than the other.
+        let ratio = residual_horiz.max(lqi_horiz) / residual_horiz.min(lqi_horiz);
+        assert!(
+            ratio < 3.0,
+            "residual and LQI should be in the same tier: residual {residual_horiz} m, lqi {lqi_horiz} m (ratio {ratio})"
+        );
+        // Hard floor on bare MPC so a bug that stealthily enables
+        // integration in the MPC path gets flagged — this test
+        // depends on bare MPC being bias-blind.
+        assert!(
+            bare_horiz > 0.5,
+            "bare MPC should show significant drift under wind+drag; got {bare_horiz}"
+        );
+    }
+
     #[test]
     fn mpc_plus_residual_beats_bare_mpc_under_drag() {
         // Realistic sim (motor lag + drag + wind) in which bare MPC
