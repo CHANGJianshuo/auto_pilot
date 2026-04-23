@@ -12,3 +12,5 @@ workspace = true
 
 [dependencies]
 heapless = { workspace = true }
+nalgebra = { workspace = true }
+libm = { workspace = true }
