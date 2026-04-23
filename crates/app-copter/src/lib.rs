@@ -321,6 +321,43 @@ pub enum TakeoffState {
     },
 }
 
+/// Outcome of [`TakeoffState::advance`]. Same shape as
+/// [`LandingTransition`] — one-way exit via `Reached`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TakeoffTransition {
+    /// No change — caller keeps driving the climb setpoint.
+    Stay,
+    /// Altitude-reached detector fired — caller resets the takeoff
+    /// state to `Idle` and resets the detector's accumulator. Caller
+    /// decides whether the setpoint shifts to the target or whatever
+    /// the outer navigator supplies next.
+    Reached,
+}
+
+impl TakeoffState {
+    /// Pure transition. `Idle` never advances autonomously;
+    /// `TakingOff { target_z_ned }` advances to `Reached` once the
+    /// altitude-reached detector sees the vehicle settled near the
+    /// commanded altitude.
+    pub fn advance(
+        self,
+        detector: &mut AltitudeReachedDetector,
+        position_z_ned: f32,
+        velocity_z_ned: f32,
+        dt_s: f32,
+    ) -> TakeoffTransition {
+        let target_z_ned = match self {
+            Self::Idle => return TakeoffTransition::Stay,
+            Self::TakingOff { target_z_ned } => target_z_ned,
+        };
+        if detector.observe(position_z_ned, velocity_z_ned, target_z_ned, dt_s) {
+            TakeoffTransition::Reached
+        } else {
+            TakeoffTransition::Stay
+        }
+    }
+}
+
 /// Detects that the vehicle has reached and settled at its takeoff
 /// altitude. Parallels [`TouchdownDetector`] but checks "close to
 /// commanded z" rather than "close to ground".
@@ -787,16 +824,15 @@ pub fn outer_step(
         }
     }
 
-    // Takeoff completion: if we've reached target altitude, flip back
-    // to Idle so the caller's subsequent setpoints take over.
-    if let TakeoffState::TakingOff { target_z_ned } = flight.takeoff_state {
-        let reached = flight.altitude_reached_detector.observe(
-            flight.state.position_ned.z,
-            flight.state.velocity_ned.z,
-            target_z_ned,
-            dt_s,
-        );
-        if reached {
+    // Takeoff completion — pure transition fn + side effects.
+    match flight.takeoff_state.advance(
+        &mut flight.altitude_reached_detector,
+        flight.state.position_ned.z,
+        flight.state.velocity_ned.z,
+        dt_s,
+    ) {
+        TakeoffTransition::Stay => {}
+        TakeoffTransition::Reached => {
             flight.takeoff_state = TakeoffState::Idle;
             flight.altitude_reached_detector.reset();
         }
@@ -947,6 +983,56 @@ mod rtl_kani {
     /// flight toggles Idle → Landing → Idle repeatedly, and each new
     /// Landing has to start from a clean detector state via the
     /// outer_step `reset` call on Complete (not silently mid-Idle).
+    // ---- TakeoffState (M16c) -----------------------------------------
+
+    /// `TakeoffState::Idle` can't auto-advance. External commands
+    /// (MAV_CMD_NAV_TAKEOFF) flip it to `TakingOff` directly.
+    #[kani::proof]
+    fn takeoff_idle_is_absorbing() {
+        let mut det = AltitudeReachedDetector::new();
+        det.settled_s = any_finite_f32();
+        kani::assume(det.settled_s >= 0.0);
+        let pos_z = any_finite_f32();
+        let vel_z = any_finite_f32();
+        let dt = any_finite_f32();
+        let r = TakeoffState::Idle.advance(&mut det, pos_z, vel_z, dt);
+        assert!(matches!(r, TakeoffTransition::Stay));
+    }
+
+    /// `TakeoffState::TakingOff` exits only via `Reached`. No phantom
+    /// transition back to Idle (that's a side effect the caller
+    /// performs on `Reached`, not something `advance` itself does).
+    #[kani::proof]
+    fn takeoff_only_exits_via_reached() {
+        let mut det = AltitudeReachedDetector::new();
+        det.settled_s = any_finite_f32();
+        kani::assume(det.settled_s >= 0.0);
+        let target_z = any_finite_f32();
+        let pos_z = any_finite_f32();
+        let vel_z = any_finite_f32();
+        let dt = any_finite_f32();
+        let r = TakeoffState::TakingOff { target_z_ned: target_z }
+            .advance(&mut det, pos_z, vel_z, dt);
+        assert!(matches!(r, TakeoffTransition::Stay | TakeoffTransition::Reached));
+    }
+
+    /// Idle leaves the altitude detector untouched. Symmetric to the
+    /// Landing Idle-doesn't-accumulate invariant — ensures a stale
+    /// detector value from a previous flight doesn't poison a fresh
+    /// TakingOff that follows.
+    #[kani::proof]
+    fn takeoff_idle_does_not_touch_detector() {
+        let mut det = AltitudeReachedDetector::new();
+        let before = any_finite_f32();
+        kani::assume(before >= 0.0);
+        det.settled_s = before;
+        let pos_z = any_finite_f32();
+        let vel_z = any_finite_f32();
+        let dt = any_finite_f32();
+        let _ = TakeoffState::Idle.advance(&mut det, pos_z, vel_z, dt);
+        assert!(det.settled_s == before);
+    }
+
     #[kani::proof]
     fn landing_idle_does_not_touch_detector() {
         let mut det = TouchdownDetector::new();
