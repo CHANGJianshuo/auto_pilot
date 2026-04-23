@@ -78,6 +78,7 @@
 | [0072](./0072-sitl-zenoh-runner.md) | 2026-04-23 | M14 SITL runner 广播 Zenoh | `648b68a` | `run_closed_loop_with_zenoh_telemetry` 把 MPC 闭环 + TelemetryPublisher 合体：每 tick 按 docs/topics.md 速率（IMU 1 kHz / att·vel·pos 250 Hz / setpoint 50 Hz / health 10 Hz）广播；测试 counting subscriber 断言 ≥ 90% 速率 + 飞机保持 < 30 cm 悬停；plan.md 创新点 4 从"能 pub/sub"升级到"闭环里真的实时流"。 |
 | [0073](./0073-shootout-executable.md) | 2026-04-23 | M15 residual+Zenoh / shootout 可执行 | `7deab80` + `206b9bb` | **M15a**：新 runner 让 MpcResidual + TelemetryPublisher 同时跑，policy reject 转 HealthMsg::EKF flag；SITL 风扰 < 1 m。**M15b**：`cargo run -p sim-hil --example controller_shootout --release` 输出六路 markdown 表（PI 0.015 / residual 0.221 / MPC-I 0.226 / LQI 0.239 / MPC 2.74 / LQR 5.18 m），`sim_hil::sitl` 新 public 模块、app-copter 升主 dep。|
 | [0074](./0074-rtl-kani.md) | 2026-04-23 | M16a RtlPhase pure fn + Kani | `493a643` | RTL transition 从 outer_step 糅合代码重构成 pure `RtlPhase::advance → RtlTransition`，用 `dx²+dy² < tol²` 替代 `sqrt`；4 新 Kani 证（Idle 吸收、no-home 取消、Climbing 不跳 Handoff、Returning 不回退）；CI Kani job 加 app-copter；workspace 证明数 18→22。 |
+| [0075](./0075-landing-takeoff-kani.md) | 2026-04-23 | M16b+c Landing + Takeoff pure fn | `a8be3e6` + `91200fb` | 对称完成：`LandingState::advance → LandingTransition {Stay, Complete}`、`TakeoffState::advance → TakeoffTransition {Stay, Reached}`；TouchdownDetector 的 sqrt 换 squared compare；6 新 Kani 证（Idle 吸收 / 只能从指定出口退出 / Idle 不碰 detector）× 2；workspace 证明数 22→28；app-copter 里 3 条飞行 mode 状态机全部形式化。|
 
 ## 写新文档时遵守的模板
 
