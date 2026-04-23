@@ -322,6 +322,89 @@ impl RtlPhase {
     }
 }
 
+/// Top-level flight mode. Unifies what has been several ad-hoc state
+/// fields on [`FlightState`] (`landing_state`, `takeoff_state`,
+/// `rtl_phase`, `motor_fault_detector_enabled`) into one enum.
+///
+/// This type is the **contract** — integration with the existing
+/// ad-hoc fields lands in M24b. Transitions are defined as a pure
+/// function ([`FlightMode::request`]) so Kani can prove safety /
+/// liveness invariants before any runtime code migrates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FlightMode {
+    /// Normal position hold / mission navigation. Caller's setpoint
+    /// is followed verbatim; failure detectors are all enabled.
+    #[default]
+    Stable = 0,
+    /// Pilot commands body rates directly (flip / aggressive
+    /// maneuvering). Motor-fault detector is disabled because
+    /// actuator saturation produces ω̇ residuals indistinguishable
+    /// from real failures (see M22 commit).
+    Acro = 1,
+    /// Automatic climb to a target altitude after ARM.
+    TakingOff = 2,
+    /// Descend to ground + auto-disarm on touchdown. Safety-
+    /// preempts every other mode.
+    Landing = 3,
+    /// Return-to-launch: climb to safe altitude, traverse home xy,
+    /// hand off to Landing at arrival.
+    Rtl = 4,
+}
+
+/// Outcome of [`FlightMode::request`]. Matches the pattern used by
+/// `RtlTransition` / `LandingTransition` / `TakeoffTransition`: pure
+/// directive, caller applies the mutation explicitly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModeTransitionResult {
+    /// Target equals current; caller does nothing.
+    Stay,
+    /// Caller overwrites [`FlightState::flight_mode`] with the
+    /// contained value.
+    Enter(FlightMode),
+    /// Transition is not permitted from the current mode. Caller
+    /// typically logs a STATUSTEXT and leaves the current mode.
+    Reject,
+}
+
+impl FlightMode {
+    /// Request a mode change. Rules:
+    ///
+    /// * Self-transition → `Stay`.
+    /// * `Landing` is always reachable (safety preempt).
+    /// * `Stable` is always reachable from any non-`Stable` mode
+    ///   (explicit abort / user cancel).
+    /// * `Acro` / `TakingOff` / `Rtl` can only be entered **from**
+    ///   `Stable` — you can't flip mid-takeoff, can't takeoff while
+    ///   landing, etc.
+    /// * Everything else → `Reject`.
+    #[must_use]
+    pub fn request(self, target: FlightMode) -> ModeTransitionResult {
+        // Self-transition is always Stay.
+        if self == target {
+            return ModeTransitionResult::Stay;
+        }
+        // Landing is the universal safety preempt.
+        if matches!(target, FlightMode::Landing) {
+            return ModeTransitionResult::Enter(FlightMode::Landing);
+        }
+        // Stable is the universal abort from any non-Stable mode.
+        if matches!(target, FlightMode::Stable) {
+            return ModeTransitionResult::Enter(FlightMode::Stable);
+        }
+        // Acro / TakingOff / Rtl entry only from Stable.
+        if matches!(self, FlightMode::Stable)
+            && matches!(
+                target,
+                FlightMode::Acro | FlightMode::TakingOff | FlightMode::Rtl
+            )
+        {
+            return ModeTransitionResult::Enter(target);
+        }
+        ModeTransitionResult::Reject
+    }
+}
+
 /// Automatic climb-to-altitude state machine.
 ///
 /// `Idle`: vehicle follows the caller's setpoint as usual.
@@ -1186,6 +1269,88 @@ mod rtl_kani {
             }
         }
     }
+
+    // ---- FlightMode (M24a) -------------------------------------------
+
+    fn any_flight_mode() -> FlightMode {
+        let t: u8 = kani::any();
+        kani::assume(t < 5);
+        match t {
+            0 => FlightMode::Stable,
+            1 => FlightMode::Acro,
+            2 => FlightMode::TakingOff,
+            3 => FlightMode::Landing,
+            _ => FlightMode::Rtl,
+        }
+    }
+
+    /// Safety preempt: Landing is reachable from every other mode.
+    /// This is *the* FlightMode invariant — no mode may "trap" the
+    /// vehicle such that an emergency Landing cannot be entered.
+    #[kani::proof]
+    fn landing_always_reachable() {
+        let current = any_flight_mode();
+        let result = current.request(FlightMode::Landing);
+        // Self-transition to Landing returns Stay (already there),
+        // anything else must be Enter(Landing).
+        match (current, result) {
+            (FlightMode::Landing, ModeTransitionResult::Stay) => {}
+            (_, ModeTransitionResult::Enter(FlightMode::Landing)) => {}
+            other => panic!("Landing preempt broken: {:?}", other),
+        }
+    }
+
+    /// Abort route: Stable is reachable from every other mode.
+    /// Operator can always cancel whatever automation is active.
+    #[kani::proof]
+    fn stable_always_reachable() {
+        let current = any_flight_mode();
+        let result = current.request(FlightMode::Stable);
+        match (current, result) {
+            (FlightMode::Stable, ModeTransitionResult::Stay) => {}
+            (_, ModeTransitionResult::Enter(FlightMode::Stable)) => {}
+            other => panic!("Stable abort broken: {:?}", other),
+        }
+    }
+
+    /// Self-transitions always Stay. Prevents `Enter(same)` from
+    /// producing redundant wakeups / log spam.
+    #[kani::proof]
+    fn self_transitions_stay() {
+        let m = any_flight_mode();
+        assert!(matches!(m.request(m), ModeTransitionResult::Stay));
+    }
+
+    /// Acro is reachable only from Stable — prevents flip-during-
+    /// landing or flip-during-RTL shenanigans.
+    #[kani::proof]
+    fn acro_only_from_stable() {
+        let current = any_flight_mode();
+        kani::assume(!matches!(current, FlightMode::Stable));
+        kani::assume(!matches!(current, FlightMode::Acro)); // self-Stay handled elsewhere
+        let result = current.request(FlightMode::Acro);
+        assert!(matches!(result, ModeTransitionResult::Reject));
+    }
+
+    /// Takeoff mirrors Acro: only from Stable.
+    #[kani::proof]
+    fn takeoff_only_from_stable() {
+        let current = any_flight_mode();
+        kani::assume(!matches!(current, FlightMode::Stable));
+        kani::assume(!matches!(current, FlightMode::TakingOff));
+        let result = current.request(FlightMode::TakingOff);
+        assert!(matches!(result, ModeTransitionResult::Reject));
+    }
+
+    /// RTL mirrors Acro: only from Stable.
+    #[kani::proof]
+    fn rtl_only_from_stable() {
+        let current = any_flight_mode();
+        kani::assume(!matches!(current, FlightMode::Stable));
+        kani::assume(!matches!(current, FlightMode::Rtl));
+        let result = current.request(FlightMode::Rtl);
+        assert!(matches!(result, ModeTransitionResult::Reject));
+    }
 }
 
 #[cfg(test)]
@@ -1900,5 +2065,64 @@ mod tests {
             "total {total} should be ~hover {}",
             cfg.hover_thrust_n
         );
+    }
+
+    // ---- FlightMode (M24a) -------------------------------------------
+
+    #[test]
+    fn flight_mode_default_is_stable() {
+        assert_eq!(FlightMode::default(), FlightMode::Stable);
+    }
+
+    #[test]
+    fn flight_mode_stable_to_acro() {
+        assert_eq!(
+            FlightMode::Stable.request(FlightMode::Acro),
+            ModeTransitionResult::Enter(FlightMode::Acro),
+        );
+    }
+
+    #[test]
+    fn flight_mode_landing_preempts_acro() {
+        assert_eq!(
+            FlightMode::Acro.request(FlightMode::Landing),
+            ModeTransitionResult::Enter(FlightMode::Landing),
+        );
+    }
+
+    #[test]
+    fn flight_mode_acro_cannot_go_to_rtl() {
+        assert_eq!(
+            FlightMode::Acro.request(FlightMode::Rtl),
+            ModeTransitionResult::Reject,
+        );
+    }
+
+    #[test]
+    fn flight_mode_self_transition_stays() {
+        for m in [
+            FlightMode::Stable,
+            FlightMode::Acro,
+            FlightMode::TakingOff,
+            FlightMode::Landing,
+            FlightMode::Rtl,
+        ] {
+            assert_eq!(m.request(m), ModeTransitionResult::Stay);
+        }
+    }
+
+    #[test]
+    fn flight_mode_stable_is_always_reachable() {
+        for current in [
+            FlightMode::Acro,
+            FlightMode::TakingOff,
+            FlightMode::Landing,
+            FlightMode::Rtl,
+        ] {
+            assert_eq!(
+                current.request(FlightMode::Stable),
+                ModeTransitionResult::Enter(FlightMode::Stable),
+            );
+        }
     }
 }
