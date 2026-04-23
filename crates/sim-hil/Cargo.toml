@@ -27,6 +27,7 @@ libm = { workspace = true }
 algo-ekf = { path = "../algo-ekf" }
 algo-indi = { path = "../algo-indi" }
 algo-nmpc = { path = "../algo-nmpc" }
+nn-runtime = { path = "../nn-runtime" }
 core-hal = { path = "../core-hal" }
 comms-mavlink = { path = "../comms-mavlink" }
 mavlink = { workspace = true }

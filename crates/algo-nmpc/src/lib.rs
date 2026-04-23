@@ -776,6 +776,31 @@ impl<const H: usize> Mpc3dPositionController<H> {
         current_velocity: Vector3<f32>,
         mass_kg: f32,
     ) -> AttitudeAndThrust {
+        let accel_cmd = self.solve_accel(setpoint, current_position, current_velocity);
+        let dummy_gains = PositionGains {
+            k_pos: Vector3::zeros(),
+            k_vel: Vector3::zeros(),
+            k_i_vel: Vector3::zeros(),
+            max_accel: self.max_accel,
+            max_integrator: 0.0,
+        };
+        accel_to_attitude_thrust(accel_cmd, setpoint.yaw_rad, mass_kg, &dummy_gains)
+    }
+
+    /// Solve the three per-axis MPCs and return the clamped NED
+    /// acceleration command **before** attitude / thrust force-balance.
+    ///
+    /// Exposed so callers (e.g. the M11c residual-policy harness) can
+    /// inject a correction between MPC and last-mile conversion. The
+    /// acceleration magnitude is clamped to `max_accel` here — the
+    /// caller is responsible for any subsequent clamping if they add
+    /// more to the vector.
+    pub fn solve_accel(
+        &mut self,
+        setpoint: &Setpoint,
+        current_position: Vector3<f32>,
+        current_velocity: Vector3<f32>,
+    ) -> Vector3<f32> {
         // Error coords (e = x − x_ref) per axis.
         let e_x = nalgebra::Vector2::new(
             current_position.x - setpoint.position_ned.x,
@@ -790,32 +815,16 @@ impl<const H: usize> Mpc3dPositionController<H> {
             current_velocity.z - setpoint.velocity_ned.z,
         );
 
-        // Three QPs. xy shares one MPC (same dynamics + weights), z uses
-        // its own. Warm buffers are per-axis so xy still have distinct
-        // initial guesses.
         let u_x = self.mpc_xy.solve(e_x, &mut self.warm_x, self.max_iter);
         let u_y = self.mpc_xy.solve(e_y, &mut self.warm_y, self.max_iter);
         let u_z = self.mpc_z.solve(e_z, &mut self.warm_z, self.max_iter);
 
-        // Add setpoint's feed-forward acceleration then cap magnitude so
-        // the attitude loop gets a feasible request.
         let mut accel_cmd = Vector3::new(u_x, u_y, u_z) + setpoint.accel_ned;
         let mag = accel_cmd.norm();
         if mag.is_finite() && mag > self.max_accel {
             accel_cmd *= self.max_accel / mag;
         }
-
-        // Reuse the PI path's force-balance → (q_desired, thrust). Pack
-        // into the existing struct via a dummy gains object whose only
-        // purpose is to supply `max_accel` to the last-mile helper.
-        let dummy_gains = PositionGains {
-            k_pos: Vector3::zeros(),
-            k_vel: Vector3::zeros(),
-            k_i_vel: Vector3::zeros(),
-            max_accel: self.max_accel,
-            max_integrator: 0.0,
-        };
-        accel_to_attitude_thrust(accel_cmd, setpoint.yaw_rad, mass_kg, &dummy_gains)
+        accel_cmd
     }
 
     /// Read-only access to the xy MPC (for tests that want to inspect
@@ -1231,7 +1240,11 @@ impl Lqi3dPositionController {
 /// attitude + thrust magnitude. Factored out of
 /// `position_to_attitude_thrust_pi` so the MPC controller reuses it
 /// verbatim (no conceptual drift between the two control paths).
-fn accel_to_attitude_thrust(
+///
+/// Exposed `pub` so downstream crates (e.g. sim-hil's residual-MPC
+/// harness) can inject a custom `accel_cmd` and still go through the
+/// exact same force-balance math as the stock controllers.
+pub fn accel_to_attitude_thrust(
     accel_cmd: Vector3<f32>,
     yaw_rad: f32,
     mass_kg: f32,

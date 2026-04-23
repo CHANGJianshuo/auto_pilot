@@ -34,6 +34,10 @@ pub mod mavlink_udp;
 
 pub mod gazebo;
 
+/// Host-side wrapper that pairs the M9.2 MPC controller with the M11a
+/// residual policy, producing an "NMPC + NN-compensated" controller.
+pub mod residual_mpc;
+
 /// Host-side Zenoh pub/sub wrapper binding `core_bus` messages to a
 /// live Zenoh session. Opt-in via the `zenoh-host` feature because the
 /// dep graph is heavy.
@@ -942,6 +946,162 @@ mod tests {
         assert!(
             alt_err < 2.0,
             "LQR alt_err {alt_err}m ≥ 2.0m (stability lower bound)"
+        );
+    }
+
+    /// Drive the SITL with an MPC + residual policy controller. The
+    /// caller supplies the backend, so this harness also serves as the
+    /// template for future `TractBackend` / `CandleBackend` testing.
+    fn run_closed_loop_with_mpc_residual<B>(
+        sim_cfg: &SimConfig,
+        seed: u64,
+        steps: usize,
+        weights_xy: algo_nmpc::LqrWeights,
+        weights_z: algo_nmpc::LqrWeights,
+        policy_backend: B,
+    ) -> SimState
+    where
+        B: nn_runtime::InferenceBackend,
+    {
+        use algo_indi::attitude_to_rate;
+        use algo_nmpc::{Mpc1dConfig, Mpc3dPositionController, Setpoint};
+        use app_copter::{
+            ArmState, FlightState, apply_baro_measurement, apply_gps_measurement,
+            apply_mag_measurement, default_config_250g, rate_loop_step,
+        };
+        use nn_runtime::{ResidualPolicy, SafetyEnvelope};
+
+        let mut sim_state = SimState {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..SimState::default()
+        };
+        let mut rng = SimRng::new(seed);
+        let dt = 0.001_f32;
+        let mut app_cfg = default_config_250g();
+
+        let cfg_xy = Mpc1dConfig {
+            weights: weights_xy,
+            dt_s: dt,
+            u_min: -20.0,
+            u_max: 20.0,
+        };
+        let cfg_z = Mpc1dConfig {
+            weights: weights_z,
+            dt_s: dt,
+            u_min: -20.0,
+            u_max: 20.0,
+        };
+        let mpc =
+            Mpc3dPositionController::<10>::new(cfg_xy, cfg_z, 25, app_cfg.position_gains.max_accel)
+                .expect("MPC constructs for sane weights");
+        let policy =
+            ResidualPolicy::new(policy_backend, SafetyEnvelope::small_multirotor_default());
+        let mut residual_mpc = crate::residual_mpc::MpcResidualController::new(mpc, policy);
+
+        let mut flight = FlightState {
+            arm_state: ArmState::Armed,
+            ..FlightState::default()
+        };
+        let _ = apply_baro_measurement(&mut flight, &sense_baro(sim_cfg, &sim_state, &mut rng));
+        let _ = apply_gps_measurement(&mut flight, &sense_gps(sim_cfg, &sim_state, &mut rng));
+
+        let setpoint = Setpoint {
+            position_ned: Vector3::new(0.0, 0.0, -1.0),
+            ..Setpoint::default()
+        };
+
+        for i in 0..steps {
+            let accel_w = accel_world(sim_cfg, &sim_state);
+            let imu = sense_imu(sim_cfg, &sim_state, accel_w, &mut rng);
+            let att = residual_mpc.step(
+                &setpoint,
+                flight.state.position_ned,
+                flight.state.velocity_ned,
+                flight.state.attitude,
+                app_cfg.mass_kg,
+            );
+            let rate_cmd =
+                attitude_to_rate(flight.state.attitude, att.q_desired, &app_cfg.k_attitude);
+            let saved_hover = app_cfg.hover_thrust_n;
+            app_cfg.hover_thrust_n = att.thrust_n;
+            let out = rate_loop_step(&mut app_cfg, &mut flight, imu, dt, rate_cmd);
+            app_cfg.hover_thrust_n = saved_hover;
+            step(sim_cfg, &mut sim_state, &out.motor_thrusts_n, dt);
+            if i % 200 == 0 {
+                let _ =
+                    apply_gps_measurement(&mut flight, &sense_gps(sim_cfg, &sim_state, &mut rng));
+            }
+            if i % 40 == 0 {
+                let _ =
+                    apply_mag_measurement(&mut flight, &sense_mag(sim_cfg, &sim_state, &mut rng));
+            }
+            if i % 20 == 0 {
+                let _ =
+                    apply_baro_measurement(&mut flight, &sense_baro(sim_cfg, &sim_state, &mut rng));
+            }
+        }
+        sim_state
+    }
+
+    #[test]
+    fn mpc_plus_residual_beats_bare_mpc_under_drag() {
+        // Realistic sim (motor lag + drag + wind) in which bare MPC
+        // shows a drag-induced steady-state bias (LQR/MPC are bias-
+        // blind; M9.3 introduced LQI to fix this).
+        //
+        // Here we use a *hand-crafted* affine policy that mirrors the
+        // role the integrator would play: input feature vel_z → output
+        // residual accel_z that pushes up. No training involved — the
+        // point is to verify the data path end-to-end and demonstrate
+        // that the residual-policy slot can close the steady bias gap
+        // that plain MPC leaves open.
+        use algo_nmpc::LqrWeights;
+        use nn_runtime::{AffineBackend, FEATURE_LEN, RESIDUAL_LEN};
+
+        let sim_cfg = SimConfig::realistic_dynamics(Vector3::new(1.5, 0.0, 0.0));
+        let weights = LqrWeights {
+            q_pos: 4.0,
+            q_vel: 1.0,
+            r: 0.5,
+        };
+
+        // Baseline: bare MPC (residual = 0) in the same sim.
+        let baseline = AffineBackend::zero();
+        let bare_sim =
+            run_closed_loop_with_mpc_residual(&sim_cfg, 11, 15_000, weights, weights, baseline);
+        let bare_alt_err = (-bare_sim.position_ned.z - 1.0).abs();
+        let bare_horiz_err =
+            (bare_sim.position_ned.x.powi(2) + bare_sim.position_ned.y.powi(2)).sqrt();
+
+        // With residual: hand-tune a single-axis correction. Two
+        // features fight the wind-drag bias: (a) x-position error
+        // pulls the residual toward the setpoint (proportional to
+        // pos_err), (b) x-velocity contributes damping. Coefficients
+        // picked conservatively — the envelope still owns the hard
+        // safety bound.
+        let mut w = [[0.0_f32; FEATURE_LEN]; RESIDUAL_LEN];
+        w[0][0] = -2.0; // pos_err_x → residual_x (restoring force)
+        w[0][3] = -1.0; // vel_x     → residual_x (damping)
+        let tuned = AffineBackend::new(w, [0.0; RESIDUAL_LEN], 5.0);
+        let residual_sim =
+            run_closed_loop_with_mpc_residual(&sim_cfg, 11, 15_000, weights, weights, tuned);
+        let residual_alt_err = (-residual_sim.position_ned.z - 1.0).abs();
+        let residual_horiz_err =
+            (residual_sim.position_ned.x.powi(2) + residual_sim.position_ned.y.powi(2)).sqrt();
+
+        // The residual should reduce the horizontal tracking error,
+        // which is dominated by the wind-drag bias. We give the
+        // comparison a 20 cm margin so small sim-level noise can't
+        // flip the result.
+        assert!(
+            residual_horiz_err + 0.20 < bare_horiz_err,
+            "residual did not help: bare {bare_horiz_err} m vs residual {residual_horiz_err} m"
+        );
+        // Altitude error shouldn't grow appreciably — the residual is
+        // targeted at the x axis, so z tracking should stay similar.
+        assert!(
+            residual_alt_err <= bare_alt_err + 0.10,
+            "residual made altitude worse: bare {bare_alt_err} vs residual {residual_alt_err}"
         );
     }
 
