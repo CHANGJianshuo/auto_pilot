@@ -563,6 +563,7 @@ mod tests {
         let total_ticks: usize = 5_000; // 5 s total, 3 s post-failure
         let mut max_tilt_rad = 0.0_f32;
         let mut max_alt_err = 0.0_f32;
+        let mut max_xy_err = 0.0_f32;
 
         for i in 0_usize..total_ticks {
             if i == fail_tick {
@@ -572,10 +573,10 @@ mod tests {
                 sim_cfg.motor_fault_mask[0] = 0.0;
                 // Oracle fault notification: the controller learns
                 // of the failure instantly. A real FDIR module
-                // (future M20) would detect the fault from
-                // commanded-vs-observed angular acceleration with
-                // a small latency (ms scale). Oracle mode isolates
-                // the allocator's behaviour from the detector's.
+                // (M20a-d) detects the fault from the ω̇ residual
+                // with a small latency (~80 ms typical). This test
+                // uses oracle mode to isolate the allocator +
+                // M21 attitude handoff from detector latency.
                 flight.motor_alive[0] = false;
             }
             let accel_w = accel_world(&sim_cfg, &sim_state);
@@ -608,6 +609,13 @@ mod tests {
                 if alt_err > max_alt_err {
                     max_alt_err = alt_err;
                 }
+                let xy_err = libm::sqrtf(
+                    sim_state.position_ned.x * sim_state.position_ned.x
+                        + sim_state.position_ned.y * sim_state.position_ned.y,
+                );
+                if xy_err > max_xy_err {
+                    max_xy_err = xy_err;
+                }
             }
 
             if i.is_multiple_of(200) {
@@ -626,13 +634,17 @@ mod tests {
             }
         }
 
-        // Survival assertions — now that failover is wired:
+        // Survival assertions — now that failover is wired + M21
+        // yaw-handoff:
         //   1. position + velocity finite (no NaN / ∞)
         //   2. altitude err < 3 m — 3-motor allocation preserves
-        //      the total thrust magnitude, so vertical equilibrium
-        //      holds modulo yaw-coupled drift
-        //   3. tilt < 60° (≈ 1.05 rad) — uncontrolled yaw spin
-        //      perturbs roll/pitch but the vehicle stays upright
+        //      the total thrust magnitude
+        //   3. tilt < 60° (≈ 1.05 rad) — yaw spin perturbs roll /
+        //      pitch but the vehicle stays upright
+        //   4. M21-specific: xy err < 3 m — with yaw handoff, the
+        //      position controller's body-frame commands no longer
+        //      rotate out from under the vehicle. Pre-M21 this would
+        //      drift unbounded as yaw spins and body axes wander.
         assert!(
             sim_state.position_ned.norm().is_finite(),
             "position went non-finite: {:?}",
@@ -650,6 +662,10 @@ mod tests {
         assert!(
             max_tilt_rad < 1.05,
             "max tilt {max_tilt_rad} rad (> 60°) — vehicle losing upright posture",
+        );
+        assert!(
+            max_xy_err < 3.0,
+            "xy err {max_xy_err} m ≥ 3 m — M21 yaw handoff not preventing position drift",
         );
     }
 

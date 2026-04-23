@@ -861,8 +861,30 @@ pub fn outer_step(
         flight.state.wind_ne.y * cfg.wind_ff_gain,
         0.0,
     );
+    // M21 — 3-motor failover handoff: when any motor is dead, the
+    // failover allocator has given up the yaw axis (Mueller 2014).
+    // Demanding a yaw error to be corrected is then physically
+    // impossible and only accumulates INDI / attitude integrator
+    // state that the allocator ignores, which is wasted work at
+    // best and at worst couples into the roll / pitch channels.
+    // Replace the commanded yaw with the current attitude's yaw so
+    // the attitude error on the yaw axis is identically zero. The
+    // vehicle will spin freely in yaw; roll / pitch / thrust still
+    // track the setpoint.
+    let (yaw_override, three_motor_mode) = if flight.motor_alive == [true; 4] {
+        (active_sp.yaw_rad, false)
+    } else {
+        let q = flight.state.attitude;
+        // Hamilton convention, NED: yaw = atan2(2(wz + xy), 1 - 2(y² + z²)).
+        let yaw_now = libm::atan2f(
+            2.0 * (q.w * q.k + q.i * q.j),
+            1.0 - 2.0 * (q.j * q.j + q.k * q.k),
+        );
+        (yaw_now, true)
+    };
     let adjusted_setpoint = Setpoint {
         accel_ned: active_sp.accel_ned + wind_ff,
+        yaw_rad: yaw_override,
         ..*active_sp
     };
 
@@ -880,7 +902,16 @@ pub fn outer_step(
     flight.vel_integrator = new_integ;
 
     // Inner (middle): q_desired → rate command.
-    let rate_cmd = attitude_to_rate(flight.state.attitude, att.q_desired, &cfg.k_attitude);
+    let mut rate_cmd = attitude_to_rate(flight.state.attitude, att.q_desired, &cfg.k_attitude);
+    if three_motor_mode {
+        // Defensive: even if q_desired's yaw was set to the current
+        // yaw above, small numerical noise can leave a sub-milli-rad
+        // rotation error on the yaw axis. In 3-motor mode the
+        // allocator can't deliver yaw torque anyway, so asking INDI
+        // to produce any is wasted D-term on the integrator. Zero
+        // the yaw-rate command outright.
+        rate_cmd.body_rate_rad_s.z = 0.0;
+    }
 
     // Swap the hover fallback for the live thrust demand for this tick.
     let saved_hover = cfg.hover_thrust_n;
