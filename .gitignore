@@ -13,3 +13,7 @@ Cargo.lock.*
 /sim/logs/
 perf.data*
 flamegraph.svg
+# Rerun recording files — large (MB-scale) binary artefacts, not
+# source. Users generate their own via `cargo run -p sim-hil
+# --example sitl_rerun --features rerun-viz --release`.
+*.rrd

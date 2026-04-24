@@ -64,3 +64,8 @@ path = "examples/controller_shootout.rs"
 name = "sitl_rerun"
 path = "examples/sitl_rerun.rs"
 required-features = ["rerun-viz"]
+
+[[example]]
+name = "open_rrd"
+path = "examples/open_rrd.rs"
+required-features = ["rerun-viz"]

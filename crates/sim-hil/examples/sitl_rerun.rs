@@ -37,7 +37,7 @@
 
 use algo_ekf::GRAVITY_M_S2;
 use algo_indi::attitude_to_rate;
-use algo_nmpc::{LqiWeights, Mpc1dIConfig, PositionController, PositionGains, Setpoint};
+use algo_nmpc::{LqiWeights, Mpc1dIConfig, PositionController, PositionGains};
 use app_copter::{
     ArmState, FlightState, apply_baro_measurement, apply_gps_measurement, apply_mag_measurement,
     default_config_250g, rate_loop_step,
@@ -49,9 +49,14 @@ use sim_hil::{
 };
 
 fn main() -> anyhow::Result<()> {
-    // Spawn the native viewer. This blocks on a separate thread; the
-    // returned stream is what we log through.
-    let rec = rerun::RecordingStreamBuilder::new("auto_pilot_sitl").spawn()?;
+    // Save to disk. A .rrd file is portable — any `rerun` binary can
+    // open it later, you can share it, diff two runs, etc.:
+    //
+    //   rerun auto_pilot_figure_eight.rrd
+    let rrd_path = std::env::var("RRD_PATH")
+        .unwrap_or_else(|_| "auto_pilot_figure_eight.rrd".to_string());
+    let rec = rerun::RecordingStreamBuilder::new("auto_pilot_sitl").save(&rrd_path)?;
+    println!("[sitl_rerun] logging to {rrd_path}");
 
     // Static scene geometry — the world frame, logged once and then
     // referenced by every dynamic entity.
@@ -292,9 +297,9 @@ fn main() -> anyhow::Result<()> {
         )?;
     }
 
-    tracing::info!("sitl_rerun: finished {total_ticks} ticks — leaving viewer open");
-    // Keep the viewer alive; user kills with Ctrl-C or closes the window.
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
+    // Drop the stream to flush remaining data to disk.
+    drop(rec);
+    println!("[sitl_rerun] done, {total_ticks} ticks logged. Open with:");
+    println!("    rerun {rrd_path}");
+    Ok(())
 }
