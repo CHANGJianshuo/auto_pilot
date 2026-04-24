@@ -639,6 +639,51 @@ impl FlightState {
         .unwrap_or(HealthLevel::Healthy)
     }
 
+    /// Gate a mode change through the M24a-verified [`FlightMode::request`]
+    /// rules, then apply the corresponding side effect on `Enter`.
+    ///
+    /// Side effects per target mode:
+    /// - [`FlightMode::Stable`]: clears `landing_state`, `rtl_phase`,
+    ///   `takeoff_state`, and re-enables `motor_fault_detector`.
+    ///   Universal abort.
+    /// - [`FlightMode::Landing`]: sets `landing_state = Landing`.
+    /// - [`FlightMode::Rtl`]: sets `rtl_phase = Climbing`.
+    /// - [`FlightMode::Acro`]: disables `motor_fault_detector_enabled`.
+    /// - [`FlightMode::TakingOff`]: no side effect — the caller must
+    ///   still set `takeoff_state = TakingOff { target_z_ned }` with
+    ///   a target altitude we don't have here. The gate still
+    ///   blocks a disallowed transition; writing the state is the
+    ///   caller's job.
+    ///
+    /// Rejection doesn't mutate anything. `Stay` likewise.
+    pub fn request_mode(&mut self, target: FlightMode) -> ModeTransitionResult {
+        let current = self.flight_mode();
+        let result = current.request(target);
+        if let ModeTransitionResult::Enter(new) = result {
+            match new {
+                FlightMode::Stable => {
+                    self.landing_state = LandingState::Idle;
+                    self.rtl_phase = RtlPhase::Idle;
+                    self.takeoff_state = TakeoffState::Idle;
+                    self.motor_fault_detector_enabled = true;
+                }
+                FlightMode::Landing => {
+                    self.landing_state = LandingState::Landing;
+                }
+                FlightMode::Rtl => {
+                    self.rtl_phase = RtlPhase::Climbing;
+                }
+                FlightMode::Acro => {
+                    self.motor_fault_detector_enabled = false;
+                }
+                FlightMode::TakingOff => {
+                    // Caller's responsibility — see method doc.
+                }
+            }
+        }
+        result
+    }
+
     /// Derived top-level [`FlightMode`] from the ad-hoc state fields.
     ///
     /// Priority (highest wins):
@@ -2214,5 +2259,83 @@ mod tests {
         let mut f = FlightState::default();
         f.takeoff_state = TakeoffState::TakingOff { target_z_ned: -3.0 };
         assert_eq!(f.flight_mode(), FlightMode::TakingOff);
+    }
+
+    // ---- FlightState::request_mode() (M24c) ---------------------------
+
+    #[test]
+    fn request_mode_stable_to_landing_enters_and_sets_state() {
+        let mut f = FlightState::default();
+        assert_eq!(f.flight_mode(), FlightMode::Stable);
+        let r = f.request_mode(FlightMode::Landing);
+        assert_eq!(r, ModeTransitionResult::Enter(FlightMode::Landing));
+        assert_eq!(f.landing_state, LandingState::Landing);
+        assert_eq!(f.flight_mode(), FlightMode::Landing);
+    }
+
+    #[test]
+    fn request_mode_rtl_during_takeoff_is_rejected() {
+        let mut f = FlightState::default();
+        f.takeoff_state = TakeoffState::TakingOff { target_z_ned: -5.0 };
+        assert_eq!(f.flight_mode(), FlightMode::TakingOff);
+        let r = f.request_mode(FlightMode::Rtl);
+        assert_eq!(r, ModeTransitionResult::Reject);
+        // Nothing mutated.
+        assert_eq!(f.rtl_phase, RtlPhase::Idle);
+        assert_eq!(
+            f.takeoff_state,
+            TakeoffState::TakingOff { target_z_ned: -5.0 }
+        );
+    }
+
+    #[test]
+    fn request_mode_landing_preempts_rtl() {
+        let mut f = FlightState::default();
+        f.rtl_phase = RtlPhase::Returning;
+        assert_eq!(f.flight_mode(), FlightMode::Rtl);
+        let r = f.request_mode(FlightMode::Landing);
+        assert_eq!(r, ModeTransitionResult::Enter(FlightMode::Landing));
+        assert_eq!(f.landing_state, LandingState::Landing);
+        // NOTE: Rtl-specific state (rtl_phase) isn't auto-cleared on
+        // Landing preempt. flight_mode() still returns Landing
+        // because the priority logic picks Landing over Rtl.
+        assert_eq!(f.flight_mode(), FlightMode::Landing);
+    }
+
+    #[test]
+    fn request_mode_abort_to_stable_clears_everything() {
+        let mut f = FlightState::default();
+        f.rtl_phase = RtlPhase::Climbing;
+        f.motor_fault_detector_enabled = false; // was-in-Acro-too scenario
+        // flight_mode() picks Rtl (priority) even with detector off.
+        assert_eq!(f.flight_mode(), FlightMode::Rtl);
+        let r = f.request_mode(FlightMode::Stable);
+        assert_eq!(r, ModeTransitionResult::Enter(FlightMode::Stable));
+        assert_eq!(f.landing_state, LandingState::Idle);
+        assert_eq!(f.rtl_phase, RtlPhase::Idle);
+        assert_eq!(f.takeoff_state, TakeoffState::Idle);
+        assert!(f.motor_fault_detector_enabled);
+        assert_eq!(f.flight_mode(), FlightMode::Stable);
+    }
+
+    #[test]
+    fn request_mode_acro_from_stable_disables_detector() {
+        let mut f = FlightState::default();
+        assert!(f.motor_fault_detector_enabled);
+        let r = f.request_mode(FlightMode::Acro);
+        assert_eq!(r, ModeTransitionResult::Enter(FlightMode::Acro));
+        assert!(!f.motor_fault_detector_enabled);
+        assert_eq!(f.flight_mode(), FlightMode::Acro);
+    }
+
+    #[test]
+    fn request_mode_self_transition_does_not_mutate() {
+        let mut f = FlightState::default();
+        f.landing_state = LandingState::Landing;
+        let before = (f.landing_state, f.rtl_phase, f.motor_fault_detector_enabled);
+        let r = f.request_mode(FlightMode::Landing);
+        assert_eq!(r, ModeTransitionResult::Stay);
+        let after = (f.landing_state, f.rtl_phase, f.motor_fault_detector_enabled);
+        assert_eq!(before, after);
     }
 }
