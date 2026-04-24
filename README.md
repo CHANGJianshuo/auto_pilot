@@ -127,6 +127,17 @@ cargo run -p sim-hil --example sitl_mavlink
 # Open QGC; it auto-discovers the vehicle. Arm / Land / Takeoff / RTL all wired.
 ```
 
+### Run the 3D visualization (rerun.io)
+
+```bash
+cargo run -p sim-hil --example sitl_rerun --features rerun-viz --release
+# Spawns the rerun native viewer. Flies a 2-orbit figure-8 pattern with
+# MPC-I; 3D scene shows the vehicle + motor arms + thrust vector + trail,
+# time-series panels show altitude, xy err, body rates, motor thrusts.
+# The `rerun-viz` feature pulls ~300 transitive crates (wgpu, eframe) so
+# it's gated off by default.
+```
+
 ### Build firmware for STM32H753
 
 ```bash

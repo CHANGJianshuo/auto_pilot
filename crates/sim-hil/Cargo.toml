@@ -15,6 +15,10 @@ default = []
 # Enable the Zenoh host session + typed pub/sub wrapper. Gated because
 # zenoh pulls ~80 transitive crates and bloats CI build times.
 zenoh-host = ["dep:zenoh", "dep:core-bus", "dep:serde"]
+# Enable the rerun.io 3D visualization example. Gated because rerun
+# pulls ~300 transitive crates (wgpu, eframe, image decoders) and
+# blows up CI build time if always-on.
+rerun-viz = ["dep:rerun"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -40,6 +44,10 @@ app-copter = { path = "../app-copter" }
 core-bus = { path = "../core-bus", optional = true }
 zenoh = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
+# rerun.io — robotics / ML time-aligned 3D + time-series viewer.
+# Pinned to a concrete major so feature-gated CI doesn't get churn
+# from minor breaking changes.
+rerun = { version = "0.21", default-features = false, features = ["sdk", "native_viewer"], optional = true }
 
 [dev-dependencies]
 algo-fdir = { path = "../algo-fdir" }
@@ -51,3 +59,8 @@ path = "examples/sitl_mavlink.rs"
 [[example]]
 name = "controller_shootout"
 path = "examples/controller_shootout.rs"
+
+[[example]]
+name = "sitl_rerun"
+path = "examples/sitl_rerun.rs"
+required-features = ["rerun-viz"]
