@@ -638,6 +638,47 @@ impl FlightState {
         .max_by_key(|l| l.severity())
         .unwrap_or(HealthLevel::Healthy)
     }
+
+    /// Derived top-level [`FlightMode`] from the ad-hoc state fields.
+    ///
+    /// Priority (highest wins):
+    ///
+    /// 1. `Landing` — takes precedence over everything. Safety
+    ///    critical; once the touchdown sequence is committed it
+    ///    should not be masked by any other mode indicator.
+    /// 2. `Rtl` — active if `rtl_phase != Idle`. Preempts any
+    ///    takeoff in progress (RTL is operator-commanded and means
+    ///    "abandon whatever you were doing, come home").
+    /// 3. `TakingOff` — active if `takeoff_state != Idle` and
+    ///    nothing higher-priority is active.
+    /// 4. `Acro` — inferred from
+    ///    `motor_fault_detector_enabled == false` (set by the SITL
+    ///    flip test / aggressive-maneuver entry path). Lowest-
+    ///    priority because it's a "bias" state that only matters
+    ///    when nothing else is happening.
+    /// 5. `Stable` — default.
+    ///
+    /// This is a **derivation**, not a replacement — existing
+    /// writers to `landing_state` / `takeoff_state` / `rtl_phase` /
+    /// `motor_fault_detector_enabled` still control the mode. M24c
+    /// will add `request_mode()` to route mode transitions through
+    /// the M24a invariants instead.
+    #[must_use]
+    pub fn flight_mode(&self) -> FlightMode {
+        if matches!(self.landing_state, LandingState::Landing) {
+            return FlightMode::Landing;
+        }
+        if !matches!(self.rtl_phase, RtlPhase::Idle) {
+            return FlightMode::Rtl;
+        }
+        if !matches!(self.takeoff_state, TakeoffState::Idle) {
+            return FlightMode::TakingOff;
+        }
+        if !self.motor_fault_detector_enabled {
+            return FlightMode::Acro;
+        }
+        FlightMode::Stable
+    }
 }
 
 /// Output of one rate-loop iteration.
@@ -2124,5 +2165,54 @@ mod tests {
                 ModeTransitionResult::Enter(FlightMode::Stable),
             );
         }
+    }
+
+    // ---- FlightState::flight_mode() derivation (M24b) -----------------
+
+    #[test]
+    fn flight_mode_default_state_is_stable() {
+        assert_eq!(FlightState::default().flight_mode(), FlightMode::Stable);
+    }
+
+    #[test]
+    fn flight_mode_landing_wins_over_takeoff() {
+        // Both Landing and TakingOff active — Landing priority.
+        let mut f = FlightState::default();
+        f.landing_state = LandingState::Landing;
+        f.takeoff_state = TakeoffState::TakingOff { target_z_ned: -5.0 };
+        assert_eq!(f.flight_mode(), FlightMode::Landing);
+    }
+
+    #[test]
+    fn flight_mode_rtl_wins_over_takeoff() {
+        let mut f = FlightState::default();
+        f.rtl_phase = RtlPhase::Climbing;
+        f.takeoff_state = TakeoffState::TakingOff { target_z_ned: -5.0 };
+        assert_eq!(f.flight_mode(), FlightMode::Rtl);
+    }
+
+    #[test]
+    fn flight_mode_landing_wins_over_rtl() {
+        let mut f = FlightState::default();
+        f.landing_state = LandingState::Landing;
+        f.rtl_phase = RtlPhase::Returning;
+        assert_eq!(f.flight_mode(), FlightMode::Landing);
+    }
+
+    #[test]
+    fn flight_mode_acro_derived_from_detector_flag() {
+        let mut f = FlightState::default();
+        f.motor_fault_detector_enabled = false;
+        assert_eq!(f.flight_mode(), FlightMode::Acro);
+        // Acro loses to Landing.
+        f.landing_state = LandingState::Landing;
+        assert_eq!(f.flight_mode(), FlightMode::Landing);
+    }
+
+    #[test]
+    fn flight_mode_takeoff_when_only_takeoff_active() {
+        let mut f = FlightState::default();
+        f.takeoff_state = TakeoffState::TakingOff { target_z_ned: -3.0 };
+        assert_eq!(f.flight_mode(), FlightMode::TakingOff);
     }
 }

@@ -26,7 +26,7 @@ use algo_ekf::GRAVITY_M_S2;
 use algo_nmpc::Setpoint;
 use algo_fdir::HealthLevel;
 use app_copter::{
-    ArmState, FlightState, LandingState, PreflightReject, RtlPhase, TakeoffState,
+    ArmState, FlightMode, FlightState, LandingState, PreflightReject, RtlPhase, TakeoffState,
     apply_baro_measurement, apply_gps_measurement, apply_mag_measurement, default_config_250g,
     outer_step, preflight_check,
 };
@@ -397,6 +397,11 @@ struct Snapshot {
     /// (touchdown detector fired + auto-disarm) to emit a "LANDED"
     /// STATUSTEXT.
     landing_state: LandingState,
+    /// Derived top-level flight mode from `FlightState::flight_mode()`.
+    /// Not currently used by the telemetry task, but exposed so a
+    /// future MODE-CHANGE MAVLink export can pick it up without
+    /// re-deriving from the other fields.
+    flight_mode: FlightMode,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -491,6 +496,7 @@ fn run_sim(
                 preflight: preflight_check(&flight).err(),
                 overall_health: flight.overall_health(),
                 landing_state: flight.landing_state,
+                flight_mode: flight.flight_mode(),
             };
             if tx.send(snap).is_err() {
                 // Receiver dropped — main exited; wind down.
