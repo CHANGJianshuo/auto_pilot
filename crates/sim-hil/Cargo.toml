@@ -47,7 +47,7 @@ serde = { workspace = true, optional = true }
 # rerun.io — robotics / ML time-aligned 3D + time-series viewer.
 # Pinned to a concrete major so feature-gated CI doesn't get churn
 # from minor breaking changes.
-rerun = { version = "0.21", default-features = false, features = ["sdk", "native_viewer"], optional = true }
+rerun = { version = "0.22", default-features = false, features = ["sdk", "native_viewer"], optional = true }
 
 [dev-dependencies]
 algo-fdir = { path = "../algo-fdir" }
